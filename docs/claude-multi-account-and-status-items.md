@@ -123,6 +123,12 @@ icons. Hide Personal Info replaces labels with `Account 1`, `Account 2`, and so 
 Merge Icons continues to mean exactly one status item. Account-icon controls are disabled while it is enabled, with a
 button to turn Merge Icons off. Existing users and status item positions remain unchanged until they opt in.
 
+The alternative proposed in the #1268 discussion is a per-account toggle that adds selected account items, leaves
+unselected accounts under the provider item, and coexists with Merge Icons. That is more granular, but it creates
+duplicate provider/account items, makes “Merge Icons” no longer mean one item, and multiplies autosave and recovery
+states. The replacement mode above is the recommendation; if maintainers prefer the additive mode, grouping and Merge
+Icons semantics must be decided before implementation.
+
 ## UI proof
 
 The mock above shows the recommended mode and its Merge Icons conflict. It is intentionally a decision artifact, not
