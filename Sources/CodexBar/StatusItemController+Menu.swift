@@ -578,12 +578,9 @@ extension StatusItemController {
         // interaction closures must always reference the live menu they end up serving.
         let interactionMenu = captureMenu ?? menu
         let providerScopes = self.overviewProviderScopes(enabledProviders: enabledProviders)
-        let rows: [(provider: UsageProvider, model: UsageMenuCardView.Model)] = providerScopes.visible
-            .compactMap { provider in
-                guard let model = self.menuCardModel(for: provider) else { return nil }
-                guard !model.isOverviewErrorOnly else { return nil }
-                return (provider: provider, model: model)
-            }
+        let rows: [OverviewAccountRow] = providerScopes.visible.flatMap { provider in
+            self.overviewAccountRows(for: provider)
+        }
         guard !rows.isEmpty else { return false }
 
         let t0 = CACurrentMediaTime()
@@ -622,8 +619,8 @@ extension StatusItemController {
         }
 
         for (index, row) in rows.enumerated() {
-            let identifier = "\(Self.overviewRowIdentifierPrefix)\(row.provider.rawValue)"
-            let storageText = self.store.storageFootprintText(for: row.provider)
+            let identifier = row.identifier
+            let storageText = row.storageText
             let submenu = self.makeOverviewRowSubmenu(
                 provider: row.provider,
                 model: row.model,
@@ -632,7 +629,7 @@ extension StatusItemController {
                 OverviewMenuCardRowView(model: row.model, storageText: storageText, width: menuWidth),
                 id: identifier,
                 width: menuWidth,
-                heightCacheScope: row.provider.rawValue,
+                heightCacheScope: row.heightCacheScope,
                 heightCacheFingerprint: row.model.heightFingerprint(
                     section: "overview",
                     additional: [UsageMenuCardView.Model.heightFingerprintField("storage", storageText)]),
