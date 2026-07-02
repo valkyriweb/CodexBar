@@ -40,8 +40,11 @@ extension StatusItemController {
         else {
             return
         }
+        // Per-account rows suffix the identifier with "-<accountID>"; provider raw
+        // values contain no dashes, so the first dash-separated token is the provider.
         let rawProvider = String(represented.dropFirst(Self.overviewRowIdentifierPrefix.count))
-        guard let provider = UsageProvider(rawValue: rawProvider),
+        let providerToken = rawProvider.split(separator: "-").first.map(String.init) ?? rawProvider
+        guard let provider = UsageProvider(rawValue: providerToken),
               let menu = sender.menu
         else {
             return
