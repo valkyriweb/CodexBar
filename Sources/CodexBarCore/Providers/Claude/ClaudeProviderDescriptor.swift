@@ -80,9 +80,11 @@ public enum ClaudeProviderDescriptor {
         context.sourceMode == .auto && ClaudeAdminAPISettingsReader.apiKey(environment: context.env) != nil
     }
 
-    private static func makePlanningInput(context: ProviderFetchContext) -> ClaudeSourcePlanningInput {
+    static func makePlanningInput(context: ProviderFetchContext) -> ClaudeSourcePlanningInput {
         let webExtrasEnabled = context.settings?.claude?.webExtrasEnabled ?? false
+        let accountScopedWebCookie = Self.hasAccountScopedWebCookie(context: context)
         let needsOAuthAvailability = context.runtime == .app && context.sourceMode == .auto
+            && !accountScopedWebCookie
         let hasWebSession = Self.hasPlausibleWebSession(context: context)
 
         return ClaudeSourcePlanningInput(
@@ -90,11 +92,26 @@ public enum ClaudeProviderDescriptor {
             selectedDataSource: Self.sourceDataSource(from: context.sourceMode),
             webExtrasEnabled: webExtrasEnabled,
             hasWebSession: hasWebSession,
-            hasCLI: ClaudeCLIResolver.isAvailable(environment: context.env),
+            hasCLI: !accountScopedWebCookie && ClaudeCLIResolver.isAvailable(environment: context.env),
             hasOAuthCredentials: needsOAuthAvailability && ClaudeOAuthPlanningAvailability.isAvailable(
                 runtime: context.runtime,
                 sourceMode: context.sourceMode,
                 environment: context.env))
+    }
+
+    /// True when this fetch targets a configured token account whose credential is a claude.ai
+    /// web session cookie. Machine-global sources (Claude Code keychain OAuth, the local
+    /// `claude` CLI) always describe the Mac's own signed-in account, so planning them ahead
+    /// of web makes every per-account row mirror that one account. Web is the only data source
+    /// that can represent the selected token account.
+    static func hasAccountScopedWebCookie(context: ProviderFetchContext) -> Bool {
+        guard context.selectedTokenAccountID != nil,
+              context.settings?.claude?.cookieSource == .manual
+        else {
+            return false
+        }
+        return ClaudeWebAPIFetcher.hasSessionKey(
+            cookieHeader: CookieHeaderNormalizer.normalize(context.settings?.claude?.manualCookieHeader))
     }
 
     private static func hasPlausibleWebSession(context: ProviderFetchContext) -> Bool {
