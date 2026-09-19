@@ -1016,7 +1016,7 @@ private final class CodexRPCClient: @unchecked Sendable {
 
     init(
         executable: String = "codex",
-        arguments: [String] = ["-s", "read-only", "-a", "untrusted", "app-server"],
+        arguments: [String] = ["-s", "read-only", "-a", "never", "app-server"],
         environment: [String: String] = ProcessInfo.processInfo.environment,
         initializeTimeoutSeconds: TimeInterval = 8.0,
         requestTimeoutSeconds: TimeInterval = 3.0,
@@ -1268,14 +1268,14 @@ public struct UsageFetcher: Sendable {
         self.initializeTimeoutSeconds = 8.0
         self.requestTimeoutSeconds = 3.0
         self.codexExecutableResolver = defaultCodexExecutableResolver
-        self.codexArguments = ["-s", "read-only", "-a", "untrusted", "app-server"]
+        self.codexArguments = ["-s", "read-only", "-a", "never", "app-server"]
     }
 
     init(
         environment: [String: String],
         initializeTimeoutSeconds: TimeInterval,
         requestTimeoutSeconds: TimeInterval,
-        codexArguments: [String] = ["-s", "read-only", "-a", "untrusted", "app-server"],
+        codexArguments: [String] = ["-s", "read-only", "-a", "never", "app-server"],
         codexExecutableResolver: @escaping CodexExecutableResolver = defaultCodexExecutableResolver)
     {
         self.environment = environment
