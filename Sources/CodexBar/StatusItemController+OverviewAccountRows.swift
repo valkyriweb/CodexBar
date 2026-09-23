@@ -17,6 +17,8 @@ extension StatusItemController {
     func overviewAccountRows(for provider: UsageProvider) -> [OverviewAccountRow] {
         let storageText = self.store.storageFootprintText(for: provider)
 
+        // Provider-specific by design: Codex managed profiles use the visible-account projection;
+        // other token-account providers use their token snapshots below.
         if provider == .codex,
            let display = self.codexAccountMenuDisplay(for: .codex),
            display.showAll,
