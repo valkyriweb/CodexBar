@@ -25,13 +25,9 @@ extension StatusItemController {
             let snapshotsByID = Dictionary(uniqueKeysWithValues: display.snapshots.map { ($0.id, $0) })
             let accountRows = display.accounts.compactMap { account -> OverviewAccountRow? in
                 let accountSnapshot = snapshotsByID[account.id]
-                let health = CodexAccountHealth.status(for: account, error: accountSnapshot?.error)
-                guard let model = self.menuCardModel(
-                    for: .codex,
-                    snapshotOverride: accountSnapshot?.snapshot,
-                    errorOverride: health.label,
-                    forceOverrideCard: accountSnapshot == nil,
-                    accountOverride: self.accountInfo(for: account)) else { return nil }
+                guard let model = self.codexAccountMenuCardModel(
+                    for: account,
+                    accountSnapshot: accountSnapshot) else { return nil }
                 guard !model.isOverviewErrorOnly else { return nil }
                 return OverviewAccountRow(
                     provider: provider,
@@ -50,11 +46,9 @@ extension StatusItemController {
            !display.snapshots.isEmpty
         {
             let accountRows = display.snapshots.compactMap { accountSnapshot -> OverviewAccountRow? in
-                guard let model = self.menuCardModel(
+                guard let model = self.tokenAccountMenuCardModel(
                     for: provider,
-                    snapshotOverride: accountSnapshot.snapshot,
-                    errorOverride: accountSnapshot.error,
-                    forceOverrideCard: accountSnapshot.snapshot == nil) else { return nil }
+                    accountSnapshot: accountSnapshot) else { return nil }
                 guard !model.isOverviewErrorOnly else { return nil }
                 return OverviewAccountRow(
                     provider: provider,
