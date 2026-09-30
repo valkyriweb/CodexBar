@@ -181,7 +181,9 @@ struct OverviewAccountRowsTests {
 
         let rows = controller.overviewAccountRows(for: .claude)
         #expect(rows.map(\.model.email) == ["alpha@example.com", "beta@example.com"])
-        #expect(rows.allSatisfy(\.model.metrics.isEmpty))
+        #expect(rows.allSatisfy { row in
+            row.model.metrics.isEmpty
+        })
         #expect(rows.allSatisfy { $0.model.subtitleText == "Unavailable" })
         #expect(rows.allSatisfy { $0.model.email != "selected@example.com" })
     }
@@ -226,6 +228,52 @@ struct OverviewAccountRowsTests {
     }
 
     @Test
+    func `stacked claude-swap overview rows show the snapshot plan not the switch action`() {
+        let settings = testSettingsStore(suiteName: "OverviewAccountRowsTests-claudeswap-plan")
+        settings.multiAccountMenuLayout = .stacked
+        settings.usageBarsShowUsed = true
+        Self.enableOnly(.claude, settings)
+        let store = UsageStore(
+            fetcher: UsageFetcher(),
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings)
+        let planned = Self.claudeSwapAccount(ClaudeSwapPlanFixture(
+            number: 1,
+            email: "planned@example.com",
+            isActive: true,
+            canActivate: true,
+            weeklyUsed: 41,
+            loginMethod: "Max"))
+        let unplanned = Self.claudeSwapAccount(ClaudeSwapPlanFixture(
+            number: 2,
+            email: "unplanned@example.com",
+            isActive: false,
+            canActivate: true,
+            weeklyUsed: 42,
+            loginMethod: nil))
+        store.claudeSwapAccountSnapshots = [planned, unplanned]
+        let controller = Self.makeController(store: store, settings: settings)
+        defer { controller.releaseStatusItemsForTesting() }
+
+        let rows = controller.overviewAccountRows(for: .claude)
+        let menuPlans = [planned, unplanned].map { controller.claudeSwapCardModel(for: $0)?.planText }
+        #expect(menuPlans == ["Re-authenticate", "Switch Account..."])
+        #expect(rows.map(\.model.planText) == ["Max", nil])
+        #expect(rows.map { $0.model.metrics.first { $0.id == "secondary" }?.percent } == [41, 42])
+        let switchActions = [
+            "Switch Account...",
+            "Re-authenticate",
+            "Switching account…",
+            "Refreshing account status…",
+            "Active",
+        ]
+        #expect(rows.allSatisfy { row in
+            guard let plan = row.model.planText else { return true }
+            return !switchActions.contains(plan)
+        })
+    }
+
+    @Test
     func `segmented claude-swap layout keeps one provider overview row`() {
         let settings = testSettingsStore(suiteName: "OverviewAccountRowsTests-claudeswap-segmented")
         settings.multiAccountMenuLayout = .segmented
@@ -245,6 +293,43 @@ struct OverviewAccountRowsTests {
         defer { controller.releaseStatusItemsForTesting() }
 
         #expect(controller.overviewAccountRows(for: .claude).map(\.identifier) == ["overviewRow-claude"])
+    }
+
+    private struct ClaudeSwapPlanFixture {
+        var number: Int
+        var email: String
+        var isActive: Bool
+        var canActivate: Bool
+        var weeklyUsed: Double
+        var loginMethod: String?
+    }
+
+    private static func claudeSwapAccount(_ fixture: ClaudeSwapPlanFixture) -> ProviderAccountUsageSnapshot {
+        let reset = Date(timeIntervalSince1970: 1_782_086_400)
+        return ProviderAccountUsageSnapshot(
+            id: ProviderAccountIdentity(
+                source: ClaudeSwapAccountProjection.sourceName,
+                opaqueID: String(fixture.number)),
+            provider: .claude,
+            displayLabel: fixture.email,
+            accountEmail: fixture.email,
+            isActive: fixture.isActive,
+            canActivate: fixture.canActivate,
+            snapshot: UsageSnapshot(
+                primary: RateWindow(usedPercent: 20, windowMinutes: 300, resetsAt: reset, resetDescription: nil),
+                secondary: RateWindow(
+                    usedPercent: fixture.weeklyUsed,
+                    windowMinutes: 10080,
+                    resetsAt: reset,
+                    resetDescription: nil),
+                updatedAt: reset,
+                identity: ProviderIdentitySnapshot(
+                    providerID: UsageProvider.claude.instanceID,
+                    accountEmail: fixture.email,
+                    accountOrganization: nil,
+                    loginMethod: fixture.loginMethod)),
+            error: nil,
+            sourceLabel: ClaudeSwapAccountProjection.sourceLabel)
     }
 
     private static func claudeSwapAccounts(count: Int) -> [ProviderAccountUsageSnapshot] {

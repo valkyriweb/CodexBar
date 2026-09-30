@@ -50,7 +50,8 @@ struct ClaudeSwapAccountMenuDisplay {
         for account: ProviderAccountUsageSnapshot,
         planLabel: String?,
         adapterError: String?,
-        switchError: String?) -> UsageMenuCardContext
+        switchError: String?,
+        plan: UsageMenuCardView.Model.PlanOverride? = nil) -> UsageMenuCardContext
     {
         .account(.init(
             snapshot: account.snapshot,
@@ -60,7 +61,7 @@ struct ClaudeSwapAccountMenuDisplay {
                 switchError: switchError),
             info: AccountInfo(email: account.displayLabel, plan: nil),
             privacyOrdinal: self.privacyOrdinal(for: account),
-            plan: .label(planLabel),
+            plan: plan ?? .label(planLabel),
             planEmphasis: account.isActive ? .active : .none,
             lastKnownUsageCapturedAt: account.usesLastKnownUsage ? account.snapshot?.updatedAt : nil,
             sourceLabel: ClaudeSwapAccountProjection.sourceLabel))

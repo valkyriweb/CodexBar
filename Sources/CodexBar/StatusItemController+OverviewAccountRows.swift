@@ -118,7 +118,7 @@ extension StatusItemController {
             return nil
         }
         return accounts.compactMap { account in
-            guard let model = self.claudeSwapCardModel(for: account) else { return nil }
+            guard let model = self.claudeSwapOverviewCardModel(for: account) else { return nil }
             let accountID = "\(account.id.source):\(account.id.opaqueID)"
             return OverviewAccountRow(
                 provider: .claude,

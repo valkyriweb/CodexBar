@@ -149,6 +149,18 @@ extension StatusItemController {
     }
 
     func claudeSwapCardModel(for account: ProviderAccountUsageSnapshot) -> UsageMenuCardView.Model? {
+        self.claudeSwapCardModel(for: account, plan: nil)
+    }
+
+    /// Overview rows must not reuse the provider-menu switch action as a plan name.
+    func claudeSwapOverviewCardModel(for account: ProviderAccountUsageSnapshot) -> UsageMenuCardView.Model? {
+        self.claudeSwapCardModel(for: account, plan: .automatic)
+    }
+
+    private func claudeSwapCardModel(
+        for account: ProviderAccountUsageSnapshot,
+        plan: UsageMenuCardView.Model.PlanOverride?) -> UsageMenuCardView.Model?
+    {
         self.menuCardModel(
             for: .claude,
             context: ClaudeSwapAccountMenuDisplay.cardContext(
@@ -157,7 +169,8 @@ extension StatusItemController {
                 adapterError: self.store.claudeSwapLastError,
                 switchError: self.store.claudeSwapTransientState.lastErrorAccountID == account.id
                     ? self.store.claudeSwapTransientState.lastError
-                    : nil))
+                    : nil,
+                plan: plan))
     }
 
     private func claudeSwapAccountActionLabel(_ account: ProviderAccountUsageSnapshot) -> String? {
