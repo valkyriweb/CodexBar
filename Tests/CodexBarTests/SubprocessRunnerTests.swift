@@ -9,6 +9,17 @@ import Glibc
 #endif
 
 struct SubprocessRunnerTests {
+    @Test(arguments: [Double(Int.max) / 1_000_000_000, Double.greatestFiniteMagnitude])
+    func `large finite subprocess timeouts retain successful output`(timeout: Double) async throws {
+        let result = try await SubprocessRunner.run(
+            binary: "/bin/echo",
+            arguments: ["finished"],
+            environment: [:],
+            timeout: timeout,
+            label: "large timeout fixture")
+        #expect(result.stdout == "finished\n")
+    }
+
     @Test
     func `reads large stdout without deadlock`() async throws {
         let result = try await SubprocessRunner.run(
@@ -33,6 +44,28 @@ struct SubprocessRunnerTests {
 
         #expect(result.stdout.utf8.count == ProcessPipeCapture.defaultMaxBytes)
         #expect(result.stderr.isEmpty)
+    }
+
+    @Test
+    func `rejects oversized output when strict limit is configured`() async throws {
+        do {
+            _ = try await SubprocessRunner.run(
+                binary: "/usr/bin/python3",
+                arguments: ["-c", "print('x' * 10_000)"],
+                environment: ProcessInfo.processInfo.environment,
+                timeout: 5,
+                maxOutputBytes: 1024,
+                label: "python strict output limit")
+            Issue.record("Expected strict output limit failure")
+        } catch let error as SubprocessRunnerError {
+            guard case let .outputTooLarge(label) = error else {
+                Issue.record("Expected outputTooLarge, got \(error)")
+                return
+            }
+            #expect(label == "python strict output limit")
+        } catch {
+            Issue.record("Expected SubprocessRunnerError, got \(error)")
+        }
     }
 
     @Test
@@ -197,13 +230,19 @@ struct SubprocessRunnerTests {
         time.sleep(30)
         """
 
-        await #expect(throws: SubprocessRunnerError.self) {
-            try await SubprocessRunner.run(
+        do {
+            _ = try await SubprocessRunner.run(
                 binary: "/usr/bin/python3",
                 arguments: ["-c", script],
                 environment: environment,
-                timeout: 0.5,
+                // Python must start and fork before the timeout can exercise descendant cleanup.
+                // Even the loaded-runner budget stays well below the fixture's 30-second lifetime.
+                timeout: 3 * TestTimingBudget.slowdownFactor,
                 label: "escaped-descendant")
+            Issue.record("Expected the escaped-descendant timeout")
+        } catch let error as SubprocessRunnerError {
+            guard case let .timedOut(label) = error else { throw error }
+            #expect(label == "escaped-descendant")
         }
 
         let text = try String(contentsOf: childPIDFile, encoding: .utf8)
@@ -329,5 +368,54 @@ struct SubprocessRunnerTests {
             }
             #expect(count == 20, "All 20 concurrent calls should complete")
         }
+    }
+
+    @Test
+    func `reapDescendants kills a session-escaped child after the parent exits`() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexbar-reap-\(UUID().uuidString)", isDirectory: true)
+        let childPIDFile = root.appendingPathComponent("child.pid")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            if let text = try? String(contentsOf: childPIDFile, encoding: .utf8),
+               let childPID = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            {
+                _ = kill(childPID, SIGKILL)
+            }
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let environment = ["CODEXBAR_TEST_CHILD_PID_FILE": childPIDFile.path]
+        let script = """
+        import os
+        import subprocess
+        import sys
+        import time
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        with open(os.environ["CODEXBAR_TEST_CHILD_PID_FILE"], "w") as handle:
+            handle.write(str(child.pid))
+        time.sleep(0.4)
+        """
+
+        _ = try await SubprocessRunner.run(
+            binary: "/usr/bin/python3",
+            arguments: ["-c", script],
+            environment: environment,
+            timeout: 10,
+            currentDirectoryURL: root,
+            reapDescendants: true,
+            label: "reap-escaped-child")
+
+        let text = try String(contentsOf: childPIDFile, encoding: .utf8)
+        let childPID = try #require(pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        let deadline = Date().addingTimeInterval(1.5)
+        while kill(childPID, 0) == 0, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(kill(childPID, 0) == -1)
     }
 }

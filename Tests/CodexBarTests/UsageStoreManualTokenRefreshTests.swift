@@ -78,6 +78,17 @@ private actor TokenRefreshRecorder {
     func record(provider: UsageProvider, force: Bool) {
         self.calls.append((provider, force))
     }
+
+    func waitForCallCount(_ count: Int, timeout: Duration = .seconds(5)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while self.calls.count < count {
+            if ContinuousClock.now >= deadline {
+                return false
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return true
+    }
 }
 
 @MainActor
@@ -250,7 +261,30 @@ struct UsageStoreManualTokenRefreshTests {
     }
 
     @Test
-    func `regular refresh schedules token-cost refresh without waiting`() async {
+    func `scoped manual refresh preserves an unrelated token sequence before it starts`() async {
+        let store = Self.makeStore(enabledProviders: [.claude, .codex])
+        let recorder = TokenRefreshRecorder()
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await recorder.record(provider: provider, force: force)
+        }
+
+        // Do not yield between installing the scheduled slot and starting the scoped refresh. This
+        // exercises the window before the scheduled task receives its first MainActor turn.
+        store.scheduleTokenRefreshForTesting()
+        await store.refreshTokenUsageNow(for: .claude, force: true)
+
+        let recordedBothRefreshes = await recorder.waitForCallCount(2)
+        #expect(recordedBothRefreshes)
+        let scheduledTask = store.tokenRefreshSequenceTask
+        await scheduledTask?.value
+
+        let calls = await recorder.calls
+        #expect(calls.contains { $0.provider == .codex && !$0.force })
+        #expect(calls.contains { $0.provider == .claude && $0.force })
+    }
+
+    @Test
+    func `ordinary automatic provider refresh schedules token-cost refresh without waiting`() async {
         let store = Self.makeStore()
         let gate = TokenRefreshGate()
         store._test_providerRefreshOverride = { _ in }
@@ -261,27 +295,198 @@ struct UsageStoreManualTokenRefreshTests {
         }
 
         await store.refresh(forceTokenUsage: false)
+        await gate.waitForStart()
         #expect(await gate.hasFinished() == false)
 
         await gate.release()
-        try? await Task.sleep(for: .milliseconds(50))
+        await gate.waitForFinish()
         let calls = await gate.calls
-        if !calls.isEmpty {
-            #expect(calls.map(\.provider) == [.codex])
-            #expect(calls.map(\.force) == [false])
-            #expect(await gate.hasFinished())
+        #expect(calls.map(\.provider) == [.codex])
+        #expect(calls.map(\.force) == [false])
+    }
+
+    @Test
+    func `menu open cost refresh schedules a forced token rescan without waiting`() async {
+        let store = Self.makeStore()
+        let recorder = TokenRefreshRecorder()
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await recorder.record(provider: provider, force: force)
         }
+
+        store.scheduleForcedTokenRefresh()
+
+        let didRecord = await recorder.waitForCallCount(1)
+        #expect(didRecord)
+        await store.tokenRefreshSequenceTask?.value
+        #expect(await recorder.calls.map(\.provider) == [.codex])
+        #expect(await recorder.calls.map(\.force) == [true])
+    }
+
+    @Test
+    func `menu open cost refresh queues one forced pass behind a running token sequence`() async {
+        let store = Self.makeStore()
+        let gate = TokenRefreshGate()
+        let recorder = TokenRefreshRecorder()
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await recorder.record(provider: provider, force: force)
+            if !force {
+                await gate.start(provider: provider, force: force)
+                await gate.waitForRelease()
+                await gate.finish()
+            }
+        }
+
+        store.scheduleTokenRefreshForTesting()
+        await gate.waitForStart()
+
+        // Re-entry while the scheduled sequence is blocked must not preempt it, and the two
+        // requests must coalesce into a single pending forced pass.
+        store.scheduleForcedTokenRefresh()
+        store.scheduleForcedTokenRefresh()
+        #expect(await recorder.calls.count == 1)
+
+        await gate.release()
+        let didRunForcedFollowUp = await recorder.waitForCallCount(2)
+        #expect(didRunForcedFollowUp)
+        await store.tokenRefreshSequenceTask?.value
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(await recorder.calls.map(\.force) == [false, true])
+        #expect(await recorder.calls.map(\.provider) == [.codex, .codex])
+    }
+
+    @Test
+    func `menu open cost refresh coalesces into an active forced pass`() async {
+        let store = Self.makeStore()
+        let gate = TokenRefreshGate()
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await gate.start(provider: provider, force: force)
+            await gate.waitForRelease()
+            await gate.finish()
+        }
+
+        store.scheduleForcedTokenRefresh()
+        await gate.waitForStart()
+        store.scheduleForcedTokenRefresh()
+
+        await gate.release()
+        await store.tokenRefreshSequenceTask?.value
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(await gate.calls.count == 1)
+        #expect(await gate.calls.map(\.force) == [true])
+    }
+
+    @Test
+    func `menu open cost refresh drops requests within the forced-scan floor`() async {
+        let store = Self.makeStore()
+        let recorder = TokenRefreshRecorder()
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await recorder.record(provider: provider, force: force)
+        }
+
+        store.scheduleForcedTokenRefresh()
+        let didRecord = await recorder.waitForCallCount(1)
+        #expect(didRecord)
+        await store.tokenRefreshSequenceTask?.value
+
+        // Reopening the menu right after a forced scan must not start another one.
+        store.scheduleForcedTokenRefresh()
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(store.tokenRefreshSequenceTask == nil)
+        #expect(store.pendingForcedTokenRefresh == false)
+        #expect(await recorder.calls.count == 1)
+    }
+
+    @Test
+    func `menu open cost refresh runs again once the forced-scan floor elapses`() async {
+        let store = Self.makeStore()
+        let recorder = TokenRefreshRecorder()
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await recorder.record(provider: provider, force: force)
+        }
+
+        store.scheduleForcedTokenRefresh()
+        let didRecord = await recorder.waitForCallCount(1)
+        #expect(didRecord)
+        await store.tokenRefreshSequenceTask?.value
+
+        store.lastForcedTokenRefreshStartedAt =
+            Date(timeIntervalSinceNow: -(UsageStore.forcedTokenRefreshMinInterval + 1))
+        store.scheduleForcedTokenRefresh()
+
+        let didRunSecondPass = await recorder.waitForCallCount(2)
+        #expect(didRunSecondPass)
+        await store.tokenRefreshSequenceTask?.value
+        #expect(await recorder.calls.map(\.force) == [true, true])
+    }
+
+    @Test
+    func `menu open cost refresh within the floor does not queue behind a running sequence`() async {
+        let store = Self.makeStore()
+        let gate = TokenRefreshGate()
+        let recorder = TokenRefreshRecorder()
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await recorder.record(provider: provider, force: force)
+            if !force {
+                await gate.start(provider: provider, force: force)
+                await gate.waitForRelease()
+                await gate.finish()
+            }
+        }
+
+        store.scheduleForcedTokenRefresh()
+        let didRecord = await recorder.waitForCallCount(1)
+        #expect(didRecord)
+        await store.tokenRefreshSequenceTask?.value
+
+        store.scheduleTokenRefreshForTesting()
+        await gate.waitForStart()
+
+        // The scheduled sequence is in flight, but the floor drops the request before it can queue.
+        store.scheduleForcedTokenRefresh()
+        #expect(store.pendingForcedTokenRefresh == false)
+
+        await gate.release()
+        await store.tokenRefreshSequenceTask?.value
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(await recorder.calls.map(\.force) == [true, false])
+    }
+
+    @Test
+    func `forced background refresh bypasses a fresh token cache`() async {
+        let store = Self.makeStore()
+        let recorder = TokenRefreshRecorder()
+        store._test_providerRefreshOverride = { _ in }
+        store._test_codexCreditsLoaderOverride = {
+            CreditsSnapshot(remaining: 25, events: [], updatedAt: Date())
+        }
+        store._test_tokenUsageRefreshOverride = { provider, force in
+            await recorder.record(provider: provider, force: force)
+        }
+        defer {
+            store._test_providerRefreshOverride = nil
+            store._test_codexCreditsLoaderOverride = nil
+            store._test_tokenUsageRefreshOverride = nil
+        }
+
+        await store.refresh(forceTokenUsage: false)
+        let didRecordScheduledRefresh = await recorder.waitForCallCount(1)
+        #expect(didRecordScheduledRefresh)
+        guard didRecordScheduledRefresh else {
+            store.cancelForcedRefreshEnrichment()
+            return
+        }
+        await store.refresh(enrichmentMode: .forcedBackground)
+        await store.awaitForcedRefreshEnrichment()
+
+        #expect(await recorder.calls.map(\.provider) == [.codex, .codex])
+        #expect(await recorder.calls.map(\.force) == [false, true])
     }
 
     private static func makeStore(enabledProviders: Set<UsageProvider> = [.codex]) -> UsageStore {
-        let suite = "UsageStoreManualTokenRefreshTests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        let settings = SettingsStore(
-            userDefaults: defaults,
-            configStore: testConfigStore(suiteName: suite),
-            zaiTokenStore: NoopZaiTokenStore(),
-            syntheticTokenStore: NoopSyntheticTokenStore())
+        let settings = testSettingsStore(suiteName: "UsageStoreManualTokenRefreshTests")
         settings.refreshFrequency = .manual
         settings.statusChecksEnabled = false
         settings.costUsageEnabled = true
@@ -298,11 +503,19 @@ struct UsageStoreManualTokenRefreshTests {
                 enabled: enabledProviders.contains(provider))
         }
 
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexbar-tests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let environment = [
+            "HOME": root.path,
+            "CODEX_HOME": root.appendingPathComponent(".codex", isDirectory: true).path,
+            "XDG_CONFIG_HOME": root.appendingPathComponent(".config", isDirectory: true).path,
+        ]
         return UsageStore(
-            fetcher: UsageFetcher(),
+            fetcher: UsageFetcher(environment: environment),
             browserDetection: BrowserDetection(cacheTTL: 0),
             settings: settings,
             startupBehavior: .testing,
-            environmentBase: [:])
+            environmentBase: environment)
     }
 }

@@ -6,7 +6,7 @@ import Testing
 @MainActor
 extension CodexAccountScopedRefreshTests {
     @Test
-    func `repairs collapsed codex windows from matching provider account history`() async throws {
+    func `provider only history never backfills account quota publication`() async throws {
         let settings = self.makeSettingsStore(
             suite: "CodexAccountVisibleHistoryBackfillTests")
         settings.refreshFrequency = .manual
@@ -14,9 +14,9 @@ extension CodexAccountScopedRefreshTests {
 
         let targetID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-222222222222"))
         let siblingID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-333333333333"))
-        let targetHome = FileManager.default.temporaryDirectory
+        let targetHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-target-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-sibling-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: targetHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: siblingHome, withIntermediateDirectories: true)
@@ -91,11 +91,9 @@ extension CodexAccountScopedRefreshTests {
             $0.account.workspaceAccountID == "acct-target"
         }?.snapshot)
         #expect(targetSnapshot.primary?.usedPercent == 1)
-        #expect(targetSnapshot.primary?.windowMinutes == 300)
-        #expect(targetSnapshot.primary?.resetsAt == sessionReset)
-        #expect(targetSnapshot.secondary?.usedPercent == 13)
-        #expect(targetSnapshot.secondary?.windowMinutes == 10080)
-        #expect(targetSnapshot.secondary?.resetsAt == weeklyReset)
+        #expect(targetSnapshot.primary?.windowMinutes == 0)
+        #expect(targetSnapshot.primary?.resetsAt == nil)
+        #expect(targetSnapshot.secondary == nil)
 
         let siblingSnapshot = try #require(store.codexAccountSnapshots.first {
             $0.account.workspaceAccountID == "acct-sibling"
@@ -107,10 +105,10 @@ extension CodexAccountScopedRefreshTests {
         let persistedTarget = try #require(snapshotStore.storedSnapshots.first {
             $0.account.workspaceAccountID == "acct-target"
         }?.snapshot)
-        #expect(persistedTarget.primary?.resetsAt == sessionReset)
-        #expect(persistedTarget.secondary?.resetsAt == weeklyReset)
-        #expect(store.snapshots[.codex]?.primary?.resetsAt == sessionReset)
-        #expect(store.snapshots[.codex]?.secondary?.resetsAt == weeklyReset)
+        #expect(persistedTarget.primary?.resetsAt == nil)
+        #expect(persistedTarget.secondary == nil)
+        #expect(store.snapshots[.codex]?.primary?.resetsAt == nil)
+        #expect(store.snapshots[.codex]?.secondary == nil)
         #expect(store.planUtilizationHistory[.codex]?.accounts[targetHistoryKey]?.count == 2)
     }
 
@@ -161,13 +159,27 @@ extension CodexAccountScopedRefreshTests {
         settings.multiAccountMenuLayout = .stacked
         let targetID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-121212121212"))
         let siblingID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-343434343434"))
+        let targetHome = CodexCredentialFixtures.root
+            .appendingPathComponent("codex-materialize-target-\(UUID().uuidString)", isDirectory: true)
+        let siblingHome = CodexCredentialFixtures.root
+            .appendingPathComponent("codex-materialize-sibling-\(UUID().uuidString)", isDirectory: true)
+        try Self.writeCodexAuthFile(
+            homeURL: targetHome,
+            email: "materialize-stack@example.com",
+            plan: "pro",
+            accountId: "acct-materialize-stack")
+        try Self.writeCodexAuthFile(
+            homeURL: siblingHome,
+            email: "other-stack@example.com",
+            plan: "pro",
+            accountId: "acct-materialize-other")
         let targetAccount = ManagedCodexAccount(
             id: targetID,
             email: "materialize-stack@example.com",
             providerAccountID: "acct-materialize-stack",
             workspaceLabel: "Target Team",
             workspaceAccountID: "acct-materialize-stack",
-            managedHomePath: "/tmp/materialize-stack-target",
+            managedHomePath: targetHome.path,
             createdAt: 1,
             updatedAt: 2,
             lastAuthenticatedAt: 2)
@@ -177,7 +189,7 @@ extension CodexAccountScopedRefreshTests {
             providerAccountID: "acct-materialize-other",
             workspaceLabel: "Other Team",
             workspaceAccountID: "acct-materialize-other",
-            managedHomePath: "/tmp/materialize-stack-other",
+            managedHomePath: siblingHome.path,
             createdAt: 1,
             updatedAt: 2,
             lastAuthenticatedAt: 2)
@@ -185,6 +197,8 @@ extension CodexAccountScopedRefreshTests {
         defer {
             settings._test_managedCodexAccountStoreURL = nil
             try? FileManager.default.removeItem(at: storeURL)
+            try? FileManager.default.removeItem(at: targetHome)
+            try? FileManager.default.removeItem(at: siblingHome)
         }
         settings._test_managedCodexAccountStoreURL = storeURL
         settings.codexActiveSource = .managedAccount(id: targetID)
@@ -225,9 +239,9 @@ extension CodexAccountScopedRefreshTests {
 
         let targetID = try #require(UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-111111111111"))
         let siblingID = try #require(UUID(uuidString: "CCCCCCCC-DDDD-EEEE-FFFF-222222222222"))
-        let targetHome = FileManager.default.temporaryDirectory
+        let targetHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-selected-history-target-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-selected-history-sibling-\(UUID().uuidString)", isDirectory: true)
         try Self.writeCodexAuthFile(
             homeURL: targetHome,
@@ -325,9 +339,9 @@ extension CodexAccountScopedRefreshTests {
 
         let targetID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-444444444444"))
         let siblingID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-555555555555"))
-        let targetHome = FileManager.default.temporaryDirectory
+        let targetHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-cache-target-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-cache-sibling-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: targetHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: siblingHome, withIntermediateDirectories: true)
@@ -400,7 +414,7 @@ extension CodexAccountScopedRefreshTests {
                     resetsAt: nil,
                     resetDescription: nil),
                 secondary: nil,
-                updatedAt: now)
+                updatedAt: now.addingTimeInterval(1))
         }
 
         await store.refreshCodexVisibleAccountsForMenu()
@@ -429,9 +443,9 @@ extension CodexAccountScopedRefreshTests {
 
         let targetID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-666666666666"))
         let siblingID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-777777777777"))
-        let targetHome = FileManager.default.temporaryDirectory
+        let targetHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-current-target-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-current-sibling-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: targetHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: siblingHome, withIntermediateDirectories: true)
@@ -497,10 +511,12 @@ extension CodexAccountScopedRefreshTests {
             startupBehavior: .testing)
         let sessionReset = now.addingTimeInterval(2 * 60 * 60)
         let weeklyReset = now.addingTimeInterval(2 * 24 * 60 * 60)
-        store.lastCodexAccountScopedRefreshGuard = CodexAccountScopedRefreshGuard(
+        let publicationGuard = CodexAccountScopedRefreshGuard(
             source: .managedAccount(id: targetID),
             identity: .providerAccount(id: "acct-current-target"),
             accountKey: "current@example.com")
+        store.lastCodexUsagePublicationGuard = publicationGuard
+        store.lastCodexAccountScopedRefreshGuard = publicationGuard
         store.lastKnownResetSnapshots[.codex] = UsageSnapshot(
             primary: RateWindow(
                 usedPercent: 44,
@@ -558,9 +574,9 @@ extension CodexAccountScopedRefreshTests {
         let targetID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-888888888888"))
         let oldID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-999999999999"))
         let siblingID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-AAAAAAAAAAAA"))
-        let targetHome = FileManager.default.temporaryDirectory
+        let targetHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-prior-target-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-prior-sibling-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: targetHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: siblingHome, withIntermediateDirectories: true)
@@ -664,9 +680,9 @@ extension CodexAccountScopedRefreshTests {
 
         let targetID = try #require(UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-111111111111"))
         let siblingID = try #require(UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-222222222222"))
-        let targetHome = FileManager.default.temporaryDirectory
+        let targetHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-history-target-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-history-sibling-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: targetHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: siblingHome, withIntermediateDirectories: true)
@@ -748,16 +764,16 @@ extension CodexAccountScopedRefreshTests {
     }
 
     @Test
-    func `backfills live codex row from same id prior snapshot`() async throws {
+    func `email only live codex row does not inherit prior quota windows`() async throws {
         let settings = self.makeSettingsStore(
             suite: "CodexAccountVisibleHistoryBackfillTests-live-prior")
         settings.refreshFrequency = .manual
         settings.multiAccountMenuLayout = .stacked
 
         let managedID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-111111111111"))
-        let liveHome = FileManager.default.temporaryDirectory
+        let liveHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-live-prior-\(UUID().uuidString)", isDirectory: true)
-        let managedHome = FileManager.default.temporaryDirectory
+        let managedHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-live-prior-managed-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: liveHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
@@ -829,8 +845,8 @@ extension CodexAccountScopedRefreshTests {
             $0.account.selectionSource == .liveSystem
         }?.snapshot)
         #expect(liveSnapshot.primary?.usedPercent == 9)
-        #expect(liveSnapshot.primary?.windowMinutes == 300)
-        #expect(liveSnapshot.primary?.resetsAt == priorReset)
+        #expect(liveSnapshot.primary?.windowMinutes == 0)
+        #expect(liveSnapshot.primary?.resetsAt == nil)
     }
 
     @Test
@@ -841,9 +857,9 @@ extension CodexAccountScopedRefreshTests {
         settings.multiAccountMenuLayout = .stacked
 
         let managedID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-222222222222"))
-        let liveHome = FileManager.default.temporaryDirectory
+        let liveHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-live-prior-auth-\(UUID().uuidString)", isDirectory: true)
-        let managedHome = FileManager.default.temporaryDirectory
+        let managedHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-live-prior-auth-managed-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: liveHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
@@ -940,9 +956,9 @@ extension CodexAccountScopedRefreshTests {
         settings.multiAccountMenuLayout = .stacked
 
         let managedID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-333333333333"))
-        let liveHome = FileManager.default.temporaryDirectory
+        let liveHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-live-active-auth-\(UUID().uuidString)", isDirectory: true)
-        let managedHome = FileManager.default.temporaryDirectory
+        let managedHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-live-active-auth-managed-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: liveHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
@@ -1043,9 +1059,9 @@ extension CodexAccountScopedRefreshTests {
         settings.multiAccountMenuLayout = .stacked
 
         let managedID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-444444444444"))
-        let liveHome = FileManager.default.temporaryDirectory
+        let liveHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-selected-auth-\(UUID().uuidString)", isDirectory: true)
-        let managedHome = FileManager.default.temporaryDirectory
+        let managedHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-selected-auth-managed-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: liveHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
@@ -1102,8 +1118,10 @@ extension CodexAccountScopedRefreshTests {
                 loginMethod: nil))
         store._setSnapshotForTesting(priorDisplayedSnapshot, provider: .codex)
         store.lastKnownResetSnapshots[.codex] = priorDisplayedSnapshot
-        store.lastCodexAccountScopedRefreshGuard = store.currentCodexAccountScopedRefreshGuard(
+        let priorGuard = store.currentCodexAccountScopedRefreshGuard(
             preferCurrentSnapshot: false)
+        store.lastCodexUsagePublicationGuard = priorGuard
+        store.lastCodexAccountScopedRefreshGuard = priorGuard
         let blocker = BlockingCodexFetchStrategy()
         let liveHomePath = liveHome.path
         self.installContextualCodexProvider(on: store) { context in
@@ -1170,9 +1188,9 @@ extension CodexAccountScopedRefreshTests {
         settings.multiAccountMenuLayout = .stacked
 
         let managedID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-888888888888"))
-        let liveHome = FileManager.default.temporaryDirectory
+        let liveHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-selected-token-\(UUID().uuidString)", isDirectory: true)
-        let managedHome = FileManager.default.temporaryDirectory
+        let managedHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-selected-token-managed-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: liveHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
@@ -1288,9 +1306,9 @@ extension CodexAccountScopedRefreshTests {
         settings.multiAccountMenuLayout = .stacked
 
         let managedID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-777777777777"))
-        let liveHome = FileManager.default.temporaryDirectory
+        let liveHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-selected-email-\(UUID().uuidString)", isDirectory: true)
-        let managedHome = FileManager.default.temporaryDirectory
+        let managedHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-selected-email-managed-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: liveHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: managedHome, withIntermediateDirectories: true)
@@ -1403,14 +1421,22 @@ extension CodexAccountScopedRefreshTests {
 
         #expect(store.snapshots[.codex] == nil)
         #expect(store.lastKnownResetSnapshots[.codex] == nil)
-        #expect(store.codexAccountSnapshots.isEmpty)
+        #expect(!store.codexAccountSnapshots.contains {
+            $0.account.selectionSource == .liveSystem
+        })
+        #expect(store.codexAccountSnapshots.contains {
+            $0.account.workspaceAccountID == "acct-managed-selected-email"
+        })
         #expect(!snapshotStore.storedSnapshots.contains {
             $0.account.selectionSource == .liveSystem
+        })
+        #expect(snapshotStore.storedSnapshots.contains {
+            $0.account.workspaceAccountID == "acct-managed-selected-email"
         })
     }
 
     @Test
-    func `stacked visible refresh keeps selected apply after provider account email changes`() async throws {
+    func `stacked visible refresh discards selected apply after provider account email changes`() async throws {
         let settings = self.makeSettingsStore(
             suite: "CodexAccountVisibleHistoryBackfillTests-selected-provider-email-change")
         settings.refreshFrequency = .manual
@@ -1418,9 +1444,9 @@ extension CodexAccountScopedRefreshTests {
 
         let targetID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-555555555555"))
         let siblingID = try #require(UUID(uuidString: "DDDDDDDD-EEEE-FFFF-AAAA-666666666666"))
-        let targetHome = FileManager.default.temporaryDirectory
+        let targetHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-provider-email-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-provider-email-sibling-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: targetHome, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: siblingHome, withIntermediateDirectories: true)
@@ -1475,6 +1501,27 @@ extension CodexAccountScopedRefreshTests {
         let targetHomePath = targetHome.path
         let now = Date()
         let reset = now.addingTimeInterval(90 * 60)
+        let prior = UsageSnapshot(
+            primary: RateWindow(
+                usedPercent: 63,
+                windowMinutes: 300,
+                resetsAt: reset,
+                resetDescription: nil),
+            secondary: nil,
+            updatedAt: now.addingTimeInterval(-60),
+            identity: ProviderIdentitySnapshot(
+                providerID: .codex,
+                accountEmail: "old-provider@example.com",
+                accountOrganization: nil,
+                loginMethod: "Provider Team"))
+        let priorGuard = CodexAccountScopedRefreshGuard(
+            source: .managedAccount(id: targetID),
+            identity: .providerAccount(id: "acct-provider-email"),
+            accountKey: "old-provider@example.com")
+        store.snapshots[.codex] = prior
+        store.lastKnownResetSnapshots[.codex] = prior
+        store.lastCodexUsagePublicationGuard = priorGuard
+        store.lastCodexAccountScopedRefreshGuard = priorGuard
         self.installContextualCodexProvider(on: store) { context in
             if context.env["CODEX_HOME"] == targetHomePath {
                 return try await blocker.awaitResult()
@@ -1514,27 +1561,16 @@ extension CodexAccountScopedRefreshTests {
                 loginMethod: "Pro"))))
         await refreshTask.value
 
-        let selectedSnapshot = try #require(store.snapshots[.codex])
-        #expect(selectedSnapshot.primary?.usedPercent == 64)
-        #expect(selectedSnapshot.accountEmail(for: .codex) == "new-provider@example.com")
-        #expect(selectedSnapshot.loginMethod(for: .codex) == "Pro")
-        #expect(store.lastKnownResetSnapshots[.codex]?.primary?.resetsAt == reset)
-        #expect(store.lastCodexAccountScopedRefreshGuard?.accountKey == "new-provider@example.com")
-
-        let targetRow = try #require(store.codexAccountSnapshots.first {
+        #expect(store.snapshots[.codex] == nil)
+        #expect(store.lastKnownResetSnapshots[.codex] == nil)
+        #expect(!store.codexAccountSnapshots.contains {
             $0.account.workspaceAccountID == "acct-provider-email"
         })
-        #expect(targetRow.account.email == "new-provider@example.com")
-        #expect(targetRow.snapshot?.primary?.usedPercent == 64)
-        #expect(targetRow.snapshot?.accountEmail(for: .codex) == "new-provider@example.com")
-        #expect(targetRow.snapshot?.loginMethod(for: .codex) == "Pro")
-
-        let persistedTarget = try #require(snapshotStore.storedSnapshots.first {
+        #expect(store.codexAccountSnapshots.contains {
+            $0.account.workspaceAccountID == "acct-provider-sibling"
+        })
+        #expect(!snapshotStore.storedSnapshots.contains {
             $0.account.workspaceAccountID == "acct-provider-email"
         })
-        #expect(persistedTarget.account.email == "new-provider@example.com")
-        #expect(persistedTarget.snapshot?.primary?.usedPercent == 64)
-        #expect(persistedTarget.snapshot?.accountEmail(for: .codex) == "new-provider@example.com")
-        #expect(persistedTarget.snapshot?.loginMethod(for: .codex) == "Pro")
     }
 }

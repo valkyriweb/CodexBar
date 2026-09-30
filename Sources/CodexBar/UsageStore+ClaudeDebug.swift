@@ -13,7 +13,7 @@ extension UsageStore {
     struct ClaudeDebugLogConfiguration {
         let runtime: CodexBarCore.ProviderRuntime
         let sourceMode: ProviderSourceMode
-        let environment: [String: String]
+        @ProcessEnvironment private(set) var environment: [String: String]
         let webExtrasEnabled: Bool
         let usageDataSource: ClaudeUsageDataSource
         let cookieSource: ProviderCookieSource
@@ -107,7 +107,8 @@ extension UsageStore {
                 lines.append("Auto source selected.")
                 return lines.joined(separator: "\n")
             case .api:
-                let hasAdminKey = ProviderTokenResolver.claudeAdminAPIToken(
+                let hasAdminKey = ProviderTokenResolver.token(
+                    for: .claude,
                     environment: configuration.environment) != nil
                 lines.append("Admin API source selected.")
                 lines.append("hasAdminAPIKey=\(hasAdminKey)")

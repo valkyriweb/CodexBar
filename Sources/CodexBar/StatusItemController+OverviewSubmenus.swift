@@ -2,22 +2,23 @@ import AppKit
 import CodexBarCore
 
 extension StatusItemController {
-    func makeOverviewRowSubmenu(
-        provider: UsageProvider,
-        model: UsageMenuCardView.Model,
-        width: CGFloat) -> NSMenu?
-    {
+    /// Every submenu below is built from provider-level stores that describe the selected or
+    /// ambient account, so an account-scoped row gets no submenu rather than another account's data.
+    func makeOverviewRowSubmenu(row: OverviewAccountRow, width: CGFloat) -> NSMenu? {
+        guard row.accountID == nil else { return nil }
+        let provider = row.provider
+        let model = row.model
         if provider == .openai,
+           self.settings.costSummaryShowsSubmenu(for: provider),
            let submenu = self.makeOpenAIAPIUsageSubmenu(provider: provider, width: width)
         {
             return submenu
         }
-        if provider == .zai,
-           let submenu = self.makeZaiUsageDetailsSubmenu(snapshot: self.store.snapshot(for: provider))
-        {
-            return submenu
-        }
-        if UsageStore.tokenCostRequiresProviderSnapshot(provider),
+        // Mistral's top usage pane has no rate-limit bars of its own, so its Overview row prioritizes
+        // cost history when the display style permits it. Other `tokenCostRequiresProviderSnapshot`
+        // providers (e.g. opencodego) show real rate-limit bars and fall through to the generic check.
+        if provider == .mistral,
+           self.settings.costSummaryShowsSubmenu(for: provider),
            let submenu = self.makeCostHistorySubmenu(provider: provider, width: width)
         {
             return submenu
@@ -40,11 +41,7 @@ extension StatusItemController {
         else {
             return
         }
-        // Per-account rows suffix the identifier with "-<accountID>"; provider raw
-        // values contain no dashes, so the first dash-separated token is the provider.
-        let rawProvider = String(represented.dropFirst(Self.overviewRowIdentifierPrefix.count))
-        let providerToken = rawProvider.split(separator: "-").first.map(String.init) ?? rawProvider
-        guard let provider = UsageProvider(rawValue: providerToken),
+        guard let provider = Self.overviewProvider(fromRepresentedObject: represented),
               let menu = sender.menu
         else {
             return
@@ -54,12 +51,12 @@ extension StatusItemController {
     }
 
     func selectOverviewProvider(_ provider: UsageProvider, menu: NSMenu) {
-        if !self.settings.mergedMenuLastSelectedWasOverview, self.selectedMenuProvider == provider { return }
+        if !self.settings.mergedMenuLastSelectedWasOverview, self.selectedMenuProvider == provider.instanceID { return }
         self.preservingMergedSwitcherContentCachesDuringInvalidation {
             self.settings.mergedMenuLastSelectedWasOverview = false
-            self.lastMergedSwitcherSelection = .provider(provider)
-            self.selectedMenuProvider = provider
-            self.lastMenuProvider = provider
+            self.lastMergedSwitcherSelection = .provider(provider.instanceID)
+            self.selectedMenuProvider = provider.instanceID
+            self.lastMenuProvider = provider.instanceID
             self.refreshProviderSelectionDependentUI(deferRendering: true)
         }
         // Custom-view clicks stay open and rebuild next turn. Standard menu-item activation can close;

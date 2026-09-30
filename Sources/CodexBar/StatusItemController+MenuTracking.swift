@@ -2,6 +2,28 @@ import AppKit
 import CodexBarCore
 
 extension StatusItemController {
+    func beginMenuTrackingSession(for menu: NSMenu) {
+        if menu.supermenu != nil, !self.isHostedSubviewMenu(menu) {
+            self.advanceMenuInteraction(for: self.rootMenu(for: menu))
+        }
+        let menuID = ObjectIdentifier(menu)
+        let generation = self.menuSession.beginTrackingSession(menuID)
+        (menu as? StatusItemMenu)?.menuInteractionGeneration = generation
+    }
+
+    func endMenuTrackingSession(for menu: NSMenu) {
+        (menu as? StatusItemMenu)?.menuInteractionGeneration = nil
+        self.menuSession.endTrackingSession(ObjectIdentifier(menu))
+    }
+
+    private func rootMenu(for menu: NSMenu) -> NSMenu {
+        var root = menu
+        while let parent = root.supermenu {
+            root = parent
+        }
+        return root
+    }
+
     private static let defaultClosedMenuPreparationDelay: Duration = .milliseconds(350)
 
     var isMenuRefreshEnabled: Bool {
@@ -130,12 +152,15 @@ extension StatusItemController {
         self.openMenuRebuildTasks.removeValue(forKey: key)?.cancel()
         self.openMenuRebuildRequests.cancel(for: key)
         self.openMenuRebuildsClosingHostedSubviewMenus.remove(key)
+        self.pendingMenuBaselineResyncs.remove(key)
+        self.cancelManualRefreshViewportRestore(for: key)
     }
 
     func clearMenuHighlight(_ key: ObjectIdentifier) {
         if let highlightedView = self.highlightedMenuItems.removeValue(forKey: key)?.view {
             (highlightedView as? MenuCardHighlighting)?.setHighlighted(false)
         }
+        self.nativeHighlightDeferredMenuRebuilds.removeValue(forKey: key)
     }
 
     func removeMenuLifecycleState(_ key: ObjectIdentifier) {
@@ -311,18 +336,21 @@ extension StatusItemController {
         var parts: [String] = []
         for target in providers {
             parts.append(target.rawValue)
-            parts.append(self.providerIdentitySignature(self.store.snapshot(for: target)?.identity(for: target)))
+            parts.append(self.providerIdentitySignature(
+                self.store.snapshot(for: target.instanceID)?.identity(for: target.instanceID)))
 
+            // Provider-specific by design: Codex managed profiles and Claude swap accounts contribute extra identity
+            // sources beyond the generic provider snapshot/account fallback.
             if target != .codex, self.store.metadata(for: target).usesAccountFallback {
                 let account = self.store.accountInfo(for: target)
                 parts.append(Self.menuIdentityField(account.email))
                 parts.append(Self.menuIdentityField(account.plan))
             }
 
-            for accountSnapshot in self.store.accountSnapshots[target] ?? [] {
+            for accountSnapshot in self.store.accountSnapshots[target.instanceID] ?? [] {
                 parts.append(accountSnapshot.account.id.uuidString)
                 parts.append(Self.menuIdentityField(accountSnapshot.account.label))
-                parts.append(self.providerIdentitySignature(accountSnapshot.snapshot?.identity(for: target)))
+                parts.append(self.providerIdentitySignature(accountSnapshot.snapshot?.identity(for: target.instanceID)))
             }
 
             if target == .codex {
@@ -337,14 +365,17 @@ extension StatusItemController {
                 }
                 for accountSnapshot in self.store.codexAccountSnapshots {
                     parts.append(Self.menuIdentityField(accountSnapshot.id))
-                    parts.append(self.providerIdentitySignature(accountSnapshot.snapshot?.identity(for: target)))
+                    parts.append(self.providerIdentitySignature(
+                        accountSnapshot.snapshot?.identity(for: target.instanceID)))
                 }
             }
 
             if target == .kilo {
                 for scopeSnapshot in self.store.kiloScopeSnapshots {
                     parts.append(Self.menuIdentityField(scopeSnapshot.id))
-                    parts.append(self.providerIdentitySignature(scopeSnapshot.snapshot?.identity(for: target)))
+                    parts
+                        .append(self
+                            .providerIdentitySignature(scopeSnapshot.snapshot?.identity(for: target.instanceID)))
                 }
             }
 
@@ -353,7 +384,8 @@ extension StatusItemController {
                 for accountSnapshot in self.store.claudeSwapAccountSnapshots {
                     parts.append(Self.menuIdentityField(accountSnapshot.id.opaqueID))
                     parts.append(accountSnapshot.isActive ? "active" : "inactive")
-                    parts.append(self.providerIdentitySignature(accountSnapshot.snapshot?.identity(for: target)))
+                    parts.append(self.providerIdentitySignature(
+                        accountSnapshot.snapshot?.identity(for: target.instanceID)))
                 }
             }
         }
@@ -378,6 +410,10 @@ extension StatusItemController {
         self.openMenus.values.contains { self.isHostedSubviewMenu($0) }
     }
 
+    func hasOpenNonHostedChildMenu() -> Bool {
+        self.openMenus.values.contains { $0.supermenu != nil && !self.isHostedSubviewMenu($0) }
+    }
+
     func refreshOpenMenuIfStillVisible(_ menu: NSMenu, provider: UsageProvider?) {
         let key = ObjectIdentifier(menu)
         guard self.openMenus[key] != nil else { return }
@@ -391,27 +427,86 @@ extension StatusItemController {
             allowStaleContentDuringDataRefresh: true)
     }
 
+    /// Marks the open root menu stale and schedules one in-place rebuild that is allowed to run now.
+    /// Unlike `refreshOpenMenuIfStillVisible`, the rebuild is not deferred for the whole tracking
+    /// session, so delayed updates (e.g. account-scoped refresh phases, #3709) reach the open menu;
+    /// unlike `rebuildOpenMenuIfStillVisible`, the content version is bumped so stale-state and
+    /// hosted-submenu close reconciliation still observe the change.
+    func scheduleOpenRootMenuDataRebuildIfStillVisible(
+        _ menu: NSMenu,
+        provider: UsageProvider,
+        isCurrent: (@MainActor () -> Bool)? = nil)
+    {
+        let key = ObjectIdentifier(menu)
+        guard self.openMenus[key] != nil else { return }
+        guard !self.isHostedSubviewMenu(menu) else { return }
+        let stillSelected: @MainActor () -> Bool = { [weak self, weak menu] in
+            guard let self, let menu else { return false }
+            guard isCurrent?() ?? true else { return false }
+            if let selection = self.resolvedMergedMenuSelection(
+                enabledProviders: self.store.enabledFirstPartyProvidersForDisplay())
+            {
+                return selection == .provider(provider.instanceID)
+            }
+            return self.menuProvider(for: menu) == provider
+        }
+        // Late account data must not replace a newer provider/Overview selection request.
+        guard stillSelected() else { return }
+        self.invalidateMenus(refreshOpenMenus: false, allowStaleContentDuringDataRefresh: true)
+        self.scheduleTrackingMenuRebuildIfStillVisible(menu, provider: provider, beforeRebuild: stillSelected)
+    }
+
     func rebuildOpenMenuIfStillVisible(_ menu: NSMenu, provider: UsageProvider?) {
         let key = ObjectIdentifier(menu)
         guard self.openMenus[key] != nil else { return }
-        guard self.isHostedSubviewMenu(menu) || !self.hasOpenHostedSubviewMenu() else { return }
-        self.populateMenu(menu, provider: provider)
-        self.markMenuFresh(menu)
-        self.menuSession.clearParentRebuildDeferral(key)
-        self.applyIcon(phase: nil)
+        let isHostedSubviewMenu = self.isHostedSubviewMenu(menu)
+        guard isHostedSubviewMenu || !self.hasOpenHostedSubviewMenu() else { return }
+        guard !self.isNativeMenuItemHighlighted(in: menu) else {
+            self.nativeHighlightDeferredMenuRebuilds[key] = NativeHighlightDeferredMenuRebuild(provider: provider)
+            return
+        }
+        self.nativeHighlightDeferredMenuRebuilds.removeValue(forKey: key)
+        if isHostedSubviewMenu {
+            self.refreshHostedSubviewMenu(menu)
+        } else {
+            self.populateMenu(menu, provider: provider)
+            self.markMenuFresh(menu)
+            self.menuSession.clearParentRebuildDeferral(key)
+            self.applyIcon(phase: nil)
+            self.scheduleDeferredManualRefreshViewportRestoreAfterRebuild(for: menu)
+        }
         #if DEBUG
         self._test_openMenuRebuildObserver?(menu)
         #endif
+    }
+
+    func isNativeMenuItemHighlighted(in menu: NSMenu) -> Bool {
+        let key = ObjectIdentifier(menu)
+        guard let item = self.highlightedMenuItems[key], item.menu === menu else { return false }
+        return item.isEnabled && item.view == nil
+    }
+
+    func resumeMenuRebuildDeferredForNativeHighlightIfNeeded(_ menu: NSMenu) {
+        let key = ObjectIdentifier(menu)
+        guard let deferredRebuild = self.nativeHighlightDeferredMenuRebuilds[key] else { return }
+        guard self.openMenus[key] === menu else {
+            self.nativeHighlightDeferredMenuRebuilds.removeValue(forKey: key)
+            self.pendingMenuBaselineResyncs.remove(key)
+            return
+        }
+        let isHostedSubviewMenu = self.isHostedSubviewMenu(menu)
+        guard isHostedSubviewMenu || !self.hasOpenHostedSubviewMenu() else { return }
+        self.nativeHighlightDeferredMenuRebuilds.removeValue(forKey: key)
+        self.scheduleOpenMenuRebuildIfStillVisible(
+            menu,
+            provider: deferredRebuild.provider,
+            duringTracking: true)
     }
 
     func refreshOpenMenusIfNeeded() {
         guard self.isMenuRefreshEnabled else { return }
         guard !self.openMenus.isEmpty else { return }
         self.refreshOpenMenusIfNeeded(allowsParentRebuild: false)
-    }
-
-    func refreshOpenMenusForStructureChange() {
-        self.refreshOpenMenusAllowingParentRebuild()
     }
 
     func refreshOpenMenusAfterHostedSubviewClose() {
@@ -422,7 +517,22 @@ extension StatusItemController {
             return
         }
         self.parentMenuRebuildPendingAfterHostedSubviewClose = false
-        self.refreshOpenMenusIfNeeded(allowsParentRebuild: true)
+        self.refreshOpenMenusIfNeeded(allowsParentRebuild: true, duringTracking: true)
+        self.resumeParentMenuRebuildsDeferredForNativeHighlightAfterHostedSubviewClose()
+    }
+
+    private func resumeParentMenuRebuildsDeferredForNativeHighlightAfterHostedSubviewClose() {
+        guard !self.hasOpenHostedSubviewMenu() else { return }
+        let deferredParents = self.openMenus.values.filter { menu in
+            let key = ObjectIdentifier(menu)
+            return !self.isHostedSubviewMenu(menu) &&
+                self.nativeHighlightDeferredMenuRebuilds[key] != nil
+        }
+        // Schedule the saved explicit request after the generic dirty-menu pass, even when the native
+        // highlight is still active. The scheduled rebuild will defer again, preserving its provider.
+        for menu in deferredParents {
+            self.resumeMenuRebuildDeferredForNativeHighlightIfNeeded(menu)
+        }
     }
 
     func completeParentMenuRebuildAfterHostedSubviewCloseIfNeeded() {
@@ -457,8 +567,8 @@ extension StatusItemController {
 
     private func refreshOpenMenusIfNeeded(
         allowsParentRebuild: Bool,
-        deferParentRebuildDuringTracking: Bool = false,
-        respectsParentRebuildDeferral: Bool = false)
+        duringTracking: Bool = false,
+        deferParentRebuildDuringTracking: Bool = false)
     {
         var orphanedKeys: [ObjectIdentifier] = []
         let hasOpenHostedSubviewMenu = self.hasOpenHostedSubviewMenu()
@@ -470,8 +580,8 @@ extension StatusItemController {
             self.refreshOpenMenuIfNeeded(
                 menu,
                 allowsParentRebuild: allowsParentRebuild,
+                duringTracking: duringTracking,
                 deferParentRebuildDuringTracking: deferParentRebuildDuringTracking,
-                respectsParentRebuildDeferral: respectsParentRebuildDeferral,
                 hasOpenHostedSubviewMenu: hasOpenHostedSubviewMenu)
         }
         self.removeOrphanedOpenMenuEntries(orphanedKeys)
@@ -480,12 +590,12 @@ extension StatusItemController {
     private func refreshOpenMenuIfNeeded(
         _ menu: NSMenu,
         allowsParentRebuild: Bool,
+        duringTracking: Bool,
         deferParentRebuildDuringTracking: Bool,
-        respectsParentRebuildDeferral: Bool,
         hasOpenHostedSubviewMenu: Bool)
     {
         if self.isHostedSubviewMenu(menu) {
-            self.refreshHostedSubviewMenu(menu)
+            self.scheduleOpenMenuRebuildIfStillVisible(menu, provider: self.menuProvider(for: menu))
             return
         }
         guard allowsParentRebuild else { return }
@@ -496,14 +606,11 @@ extension StatusItemController {
             self.menuSession.deferParentRebuild(key)
             return
         }
-        if respectsParentRebuildDeferral, self.menuSession.isParentRebuildDeferred(key) {
-            return
-        }
         self.menuSession.clearParentRebuildDeferral(key)
         guard !hasOpenHostedSubviewMenu else { return }
 
         let provider = self.menuProvider(for: menu)
-        self.scheduleOpenMenuRebuildIfStillVisible(menu, provider: provider)
+        self.scheduleOpenMenuRebuildIfStillVisible(menu, provider: provider, duringTracking: duringTracking)
     }
 
     private func removeOrphanedOpenMenuEntries(_ keys: [ObjectIdentifier]) {

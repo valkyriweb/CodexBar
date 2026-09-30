@@ -1,16 +1,24 @@
 import AppKit
 
 extension StatusItemController {
+    func isPersistentRefreshItem(_ item: NSMenuItem) -> Bool {
+        item.representedObject as? String == Self.persistentRefreshMenuItemID
+    }
+
     func makePersistentRefreshItem(title: String, menu: NSMenu, width: CGFloat) -> NSMenuItem {
         let shortcutText = self.shortcut(for: .refresh).map(Self.shortcutDisplayLabel)
         let metrics = PersistentRefreshRowMetrics.defaults
         let view = PersistentRefreshMenuView(
             title: title,
-            systemImageName: MenuDescriptor.MenuAction.refresh.systemImageName,
+            systemImageName: nil,
             shortcutText: shortcutText,
             onClick: { [weak self, weak menu] in
                 guard let self, let menu else { return }
-                self.performPersistentRefreshAction(in: ObjectIdentifier(menu))
+                if let menu = menu as? StatusItemMenu {
+                    menu.requestPersistentRefreshAction()
+                } else {
+                    self.performPersistentRefreshAction(in: ObjectIdentifier(menu))
+                }
             })
         let enabled = !self.isRefreshActionInFlight(for: menu)
         view.setEnabled(enabled)
@@ -22,7 +30,9 @@ extension StatusItemController {
         item.view = view
         item.isEnabled = enabled
         item.keyEquivalentModifierMask = []
-        item.toolTip = title
+        // No toolTip: the row already reads "Refresh" with its shortcut badge, and
+        // during tab switches the churn under a stationary cursor makes AppKit pop
+        // the tooltip instantly — a stray floating "Refresh" box beside the menu.
         return item
     }
 
@@ -30,11 +40,21 @@ extension StatusItemController {
         for shortcut: (key: String, modifiers: NSEvent.ModifierFlags)) -> String
     {
         var label = ""
-        if shortcut.modifiers.contains(.control) { label += "^" }
-        if shortcut.modifiers.contains(.option) { label += "⌥" }
-        if shortcut.modifiers.contains(.shift) { label += "⇧" }
-        if shortcut.modifiers.contains(.command) { label += "⌘" }
-        if !label.isEmpty { label += " " }
+        if shortcut.modifiers.contains(.control) {
+            label += "^"
+        }
+        if shortcut.modifiers.contains(.option) {
+            label += "⌥"
+        }
+        if shortcut.modifiers.contains(.shift) {
+            label += "⇧"
+        }
+        if shortcut.modifiers.contains(.command) {
+            label += "⌘"
+        }
+        if !label.isEmpty {
+            label += " "
+        }
         return label + shortcut.key.uppercased()
     }
 }

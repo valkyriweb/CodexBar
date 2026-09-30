@@ -3,123 +3,158 @@
     <channel>
         <title>CodexBar</title>
         <item>
-            <title>0.41.0</title>
-            <pubDate>Tue, 07 Jul 2026 00:45:58 +0100</pubDate>
+            <title>0.70.0</title>
+            <pubDate>Tue, 29 Sep 2026 23:52:57 -0700</pubDate>
             <link>https://raw.githubusercontent.com/steipete/CodexBar/main/appcast.xml</link>
-            <sparkle:version>100</sparkle:version>
-            <sparkle:shortVersionString>0.41.0</sparkle:shortVersionString>
+            <sparkle:version>161</sparkle:version>
+            <sparkle:shortVersionString>0.70.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <description><![CDATA[<h2>CodexBar 0.41.0</h2>
+            <description><![CDATA[<h2>CodexBar 0.70.0</h2>
+<h3>Highlights</h3>
+<ul>
+<li>Quota burndown: Plan Usage now shows the recorded remaining-quota burndown for Codex and Claude next to utilization history, with capture age and calendar endpoints (#4085). Thanks @callmejustdodo!</li>
+<li>Refreshed provider colors: 16 accents now match official brand sources, while colors that would hurt menu bar or widget readability keep their current values (#4075). Thanks @elijahfriedman!</li>
+<li>More accurate costs: Mistral usage is priced by event type, API zone, and service tier, Antigravity and Codex model aliases and published Cyber rates are priced, and Mistral&#x27;s Monthly Plan can drive the menu bar metric (#4076, #4094, #4072). Thanks @T0mSIlver and @urda!</li>
+<li>Hardened diagnostics: every stored process environment is redacted from debug and test output, with a repository guard against regressions (#4106).</li>
+</ul>
+<h3>Security</h3>
+<ul>
+<li>Redact every remaining stored process environment in the app, CLI, provider contexts, and session scanners, and guard against new unredacted environment properties with a repository check (#4106).</li>
+</ul>
 <h3>Added</h3>
 <ul>
-<li>CLI: add responsive <code>codexbar cards</code> and compact <code>--brief</code> terminal usage views. Thanks @DonnieFi!</li>
-<li>Antigravity: show pace details for legacy model-family and current session/weekly quota rows without changing compact icon lane semantics. Thanks @Zihao-Qi!</li>
-<li>Widgets: make Kimi available with Weekly, Rate Limit, and Monthly quota rows. Thanks @joeVenner!</li>
-<li>Kimi: show the subscription 7-day Code quota in menus and large widgets. Thanks @skyzer!</li>
-<li>Claude: distinguish Max 5x and Max 20x in the plan label instead of a flat &quot;Max&quot;. Thanks @kes02!</li>
-</ul>
-<h3>Fixed</h3>
-<ul>
-<li>Ollama: point missing-session recovery to the current <code>/signin</code> page instead of the protected settings page. Thanks @joeVenner!</li>
-<li>Alibaba Token Plan: support International Model Studio while preserving China-mainland upgrades and isolating regional cookie caches. Thanks @harshav167!</li>
-<li>Amp: open the current Usage page from the menu dashboard action. Thanks @3kh0!</li>
-<li>Browser cookies: stop automatic Chromium-family probes after the first Safe Storage denial, while keeping an explicit Refresh retry available (#1952). Thanks @CoreyCole!</li>
-<li>Claude: keep yearless reset dates in the upcoming year when a quota crosses New Year&#x27;s Day. Thanks @devYRPauli!</li>
-<li>Claude web: preserve fractional session and weekly utilization instead of displaying it as zero or unavailable. Thanks @devYRPauli!</li>
-<li>Gemini: detect Google&#x27;s consumer-tier shutdown response and offer an explicit Antigravity handoff without changing ordinary auth failures or enabling fallback automatically. Thanks @Yuxin-Qiao!</li>
-<li>Gemini: use the real Flash quota in menu-bar metrics when an account has no Pro quota. Thanks @devYRPauli!</li>
-<li>Ollama API: describe rejected keys as invalid or revoked, matching Ollama&#x27;s current key lifecycle. Thanks @joeVenner!</li>
-<li>Settings: keep Language, Default Terminal, and Refresh cadence selectors interactive on macOS 27.</li>
-<li>Usage formatting: show every positive sub-1% value as <code>&lt;1%</code> instead of rounding values above 0.5% up to <code>1%</code>. Thanks @devYRPauli!</li>
-<li>Codex menu: hide error-only optional Credits and OpenAI web setup diagnostics while keeping them visible in provider Settings.</li>
-<li>Codex quotas: show the session quota as unavailable while an exhausted weekly limit is still binding, including menu-bar icons and widgets. Thanks @Yuxin-Qiao!</li>
-<li>Codex cost history: reuse cached aggregate pricing and one pricing catalog across daily and project reports, carry fresh cache state across launches, and treat unpriced models as migrated, avoiding repeated row scans, filesystem work, and duplicate background scans on large local histories.</li>
-<li>Devin: keep exact 1% usage from being inflated to 100% while preserving fractional fallback quota semantics. Thanks @Lex-ic-on!</li>
-<li>Kimi K2: reject invalid and out-of-range numeric timestamps while preserving valid second and millisecond values. Thanks @joeVenner!</li>
-<li>Kimi K2: reject non-finite credit and token values before they reach menus, CLI output, or widgets. Thanks @joeVenner!</li>
-<li>Kimi: call the current <code>GetSubscriptionStats</code> membership endpoint so the Monthly subscription quota is populated again. Thanks @skyzer!</li>
-<li>Kimi: show the five-hour rate limit before the weekly quota while preserving existing menu-bar metric preferences. Thanks @Zihao-Qi!</li>
-<li>Menu bar: detect Tahoe&#x27;s blocked no-window state at startup when macOS still records the icon as enabled, so affected users receive recovery guidance instead of a silently missing icon (#1945). Thanks @mmyyfirstb!</li>
-</ul>
-<p><a href="https://github.com/steipete/CodexBar/blob/main/CHANGELOG.md">View full changelog</a></p>
-]]></description>
-            <enclosure url="https://github.com/steipete/CodexBar/releases/download/v0.41.0/CodexBar-macos-universal-0.41.0.zip" length="45357508" type="application/octet-stream" sparkle:edSignature="LtGMuPAjKIzZg40v5KagieJ9cUUyMvo/Y8FQxdXA1jtbM3RnIhocoEm7u+Cf/Luc9OsAy27Cn04Yd5LBhQEoAQ=="/>
-        </item>
-        <item>
-            <title>0.40.0</title>
-            <pubDate>Mon, 06 Jul 2026 00:10:16 +0100</pubDate>
-            <link>https://raw.githubusercontent.com/steipete/CodexBar/main/appcast.xml</link>
-            <sparkle:version>99</sparkle:version>
-            <sparkle:shortVersionString>0.40.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <description><![CDATA[<h2>CodexBar 0.40.0</h2>
-<h3>Added</h3>
-<ul>
-<li>Claude: show opt-in read-only claude-swap accounts as stacked usage cards without delaying ambient refreshes. Thanks @optimiz-r!</li>
-<li>Claude: switch inactive claude-swap accounts directly from their stacked usage cards and refresh usage immediately.</li>
-<li>Codex dashboard: show calendar-correct raw Today and 30-day credit totals without converting credits to billed dollars. Thanks @avenoxai!</li>
-<li>Cost charts: show visible, unit-safe scale labels across detailed history, inline menus, and widgets. Thanks @FNDEVVE!</li>
-<li>Cursor: read the signed-in app token on Linux, with explicit manual-cookie web-source support and XDG config paths. Thanks @DonnieFi!</li>
-<li>Devin: show remaining extra-usage balance in menus, CLI, and widgets while respecting optional-usage visibility. Thanks @FNDEVVE!</li>
-<li>Widgets: make Mistral available in provider selection and switching. Thanks @joeVenner!</li>
+<li>Plan Usage: show recorded remaining-quota burndown for Codex and Claude alongside utilization history, with capture age and calendar endpoints (#4085). Thanks @callmejustdodo!</li>
 </ul>
 <h3>Changed</h3>
 <ul>
-<li>Settings: keep the sidebar fixed and visible while resizing, prevent collapse or over-expansion, and cap detail content width for readability. Thanks @Zihao-Qi!</li>
-<li>Debug builds: add a compact <code>D</code> beside menu-bar icons and identify them as CodexBar Debug in tooltips and accessibility.</li>
-<li>Usage bars: distinguish full-height quota-warning thresholds from subtle workday-boundary markers. Thanks @Alekstodo!</li>
+<li>Provider colors: refresh 16 verified brand accents while preserving readable menu colors and existing widget palettes; synchronize website and social preview colors (#4075). Thanks @elijahfriedman!</li>
 </ul>
 <h3>Fixed</h3>
 <ul>
-<li>Codex cost history: reuse one pricing catalog while building project rollups and carry fresh cache state across launches, avoiding repeated filesystem work and duplicate background scans on large local histories.</li>
-<li>Providers: detect Claude Desktop on fresh installs and ignore Gemini CLI installations without usable OAuth credentials.</li>
-<li>Claude cost history: include nested Claude Desktop local-agent logs while preserving current Code/Cowork coverage through the shared <code>~/.claude/projects</code> store. Thanks @Zihao-Qi!</li>
-<li>Claude: give multiple claude-swap accounts precedence over token-account cards and segmented switching so adapter rows remain visible. Thanks @optimiz-r!</li>
-<li>Menus: scope manual refresh state to the provider being refreshed, allowing independent provider refreshes without greying unrelated rows. Thanks @hhh2210!</li>
-<li>Claude history: quarantine same-directory account-switch samples until credential ownership is stable, preventing plan-utilization history from crossing accounts. Thanks @ss251!</li>
-<li>Language picker: keep language names readable in their native form and make System follow macOS without removing unrelated overrides. Thanks @Zihao-Qi!</li>
-<li>Reset times: preserve minute precision in long day-scale countdowns when there are no whole hours, while keeping countdowns compact to two units. Thanks @konon4!</li>
-<li>Mistral: reject non-finite and overflowing credit balances before they can reach menu, CLI, or widget formatting. Thanks @joeVenner!</li>
+<li>Settings: keep the Usage &amp; Spend title and Refresh button readable by giving the time-range picker its own row (#4064). Thanks @elijahfriedman!</li>
+<li>Costs: price documented Antigravity and Codex model aliases, add published Cyber fallback rates, and preserve Sol estimates across the August 21 price change (#4094). Thanks @urda!</li>
+<li>Mistral: offer Monthly Plan in the provider&#x27;s Menu bar metric picker, so the menu bar and widgets can show the Vibe allowance without a <code>defaults write</code> (#4072). Thanks @T0mSIlver!</li>
+<li>Mistral: price billing usage by event type, API zone, and service tier, so a per-second audio or priority price no longer inflates API spend and 30-day token cost (#4076). Thanks @T0mSIlver!</li>
+<li>CLI: keep probe timeout and cancellation cleanup responsive on busy hosts with large process tables (#4108).</li>
 </ul>
 <p><a href="https://github.com/steipete/CodexBar/blob/main/CHANGELOG.md">View full changelog</a></p>
 ]]></description>
-            <enclosure url="https://github.com/steipete/CodexBar/releases/download/v0.40.0/CodexBar-macos-universal-0.40.0.zip" length="45008901" type="application/octet-stream" sparkle:edSignature="wrOI9q8rGWQgX+2wIolUM3lM5LPyIzzKcPRQNqjFLtWsNhqHqr73rf1EYEiiwUN9/UTBg3DrtaqaXdBBTkokAA=="/>
+            <enclosure url="https://github.com/steipete/CodexBar/releases/download/v0.70.0/CodexBar-macos-universal-0.70.0.zip" length="74897657" type="application/octet-stream" sparkle:edSignature="yFtKvsKSELbebYn8eu/g8KaHs44p9UPAGSbmajDOsAISFUxADlBQXESpJHz/nLt8bWuVA6WzYue8TAM5zEeFCg=="/>
         </item>
         <item>
-            <title>0.39.0</title>
-            <pubDate>Sat, 04 Jul 2026 13:01:10 -0700</pubDate>
+            <title>0.69.0</title>
+            <pubDate>Mon, 28 Sep 2026 11:05:39 -0700</pubDate>
             <link>https://raw.githubusercontent.com/steipete/CodexBar/main/appcast.xml</link>
-            <sparkle:version>97</sparkle:version>
-            <sparkle:shortVersionString>0.39.0</sparkle:shortVersionString>
+            <sparkle:version>160</sparkle:version>
+            <sparkle:shortVersionString>0.69.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <description><![CDATA[<h2>CodexBar 0.39.0</h2>
+            <description><![CDATA[<h2>CodexBar 0.69.0</h2>
+<h3>Highlights</h3>
+<ul>
+<li>Plugins feel native: user plugins now get their own switcher tab by default, and Notion AI, ZoomMate, and LongCat run as bundled plugins with browser sessions kept private to the host (#4074, #4098, #4059).</li>
+<li>Lighter on CPU and disk: Claude and Vertex cost history is reused instead of re-decoded on every scan, the history cache is about a quarter smaller, and cost scans no longer expand priority days back to year 1 (#4053, #4092, #4045). Thanks @djbclark for the CPU sample that pinned this down!</li>
+<li>Steadier refreshes: Codex rereads credentials while the CLI rewrites them and picks up plan upgrades right away, a stalled Keychain signature check can no longer freeze every provider, and Claude recovers from rejected cache writes on the next refresh (#4088, #4089). Thanks @lozcalver and @SilentKnight87!</li>
+<li>Widgets and the menu bar hold on to good data: each widget provider keeps its last good reading after failed refreshes, and corrupt saved menu bar positions are never restored (#4095, #4082).</li>
+<li>More accurate numbers: Grok token totals and model names survive billing outages, Claude shows saved limit resets from the Web source, Kimi marks windows blocked once the monthly pool is exhausted, Antigravity shows Starter quotas, and TypeSafe shows its balance in the menu bar (#4093, #4056, #4048, #4091, #4084, #4050).</li>
+<li>Leaner under the hood: the app ships with about 700 fewer lines of code than 0.68.0, even with the new plugin host capabilities.</li>
+</ul>
+<h3>Security</h3>
+<ul>
+<li>Test and debug output no longer includes environment variable values: stored environments render only an entry count, and test runners scrub credential-shaped variables before running (#4097).</li>
+</ul>
 <h3>Added</h3>
 <ul>
-<li>Codex: show every available reset-credit expiry in menus and provider settings, including non-expiring credits, and summarize credits nearing expiry. Thanks @brahimhamichan!</li>
-<li>Cost history: optionally show shorter 7, 30, and 90-day comparisons from the selected local history window (#1500). Thanks @jtl06!</li>
-<li>Codex cost history: group local usage and costs by project and worktree in menus and CLI output. Thanks @clemenspeters!</li>
-<li>Sakana AI: show best-effort pay-as-you-go credit balance and recent usage without delaying subscription quota refreshes. Thanks @ss251!</li>
-<li>Kimi: show monthly subscription usage alongside weekly and five-hour limits with a short total budget for the optional membership request. Thanks @zhiyue!</li>
-<li>Mistral: show available credit balance from the authenticated billing session while preserving API spend and Monthly Plan usage. Thanks @Zihao-Qi!</li>
+<li>Claude: show saved usage-limit resets and their expiry from the Web source in the menu and <code>codexbar usage</code> details (#4048). Thanks @enieuwy!</li>
 </ul>
 <h3>Changed</h3>
 <ul>
-<li>Codex: compact reset-credit expiry inventory into a single scannable timeline instead of one row per credit.</li>
-<li>Repository: reject oversized tracked blobs and generated release/build artifacts during checks. Thanks @joeVenner!</li>
+<li>Plugins: user plugins now get their own switcher tab by default when Merge Icons is on; set <code>topLevel: false</code> to keep the appended card (#4074).</li>
+<li>Notion AI, ZoomMate, and LongCat: usage fetching runs through bundled plugins with host-owned cookie sessions, preserving browser-session reuse, validated cache migration, Notion over-quota values, ZoomMate credits history, and LongCat fuel-pack data (#4098, #4059).</li>
+<li>Menu bar: the persistent Refresh row drops its decorative icon to match other menu actions, keeping the shortcut and accessibility action (#4057). Thanks @elijahfriedman!</li>
 </ul>
 <h3>Fixed</h3>
 <ul>
-<li>Alibaba: keep the browser Safe Storage keychain read non-interactive and honor the &quot;Disable Keychain access&quot; setting, so cookie import can never trigger a Keychain prompt.</li>
-<li>Tests: block real Keychain and <code>security</code> CLI access by default so test runs cannot display password prompts.</li>
-<li>Mistral: discard non-finite and overflowing billing costs so malformed price data cannot poison spend totals or charts. Thanks @joeVenner!</li>
-<li>Claude: notify on model-scoped weekly and Daily Routines quota thresholds using independent warning state. Thanks @cleanerzkp!</li>
-<li>Claude CLI: skip the identity probe after terminal usage errors or loading stalls, cutting failed refresh latency and subprocess churn.</li>
-<li>OpenCode web: search Dia after Chrome for automatic cookie import, with Keychain preflight scoped to the candidate browser (fixes #1822). Thanks @zeajose!</li>
-<li>Claude: make the &quot;Avoid Keychain prompts&quot; setting use the no-prompt policy instead of the experimental <code>security</code> CLI reader. Thanks @gmkbenjamin!</li>
+<li>Codex: retry brief credential-file publication races before reporting refresh errors, and discard the previous plan&#x27;s quota baseline after a subscription change so fresh usage appears (#4088, #3635, #3389).</li>
+<li>Codex: publish newly validated token and cost totals after each catch-up pass, even while historical scanning is still pending (#4087, #3508). Thanks @kernnel!</li>
+<li>Claude: retain valid in-memory credentials after a rejected OAuth cache write once stale-cache cleanup succeeds, so the next automatic refresh recovers without a manual Refresh (#4089, #3395).</li>
+<li>Keychain: bound stalled code-signature validation so it cannot hold cache locks and freeze all provider refreshes (#4089, #3249).</li>
+<li>Claude: keep priced local spend as a partial estimate when an incomplete Pi or OMP mirror is included, across Usage &amp; Spend, Overview, and sharing (#4052). Fixes #4051. Thanks @BUKOWSKIREAL!</li>
+<li>Claude and Vertex: reuse unchanged decoded cost-history caches, skip encoding unchanged caches, and compact retained row fields to cut CPU and disk writes during refreshes (#4053, #4092, #3882). Thanks @djbclark!</li>
+<li>Costs: keep All-history priority checks proportional to recorded days instead of generating centuries of empty days, preserving older logs (#4045). Thanks @djbclark!</li>
+<li>Configuration: treat empty or whitespace-only config files like missing files so usage keeps working; malformed non-empty files still report errors (#4081, #4071). Thanks @kvnloo!</li>
+<li>Menu bar: reject corrupt saved positions during status-item visibility changes and removal while preserving valid placement across restarts (#4082, #3355).</li>
+<li>Widgets: keep each eligible provider&#x27;s last good reading and original age after failed refreshes, even when another provider is unavailable, disabled, or changes accounts (#4095, #3500).</li>
+<li>Adaptive refresh: recognize ChatGPT&#x27;s nested Codex app-server with per-scan running-process validation and update-aware bundle assessment caching (#4090, #4069). Thanks @jaychou0642-create!</li>
+<li>Grok: keep local token totals visible in Usage &amp; Spend and shared cards across wider history views and billing outages (#4093, #3716). Thanks @Chipagosfinest!</li>
+<li>Grok: keep the product usage breakdown on the grok.com billing fallback, with bounded shared protobuf decoding (#4041). Thanks @olddonkey!</li>
+<li>Token history: show observed model names when per-model totals are unavailable, including Grok local sessions (#4056). Fixes #4054. Thanks @BUKOWSKIREAL!</li>
+<li>Kimi: point stale CLI sessions to running <code>kimi</code> or adding an API key in Settings, keeping web fallback and leaving rotating CLI credentials read-only (#4086, #4063). Thanks @kid0114!</li>
+<li>Kimi Code: mark shorter windows as blocked when the monthly membership pool is exhausted, without fresh quota or pace forecasts (#4091, #3536).</li>
+<li>z.ai: explain unavailable Coding Plan usage for empty or unsupported quota shapes while keeping recognized quotas and analytics (#4091, #2522).</li>
+<li>Antigravity: preserve grouped OAuth quotas, including weekly-only Starter allowances, and honor explicit quota-window cadence (#4084, #2427, #3789).</li>
+<li>Antigravity: usage probes no longer leave MCP server processes behind; cleanup only touches processes carrying the probe&#x27;s inherited ownership marker, so unrelated processes in the same directory are never killed (#4077). Thanks @bcharleson!</li>
+<li>TypeSafe: show the credit balance in the menu bar and layout preview instead of missing-value dashes (#4050). Thanks @lg!</li>
+<li>Pi: preserve the directory marker for session roots that do not exist yet (#4067). Thanks @Sogl!</li>
+<li>Agent Sessions: avoid the macOS 15 isolated-teardown crash while keeping task cancellation and Stay Awake cleanup (#4068). Thanks @Sogl!</li>
+<li>Browser sessions: keep distinct host-only and domain-scoped cookies when merging stores from the same profile, and preserve interactive cookie-refresh authorization across plugin engine callbacks (#4059, #4098).</li>
+<li>CLI and development: macOS CLI release builds and the test suite compile on Xcode 26.3 again, and CI now builds app, CLI, and tests on that toolchain (#4058, #4079, #4070). Thanks @RowboTony!</li>
 </ul>
 <p><a href="https://github.com/steipete/CodexBar/blob/main/CHANGELOG.md">View full changelog</a></p>
 ]]></description>
-            <enclosure url="https://github.com/steipete/CodexBar/releases/download/v0.39.0/CodexBar-macos-universal-0.39.0.zip" length="44368510" type="application/octet-stream" sparkle:edSignature="F+SciYs2emoO/eSut/ed5/zp9By0SGzpxGV6l94wSkSa5I3oNM1M34/7EKPY7ncvzlvFFGM8tvCXI0j6K/LhAg=="/>
+            <enclosure url="https://github.com/steipete/CodexBar/releases/download/v0.69.0/CodexBar-macos-universal-0.69.0.zip" length="74820928" type="application/octet-stream" sparkle:edSignature="BU9QC4DHjmSFBwnnRLNxWI6RG2fn7kK4loNDDlkzex4UjTV7iaUs7N3v3cEd+D9xEr9cEkdko8NW9V+l4aMTCw=="/>
+        </item>
+        <item>
+            <title>0.68.0</title>
+            <pubDate>Sun, 27 Sep 2026 03:54:08 -0700</pubDate>
+            <link>https://raw.githubusercontent.com/steipete/CodexBar/main/appcast.xml</link>
+            <sparkle:version>159</sparkle:version>
+            <sparkle:shortVersionString>0.68.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[<h2>CodexBar 0.68.0</h2>
+<h3>Highlights</h3>
+<ul>
+<li>Codex account switching works end to end: a System Account switch now restarts the running app-server daemon even when its control socket is a symlink, and Usage Dashboard opens the current analytics page (#3990, #4018, #4004). Thanks @massdo and @RowboTony!</li>
+<li>A steadier menu bar on macOS 26.6: no blank slots after quitting, stable status-item identities through recovery and updates (fewer duplicate Bartender entries), and opt-in startup diagnostics for Control Center hosting problems (#4021, #3201, #3377). Thanks @mymatejackson, @giuseppebisemi, @WilliamTso, and @zxfxpower!</li>
+<li>One-click Homebrew updates for cask installs, with Homebrew staying in charge of the installation (#3994). Thanks @Yuxin-Qiao!</li>
+<li>More from sign-ins you already have: ClinePass reuses Cline&#x27;s browser session, Venice accepts its new Clerk sessions, Muse Code can show a chosen web team&#x27;s quota, and Mistral shows its Vibe Monthly Plan in the CLI, widgets, and on Linux (#4026, #3940, #4011, #4025, #4038, #4024). Thanks @shirishpothi, @LachieFREEDOM, @enieuwy, and @T0mSIlver!</li>
+<li>Usage &amp; Spend names and ranks Codex sessions with privacy masking and counts Nous-billed ledger activity, and the web dashboard remembers Used or Remaining per browser (#4020, #4008, #4013). Thanks @urda, @Reztahla, and @andybergon!</li>
+<li>Leaner under the hood: Abacus now runs as a bundled plugin, 31 bundled-plugin providers are declared through shared specs, and the app ships with about 1,300 fewer lines of code than 0.67.0.</li>
+</ul>
+<h3>Added</h3>
+<ul>
+<li>Mistral: show the Vibe Monthly Plan window, with its used / total / remaining amounts, in <code>codexbar usage</code> text output and the menu descriptor (#4025). Thanks @T0mSIlver!</li>
+<li>ClinePass: reuse an existing Cline browser sign-in session when no API key is configured, without copying or refreshing tokens (#4026). Thanks @shirishpothi!</li>
+<li>Muse Code: optionally show the explicitly selected dev.meta.ai browser team’s quota when the login omits quotas, with cookies Off by default and team choices in settings (#4011). Fixes #4002. Thanks @enieuwy!</li>
+<li>Mistral: show the Vibe Monthly Plan in widgets when the Mistral menu bar metric is set to Monthly Plan (#4038). Thanks @T0mSIlver!</li>
+<li>Updates: offer one-click Homebrew cask upgrades from the menu and About while keeping Homebrew responsible for installation (#3994). Thanks @Yuxin-Qiao!</li>
+<li>Web dashboard: choose Follow server, Used, or Remaining per browser, with persistent display preferences and consumption-based warnings (#4013). Fixes #3156. Thanks @andybergon!</li>
+<li>Menu bar: add opt-in, bounded startup diagnostics for status-item creation and Control Center hosting investigations (#3377).</li>
+<li>Plugins: support host-encoded form POST, optional POST enrichment with bounded collection, and time-zone-aware calendar month arithmetic on both engines.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Abacus AI: fetch credits and optional billing through the bundled plugin, preserving calendar-month pacing and Chrome-first sessions, with bounded retries and a five-second billing budget (#4047).</li>
+<li>Usage &amp; Spend: name Codex sessions from local thread metadata, rank them by cost with stable ties, and mask session titles and projects when Hide personal information is enabled (#4020). Thanks @urda!</li>
+<li>Settings: simplify menu bar layout controls while keeping token-removal instructions in the section footer (#3999). Thanks @elijahfriedman!</li>
+<li>Settings: dim inactive merged-icon labels while keeping their titles and explanations accessible, including stacked-style restrictions (#4030). Thanks @elijahfriedman!</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Codex: resolve control socket symlinks when checking the running daemon, so System Account switches do not silently skip its restart (#3990, #4018). Thanks @massdo!</li>
+<li>Codex: open usage analytics from Usage Dashboard instead of the retired settings route. Fixes #4004. Thanks @RowboTony!</li>
+<li>Menu bar: prevent blank status-item slots after normal quit on macOS 26.6.2 while preserving saved icon positions (#4022). Fixes #4021. Thanks @mymatejackson and @giuseppebisemi!</li>
+<li>Menu bar: keep stable status-item identities through recovery removal after updates while preserving saved icon positions. Fixes #3201. Thanks @WilliamTso and @zxfxpower!</li>
+<li>Claude: keep automatic refreshes using an unexpired credential already in memory when the OAuth cache is temporarily unavailable past its 30-minute refresh window (#3395, #3390). Thanks @lozcalver!</li>
+<li>Mistral: accept a manual Cookie header in the Linux CLI, which refused it as macOS-only, so Linux shows the Included API and Vibe Monthly Plan allowances (#4024). Thanks @T0mSIlver!</li>
+<li>Venice: accept Clerk session cookies in Web and Manual modes, authenticate with a Bearer token, and explain active-tab recovery for expired sessions. Fixes #3940. Thanks @LachieFREEDOM!</li>
+<li>Nous Portal: include Nous-billed OpenCodex ledger activity in Usage &amp; Spend, preserving estimated or unpriced costs separately from Portal credits. Fixes #4008. Thanks @Reztahla!</li>
+<li>Cursor: keep all-history cost requests within the dashboard API&#x27;s supported date range so Usage &amp; Spend can refresh (#4028). Thanks @Yuxin-Qiao!</li>
+<li>Plugins: retire timed-out or cancelled script contexts before allowing a retry, so the next refresh cannot reuse a poisoned worker.</li>
+<li>Settings: clarify that sidebar dots report provider service health and use gray until status is known. Fixes #4009. Thanks @harjothkhara and @jayn2u!</li>
+</ul>
+<p><a href="https://github.com/steipete/CodexBar/blob/main/CHANGELOG.md">View full changelog</a></p>
+]]></description>
+            <enclosure url="https://github.com/steipete/CodexBar/releases/download/v0.68.0/CodexBar-macos-universal-0.68.0.zip" length="74774044" type="application/octet-stream" sparkle:edSignature="sOZ9k8KJScMQ26wqpJewz8yfB+V4ye3Up4V6UVYqgF7TBrm9o2ypLpS64liO0cIOtk9fttMC0SXXnUCIBqJiBw=="/>
         </item>
         <item>
             <title>0.14.0</title>
