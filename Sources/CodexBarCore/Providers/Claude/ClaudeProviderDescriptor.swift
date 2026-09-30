@@ -340,6 +340,21 @@ public enum ClaudeProviderDescriptor {
             hasOAuthCredentials: shouldAttemptOAuth)
     }
 
+    /// True when this fetch targets a configured token account whose credential is a claude.ai
+    /// web session cookie. Machine-global sources (Claude Code keychain OAuth, the local
+    /// `claude` CLI) always describe the Mac's own signed-in account, so planning them ahead
+    /// of web makes every per-account row mirror that one account. Web is the only data source
+    /// that can represent the selected token account.
+    static func hasAccountScopedWebCookie(context: ProviderFetchContext) -> Bool {
+        guard context.selectedTokenAccountID != nil,
+              context.settings?.claude?.cookieSource == .manual
+        else {
+            return false
+        }
+        return ClaudeWebAPIFetcher.hasSessionKey(
+            cookieHeader: CookieHeaderNormalizer.normalize(context.settings?.claude?.manualCookieHeader))
+    }
+
     private static func hasPlausibleWebSession(context: ProviderFetchContext) -> Bool {
         switch context.sourceMode {
         case .api, .oauth, .cli:
