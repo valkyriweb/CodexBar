@@ -179,4 +179,59 @@ struct ClaudeTokenAccountRoutingTests {
         }
         #expect(provider == .claude)
     }
+
+    @Test
+    func `distinct web cookie accounts do not share fetch credentials`() async {
+        let settings = testSettingsStore(suiteName: "ClaudeTokenAccountRoutingTests-distinct-web")
+        settings.addTokenAccount(
+            provider: .claude,
+            label: "alpha@example.com",
+            token: "sessionKey=sk-ant-sid01-alpha")
+        settings.addTokenAccount(
+            provider: .claude,
+            label: "beta@example.com",
+            token: "sessionKey=sk-ant-sid01-beta")
+        let accounts = settings.tokenAccounts(for: .claude)
+        let browserDetection = BrowserDetection(cacheTTL: 0)
+        let ambient = "sk-ant-oat-ambient-signed-in"
+        var headers: [String] = []
+        var strategyIDs: [[String]] = []
+
+        for account in accounts {
+            let override = TokenAccountOverride(provider: .claude, account: account)
+            let snapshot = ProviderRegistry.makeSettingsSnapshot(settings: settings, tokenOverride: override)
+            let env = ProviderRegistry.makeEnvironment(
+                base: [ClaudeOAuthCredentialsStore.environmentTokenKey: ambient],
+                provider: .claude,
+                settings: settings,
+                tokenOverride: override)
+            let context = ProviderFetchContext(
+                runtime: .app,
+                sourceMode: .auto,
+                includeCredits: false,
+                webTimeout: 1,
+                webDebugDumpHTML: false,
+                verbose: false,
+                env: env,
+                settings: snapshot,
+                fetcher: UsageFetcher(environment: env),
+                claudeFetcher: ClaudeUsageFetcher(browserDetection: browserDetection),
+                browserDetection: browserDetection,
+                selectedTokenAccountID: account.id)
+            let strategies = await ProviderDescriptorRegistry.descriptor(for: .claude)
+                .fetchPlan.pipeline.resolveStrategies(context)
+
+            #expect(snapshot.claude?.usageDataSource == .web)
+            #expect(snapshot.claude?.cookieSource == .manual)
+            #expect(env[ClaudeOAuthCredentialsStore.environmentTokenKey] == nil)
+            headers.append(snapshot.claude?.manualCookieHeader ?? "")
+            strategyIDs.append(strategies.map(\.id))
+        }
+
+        #expect(headers == [
+            "sessionKey=sk-ant-sid01-alpha",
+            "sessionKey=sk-ant-sid01-beta",
+        ])
+        #expect(strategyIDs == [["claude.web"], ["claude.web"]])
+    }
 }

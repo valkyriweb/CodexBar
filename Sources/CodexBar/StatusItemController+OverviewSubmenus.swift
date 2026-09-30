@@ -40,8 +40,7 @@ extension StatusItemController {
         else {
             return
         }
-        let rawProvider = String(represented.dropFirst(Self.overviewRowIdentifierPrefix.count))
-        guard let provider = UsageProvider(rawValue: rawProvider),
+        guard let provider = Self.overviewProvider(fromRepresentedObject: represented),
               let menu = sender.menu
         else {
             return
