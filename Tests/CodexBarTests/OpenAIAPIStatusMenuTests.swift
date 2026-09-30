@@ -209,7 +209,14 @@ extension StatusMenuTests {
         let model = try #require(controller.menuCardModel(for: .mistral))
         #expect(model.inlineUsageDashboard == nil)
         #expect(model.tokenUsage == nil)
-        #expect(controller.makeOverviewRowSubmenu(provider: .mistral, model: model, width: 320) == nil)
+        let providerRow = StatusItemController.OverviewAccountRow(
+            provider: .mistral,
+            model: model,
+            identifier: "overviewRow-mistral",
+            heightCacheScope: "mistral",
+            accountID: nil,
+            storageText: nil)
+        #expect(controller.makeOverviewRowSubmenu(row: providerRow, width: 320) == nil)
 
         let menu = controller.makeMenu(for: .mistral)
         controller.menuWillOpen(menu)

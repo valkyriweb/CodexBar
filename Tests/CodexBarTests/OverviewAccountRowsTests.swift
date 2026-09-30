@@ -133,6 +133,143 @@ struct OverviewAccountRowsTests {
     }
 
     @Test
+    func `account overview rows do not open provider-level submenus`() {
+        let settings = testSettingsStore(suiteName: "OverviewAccountRowsTests-submenu")
+        settings.multiAccountMenuLayout = .stacked
+        Self.enableOnly(.claude, settings)
+        settings.addTokenAccount(provider: .claude, label: "alpha@example.com", token: "sessionKey=sk-ant-sid01-alpha")
+        settings.addTokenAccount(provider: .claude, label: "beta@example.com", token: "sessionKey=sk-ant-sid01-beta")
+        let store = UsageStore(
+            fetcher: UsageFetcher(),
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings)
+        let controller = Self.makeController(store: store, settings: settings)
+        defer { controller.releaseStatusItemsForTesting() }
+
+        let accountRows = controller.overviewAccountRows(for: .claude)
+        #expect(accountRows.count == 2)
+        #expect(accountRows.allSatisfy { $0.accountID != nil })
+        #expect(accountRows.allSatisfy { $0.storageText == nil })
+        #expect(accountRows.allSatisfy { controller.makeOverviewRowSubmenu(row: $0, width: 320) == nil })
+
+        settings.multiAccountMenuLayout = .segmented
+        let providerRows = controller.overviewAccountRows(for: .claude)
+        #expect(providerRows.map(\.accountID) == [nil])
+        #expect(controller.makeOverviewRowSubmenu(row: providerRows[0], width: 320) != nil)
+    }
+
+    @Test
+    func `stacked accounts fan out even when every snapshot is missing`() {
+        let settings = testSettingsStore(suiteName: "OverviewAccountRowsTests-nosnapshots")
+        settings.multiAccountMenuLayout = .stacked
+        settings.usageBarsShowUsed = true
+        Self.enableOnly(.claude, settings)
+        settings.addTokenAccount(provider: .claude, label: "alpha@example.com", token: "sessionKey=sk-ant-sid01-alpha")
+        settings.addTokenAccount(provider: .claude, label: "beta@example.com", token: "sessionKey=sk-ant-sid01-beta")
+        let store = UsageStore(
+            fetcher: UsageFetcher(),
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings)
+        store.snapshots[.claude] = Self.usageSnapshot(
+            provider: .claude,
+            email: "selected@example.com",
+            sessionUsed: 77,
+            weeklyUsed: 88,
+            weeklyReset: Date(timeIntervalSince1970: 1_700_000_000))
+        let controller = Self.makeController(store: store, settings: settings)
+        defer { controller.releaseStatusItemsForTesting() }
+
+        let rows = controller.overviewAccountRows(for: .claude)
+        #expect(rows.map(\.model.email) == ["alpha@example.com", "beta@example.com"])
+        #expect(rows.allSatisfy(\.model.metrics.isEmpty))
+        #expect(rows.allSatisfy { $0.model.subtitleText == "Unavailable" })
+        #expect(rows.allSatisfy { $0.model.email != "selected@example.com" })
+    }
+
+    @Test
+    func `stacked claude-swap accounts each get an overview row`() {
+        let settings = testSettingsStore(suiteName: "OverviewAccountRowsTests-claudeswap")
+        settings.multiAccountMenuLayout = .stacked
+        settings.usageBarsShowUsed = true
+        Self.enableOnly(.claude, settings)
+        let store = UsageStore(
+            fetcher: UsageFetcher(),
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings)
+        store.snapshots[.claude] = Self.usageSnapshot(
+            provider: .claude,
+            email: "signedin@example.com",
+            sessionUsed: 95,
+            weeklyUsed: 96,
+            weeklyReset: Date(timeIntervalSince1970: 1_700_000_000))
+        store.claudeSwapAccountSnapshots = Self.claudeSwapAccounts(count: 2)
+        let controller = Self.makeController(store: store, settings: settings)
+        defer { controller.releaseStatusItemsForTesting() }
+
+        let rows = controller.overviewAccountRows(for: .claude)
+        #expect(rows.count == 2)
+        #expect(rows.map(\.provider) == [.claude, .claude])
+        #expect(rows.map(\.identifier) == [
+            StatusItemController.overviewRowIdentifier(
+                provider: .claude,
+                accountID: "\(ClaudeSwapAccountProjection.sourceName):1"),
+            StatusItemController.overviewRowIdentifier(
+                provider: .claude,
+                accountID: "\(ClaudeSwapAccountProjection.sourceName):2"),
+        ])
+        #expect(rows.allSatisfy { $0.model.email != "signedin@example.com" })
+        let weeklyPercents = rows.compactMap { row in
+            row.model.metrics.first { $0.id == "secondary" }?.percent
+        }
+        #expect(weeklyPercents == [41, 42])
+        #expect(rows.allSatisfy { controller.makeOverviewRowSubmenu(row: $0, width: 320) == nil })
+    }
+
+    @Test
+    func `segmented claude-swap layout keeps one provider overview row`() {
+        let settings = testSettingsStore(suiteName: "OverviewAccountRowsTests-claudeswap-segmented")
+        settings.multiAccountMenuLayout = .segmented
+        Self.enableOnly(.claude, settings)
+        let store = UsageStore(
+            fetcher: UsageFetcher(),
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            settings: settings)
+        store.snapshots[.claude] = Self.usageSnapshot(
+            provider: .claude,
+            email: "signedin@example.com",
+            sessionUsed: 12,
+            weeklyUsed: 13,
+            weeklyReset: Date(timeIntervalSince1970: 1_700_000_000))
+        store.claudeSwapAccountSnapshots = Self.claudeSwapAccounts(count: 2)
+        let controller = Self.makeController(store: store, settings: settings)
+        defer { controller.releaseStatusItemsForTesting() }
+
+        #expect(controller.overviewAccountRows(for: .claude).map(\.identifier) == ["overviewRow-claude"])
+    }
+
+    private static func claudeSwapAccounts(count: Int) -> [ProviderAccountUsageSnapshot] {
+        let now = Date(timeIntervalSince1970: 1_782_000_000)
+        return ClaudeSwapAccountProjection.accountSnapshots(
+            from: ClaudeSwapAccountList(
+                activeAccountNumber: 1,
+                accounts: (1...count).map { number in
+                    ClaudeSwapAccountRow(
+                        number: number,
+                        email: "swap\(number)@example.com",
+                        isActive: number == 1,
+                        usageStatus: .ok,
+                        fiveHour: ClaudeSwapUsageWindow(
+                            usedPercent: Double(20 + number),
+                            resetsAt: now.addingTimeInterval(3600)),
+                        sevenDay: ClaudeSwapUsageWindow(
+                            usedPercent: Double(40 + number),
+                            resetsAt: now.addingTimeInterval(86400)),
+                        scoped: [])
+                }),
+            now: now)
+    }
+
+    @Test
     func `segmented layout keeps one provider overview row`() {
         let settings = testSettingsStore(suiteName: "OverviewAccountRowsTests-segmented")
         settings.multiAccountMenuLayout = .segmented

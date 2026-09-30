@@ -2,11 +2,12 @@ import AppKit
 import CodexBarCore
 
 extension StatusItemController {
-    func makeOverviewRowSubmenu(
-        provider: UsageProvider,
-        model: UsageMenuCardView.Model,
-        width: CGFloat) -> NSMenu?
-    {
+    /// Every submenu below is built from provider-level stores that describe the selected or
+    /// ambient account, so an account-scoped row gets no submenu rather than another account's data.
+    func makeOverviewRowSubmenu(row: OverviewAccountRow, width: CGFloat) -> NSMenu? {
+        guard row.accountID == nil else { return nil }
+        let provider = row.provider
+        let model = row.model
         if provider == .openai,
            self.settings.costSummaryShowsSubmenu(for: provider),
            let submenu = self.makeOpenAIAPIUsageSubmenu(provider: provider, width: width)

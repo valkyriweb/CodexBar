@@ -9,16 +9,17 @@ extension StatusItemController {
         let model: UsageMenuCardView.Model
         let identifier: String
         let heightCacheScope: String
+        let accountID: String?
         var storageText: String?
     }
 
     /// Overview rows for one provider. Stacked multi-account layouts get one row per configured
     /// account, using that account's snapshot only. A missing snapshot is unavailable, never the
-    /// selected account's live usage. Single-account and segmented layouts keep the provider row.
+    /// selected account's live usage. Single-account and segmented layouts keep the provider row,
+    /// which alone carries the provider-wide storage footprint.
     func overviewAccountRows(for provider: UsageProvider) -> [OverviewAccountRow] {
-        let storageText = self.store.storageFootprintText(for: provider)
         if let accountRows = self.stackedAccountOverviewRows(for: provider), !accountRows.isEmpty {
-            return Self.attachingStorageText(storageText, to: accountRows)
+            return accountRows
         }
 
         guard let model = self.menuCardModel(for: provider), !model.isOverviewErrorOnly else { return [] }
@@ -27,7 +28,8 @@ extension StatusItemController {
             model: model,
             identifier: Self.overviewRowIdentifier(provider: provider),
             heightCacheScope: provider.rawValue,
-            storageText: storageText)]
+            accountID: nil,
+            storageText: self.store.storageFootprintText(for: provider))]
     }
 
     static func overviewProvider(fromRepresentedObject represented: String) -> UsageProvider? {
@@ -36,9 +38,8 @@ extension StatusItemController {
         if let provider = UsageProvider(rawValue: raw) {
             return provider
         }
-        return UsageProvider.allCases
-            .filter { raw.hasPrefix($0.rawValue + "-") }
-            .max { $0.rawValue.count < $1.rawValue.count }
+        // No provider raw value contains a hyphen, so the first prefix match is unambiguous.
+        return UsageProvider.allCases.first { raw.hasPrefix($0.rawValue + "-") }
     }
 
     static func overviewRowIdentifier(provider: UsageProvider, accountID: String? = nil) -> String {
@@ -51,16 +52,18 @@ extension StatusItemController {
         if provider == .codex,
            let display = self.codexAccountMenuDisplay(for: .codex),
            display.showAll,
-           display.accounts.count > 1,
-           !display.snapshots.isEmpty
+           display.accounts.count > 1
         {
             return self.codexOverviewRows(display)
         }
 
+        if let claudeSwapRows = self.claudeSwapOverviewRows(for: provider) {
+            return claudeSwapRows
+        }
+
         guard let display = self.tokenAccountMenuDisplay(for: provider),
               display.showAll,
-              display.accounts.count > 1,
-              !display.snapshots.isEmpty
+              display.accounts.count > 1
         else {
             return nil
         }
@@ -79,6 +82,7 @@ extension StatusItemController {
                 model: model,
                 identifier: Self.overviewRowIdentifier(provider: .codex, accountID: account.id),
                 heightCacheScope: "overview-\(account.id)",
+                accountID: account.id,
                 storageText: nil)
         }
     }
@@ -97,6 +101,31 @@ extension StatusItemController {
                     provider: display.provider,
                     accountID: account.id.uuidString),
                 heightCacheScope: "overview-\(account.id.uuidString)",
+                accountID: account.id.uuidString,
+                storageText: nil)
+        }
+    }
+
+    private func claudeSwapOverviewRows(for provider: UsageProvider) -> [OverviewAccountRow]? {
+        let accounts = self.store.claudeSwapAccountSnapshots
+        guard self.settings.multiAccountMenuLayout == .stacked,
+              accounts.count > 1,
+              ClaudeSwapMenuPrecedence.prefersClaudeSwap(
+                  provider: provider,
+                  accountCount: accounts.count,
+                  showSingleAccount: self.settings.claudeSwapShowSingleAccount)
+        else {
+            return nil
+        }
+        return accounts.compactMap { account in
+            guard let model = self.claudeSwapCardModel(for: account) else { return nil }
+            let accountID = "\(account.id.source):\(account.id.opaqueID)"
+            return OverviewAccountRow(
+                provider: .claude,
+                model: model,
+                identifier: Self.overviewRowIdentifier(provider: .claude, accountID: accountID),
+                heightCacheScope: "overview-\(accountID)",
+                accountID: accountID,
                 storageText: nil)
         }
     }
@@ -116,15 +145,5 @@ extension StatusItemController {
             error: L("Unavailable"),
             sourceLabel: nil,
             cacheKey: "overview-missing")
-    }
-
-    private static func attachingStorageText(
-        _ text: String?,
-        to rows: [OverviewAccountRow]) -> [OverviewAccountRow]
-    {
-        guard let text, !rows.isEmpty else { return rows }
-        var rows = rows
-        rows[rows.count - 1].storageText = text
-        return rows
     }
 }

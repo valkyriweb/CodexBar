@@ -624,10 +624,7 @@ extension StatusItemController {
         for (index, row) in rows.enumerated() {
             let identifier = row.identifier
             let storageText = row.storageText
-            let submenu = self.makeOverviewRowSubmenu(
-                provider: row.provider,
-                model: row.model,
-                width: menuWidth)
+            let submenu = self.makeOverviewRowSubmenu(row: row, width: menuWidth)
             let item = self.makeMenuCardItem(
                 OverviewMenuCardRowView(
                     model: row.model,
