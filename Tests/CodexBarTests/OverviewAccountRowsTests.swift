@@ -90,6 +90,7 @@ struct OverviewAccountRowsTests {
                 canReauthenticate: false,
                 canRemove: false)
         }
+        settings.codexActiveSource = accounts[0].selectionSource
         settings.cachedCodexAccountMenuProjection = CachedCodexAccountMenuProjection(
             activeSource: accounts[0].selectionSource,
             loadedAt: Date(),
