@@ -1,12 +1,35 @@
-#if os(macOS)
 import Foundation
+#if os(macOS)
 import SweetCookieKit
+#endif
 
-/// Common traversal only; providers retain browser selection, session validation, caching, and logging.
-enum BrowserCookieImportSupport {
+/// Shared browser policies and traversal; providers retain session validation, caching, and logging.
+public enum BrowserCookieImportSupport {
+    public static func browserNames(for provider: UsageProvider?) -> String {
+        #if os(macOS)
+        self.importOrder(for: provider).map(\.displayName).joined(separator: ", ")
+        #else
+        "none on this platform"
+        #endif
+    }
+
+    /// Keep deliberate Chrome-only policies explicit without duplicating platform guards in descriptors.
+    static func chromeOnly(reason _: StaticString) -> BrowserCookieImportOrder? {
+        #if os(macOS)
+        Browser.defaultImportOrder.filter { $0 == .chrome }
+        #else
+        nil
+        #endif
+    }
+
+    #if os(macOS)
+    static func importOrder(for provider: UsageProvider?) -> [Browser] {
+        provider.map { ProviderDefaults.metadata[$0]?.browserCookieOrder ?? Browser.defaultImportOrder } ?? [.chrome]
+    }
+
     static func collectSessions<Session>(
         from browsers: [Browser],
-        missingError: any Error,
+        missingError: (any Error)?,
         logger: (String) -> Void,
         load: (Browser) throws -> [Session]) throws -> [Session]
     {
@@ -19,7 +42,7 @@ enum BrowserCookieImportSupport {
                 logger("\(browser.displayName) cookie import failed: \(error.localizedDescription)")
             }
         }
-        guard !sessions.isEmpty else { throw missingError }
+        if sessions.isEmpty, let missingError { throw missingError }
         return sessions
     }
 
@@ -43,5 +66,5 @@ enum BrowserCookieImportSupport {
             return cookies.isEmpty ? nil : (profile.label, cookies)
         }
     }
+    #endif
 }
-#endif

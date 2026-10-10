@@ -4,7 +4,7 @@ import SwiftUI
 
 @MainActor
 enum ProviderSettingsRefreshInteraction {
-    static func perform(operation: () async -> Void) async {
+    static func perform<Result>(operation: () async -> Result) async -> Result {
         await BrowserCookieAccessGate.withExplicitRetry {
             await ProviderInteractionContext.$current.withValue(.userInitiated) {
                 await operation()
@@ -54,20 +54,35 @@ struct ProvidersPane: View {
 
     var body: some View {
         let unfilteredModel = self.unfilteredMenuCardModel(for: self.provider)
+        // Provider-specific by design: only Codex has managed OAuth account snapshots for this shared settings view.
+        let overview = self.provider == .codex ? self.store.codexAccountUsageOverview { accountIDs in
+            Task { @MainActor in
+                await ProviderSettingsRefreshInteraction.perform {
+                    await self.store.refreshCodexAccountsForSettings(accountIDs)
+                }
+            }
+        } : nil
+        let usageItems = ((overview?.usageItems ?? []) + unfilteredModel.usageItemDescriptors(
+            includingHidden: self.settings.hiddenUsageItemIDs(for: self.provider),
+            hidePersonalInfo: self.settings.hidePersonalInfo))
+            .reduce(into: [ProviderUsageItemDescriptor]()) { items, item in
+                if !items.contains(where: { $0.id == item.id }) { items.append(item) }
+            }
         ProviderDetailView(
             provider: self.provider,
             store: self.store,
             isEnabled: self.binding(for: self.provider),
-            subtitle: self.providerSubtitle(self.provider),
+            subtitle: overview.map { L("%@ accounts", String($0.rows.count)) }
+                ?? self.providerSubtitle(self.provider),
             model: unfilteredModel.applyingUsageItemVisibility(
                 hiddenItemIDs: self.settings.hiddenUsageItemIDs(for: self.provider)),
-            usageItems: unfilteredModel.usageItemDescriptors(
-                includingHidden: self.settings.hiddenUsageItemIDs(for: self.provider),
-                hidePersonalInfo: self.settings.hidePersonalInfo),
+            accountUsageOverview: overview,
+            usageItems: usageItems,
             openAIWebDiagnostic: self.openAIWebDiagnostic(for: self.provider),
             settingsPickers: self.extraSettingsPickers(for: self.provider),
             settingsToggles: self.extraSettingsToggles(for: self.provider),
             settingsFields: self.extraSettingsFields(for: self.provider),
+            settingsDirectoryLists: self.extraSettingsDirectoryLists(for: self.provider),
             settingsActions: self.extraSettingsActions(for: self.provider),
             settingsTokenAccounts: self.tokenAccountDescriptor(for: self.provider),
             settingsOrganizations: self.extraSettingsOrganizations(for: self.provider),
@@ -269,8 +284,11 @@ struct ProvidersPane: View {
         }
 
         let result = await self.codexAccountPromotionCoordinator.promote(managedAccountID: managedAccountID)
-        if case let .failure(error) = result {
+        switch result {
+        case let .failure(error):
             self.codexAccountsNotice = CodexAccountsSectionNotice(text: error.message, tone: .warning)
+        case let .success(promotion):
+            self.codexAccountsNotice = promotion.daemonRestartNote.map { .init(text: $0, tone: .warning) }
         }
     }
 
@@ -382,6 +400,11 @@ struct ProvidersPane: View {
         let context = self.makeSettingsContext(provider: provider)
         return impl.settingsFields(context: context)
             .filter { $0.isVisible?() ?? true }
+    }
+
+    private func extraSettingsDirectoryLists(for provider: UsageProvider) -> [ProviderSettingsDirectoryListDescriptor] {
+        ProviderCatalog.implementation(for: provider)?
+            .settingsDirectoryLists(context: self.makeSettingsContext(provider: provider)) ?? []
     }
 
     private func extraSettingsActions(for provider: UsageProvider) -> [ProviderSettingsActionsDescriptor] {

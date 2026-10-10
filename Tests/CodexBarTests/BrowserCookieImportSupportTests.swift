@@ -4,6 +4,70 @@ import Testing
 @testable import CodexBarCore
 
 struct BrowserCookieImportSupportTests {
+    @Test
+    func `browser labels and keychain requirements follow catalog metadata without discovery`() {
+        #expect(BrowserCookieImportSupport.browserNames(for: nil) == "Chrome")
+        #expect(BrowserCookieImportSupport.importOrder(for: .museai) == Browser.defaultImportOrder)
+        for browser in Browser.allCases {
+            #expect(browser.usesKeychainForCookieDecryption == browser.usesChromiumProfileStore)
+        }
+    }
+
+    @Test(arguments: ["Aside", "Opera", "Opera Neon"])
+    func `catalog browsers participate in Muse automatic import`(name: String) throws {
+        let browser = try #require(Browser.allCases.first { $0.displayName == name })
+        #expect(browser.usesChromiumProfileStore)
+        #expect(browser.usesKeychainForCookieDecryption)
+        #expect(Browser.defaultImportOrder.contains(browser))
+        var visited: [Browser] = []
+        let sessions = try BrowserCookieImportSupport.collectSessions(
+            from: BrowserCookieImportSupport.importOrder(for: .museai),
+            missingError: ImportError.missing,
+            logger: { _ in },
+            load: { candidate in
+                visited.append(candidate)
+                return candidate == browser ? ["fixture-session"] : []
+            })
+        #expect(visited == Browser.defaultImportOrder)
+        #expect(sessions == ["fixture-session"])
+    }
+
+    @Test
+    func `empty session iterators let the plugin classify missing credentials`() throws {
+        let sessions: [String] = try BrowserCookieImportSupport.collectSessions(
+            from: [.chrome],
+            missingError: nil,
+            logger: { _ in },
+            load: { _ in [] })
+        #expect(sessions.isEmpty)
+    }
+
+    @Test(arguments: [
+        UsageProvider.copilot,
+        .grok,
+        .helmcode,
+        .qoder,
+        .replicate,
+        .typesafe,
+        .venice,
+        .zoommate,
+    ])
+    func `Chrome-only providers retain their bounded browser policy`(provider: UsageProvider) throws {
+        let browsers = try #require(ProviderDefaults.metadata[provider]?.browserCookieOrder)
+        #expect(browsers == [.chrome])
+        var visited: [Browser] = []
+        let sessions = try BrowserCookieImportSupport.collectSessions(
+            from: browsers,
+            missingError: ImportError.missing,
+            logger: { _ in },
+            load: { browser in
+                visited.append(browser)
+                return ["fixture-session"]
+            })
+        #expect(visited == [.chrome])
+        #expect(sessions == ["fixture-session"])
+    }
+
     private enum ImportError: Error {
         case missing
         case failed

@@ -1,5 +1,4 @@
 import Foundation
-import SweetCookieKit
 
 public enum CopilotProviderDescriptor {
     public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
@@ -15,15 +14,6 @@ public enum CopilotProviderDescriptor {
             cookieName: nil,
             clearsAPIKeyOnMutation: true,
             primaryAddActionTitle: "Add Account"))
-
-    /// Budget imports stay Chrome-only to avoid prompting unrelated browsers.
-    private static var browserCookieOrder: BrowserCookieImportOrder? {
-        #if os(macOS)
-        [.chrome]
-        #else
-        nil
-        #endif
-    }
 
     static func makeDescriptor() -> ProviderDescriptor {
         ProviderDescriptor(
@@ -57,13 +47,14 @@ public enum CopilotProviderDescriptor {
                     "enterprise": "Enterprise",
                 ],
                 debugLogUnavailableMessage: "Copilot debug log not yet implemented",
-                browserCookieOrder: self.browserCookieOrder,
+                browserCookieOrder: BrowserCookieImportSupport.chromeOnly(
+                    reason: "Budget imports must not prompt unrelated browsers"),
                 dashboardURL: "https://github.com/settings/copilot",
                 statusPageURL: "https://www.githubstatus.com/"),
             branding: ProviderBranding(
                 iconStyle: .init(provider: .copilot),
                 iconResourceName: "ProviderIcon-copilot",
-                color: ProviderColor(red: 168 / 255, green: 85 / 255, blue: 247 / 255),
+                color: ProviderColor(hex: 0xA855F7),
                 confettiPalette: [
                     ProviderColor(hex: 0x8534F3),
                     ProviderColor(hex: 0xF08A3A),

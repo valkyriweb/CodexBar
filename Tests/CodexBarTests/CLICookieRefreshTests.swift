@@ -4,7 +4,7 @@ import Testing
 @testable import CodexBarCLI
 @testable import CodexBarCore
 
-@Suite(.serialized)
+@Suite(.serialized, ProviderTransportRegressionFixtures())
 struct CLICookieRefreshTests {
     @Test
     func `cookie refresh parses explicit keychain acknowledgement`() throws {
@@ -68,6 +68,40 @@ struct CLICookieRefreshTests {
         #expect(operationCalled == false)
         #expect(results.count == 1)
         #expect(results[0].status == .skipped)
+    }
+
+    @Test(arguments: [nil, "edge", "chrome", "safari"] as [String?], [false, true])
+    func `profile refresh acknowledgement applies only to the configured browser`(
+        browserID: String?, acknowledged: Bool) async
+    {
+        var provider = ProviderConfig(id: .langdock)
+        provider.browserID = browserID
+        provider.browserProfileID = "/synthetic/Profile"
+        let config = CodexBarConfig(providers: [provider])
+        let descriptor = ProviderDescriptorRegistry.descriptor(for: .langdock)
+        #expect(CodexBarCLI.cookieRefreshBrowserOrder(descriptor: descriptor, config: config).map(\.rawValue)
+            == [browserID ?? "edge"])
+        var operationCalled = false
+        let results = await CodexBarCLI.performCookieRefreshes(
+            targets: [descriptor], allowKeychainPrompt: acknowledged, config: config)
+        { descriptor in
+            operationCalled = true
+            #expect(ProviderInteractionContext.current == .userInitiated)
+            return CookieRefreshResult(provider: descriptor.cli.name, status: .refreshed, message: "synthetic success")
+        }
+        let permitted = acknowledged || browserID == "safari"
+        #expect(operationCalled == permitted)
+        #expect(results.first?.status == (permitted ? .refreshed : .blocked))
+    }
+
+    @Test(arguments: ["firefox", "", "Chrome"])
+    func `invalid selected browser cannot fall back to a different browser`(browserID: String) {
+        var provider = ProviderConfig(id: .langdock)
+        provider.browserID = browserID
+        provider.browserProfileID = "/synthetic/Profile"
+        #expect(CodexBarCLI.cookieRefreshBrowserOrder(
+            descriptor: ProviderDescriptorRegistry.descriptor(for: .langdock),
+            config: CodexBarConfig(providers: [provider])).isEmpty)
     }
 
     @Test
@@ -166,6 +200,25 @@ struct CLICookieRefreshTests {
 
                 #expect(result.status == .failed)
                 #expect(CookieHeaderCache.load(provider: provider)?.cookieHeader == "old-test-cookie")
+            }
+        }
+    }
+
+    @Test
+    func `validated nonpersistent refresh succeeds without changing persisted cookies`() async {
+        let service = "com.steipete.codexbar.tests.cookie-refresh.\(UUID().uuidString)"
+        await KeychainCacheStore.withServiceOverrideForTesting(service) {
+            await KeychainCacheStore.withImplicitTestStoreForTesting {
+                CookieHeaderCache.store(provider: .langdock, cookieHeader: "old-test-cookie", sourceLabel: "Test old")
+                let result = await CodexBarCLI.withCookieRefreshCacheSuppressed(
+                    provider: .langdock, providerName: "langdock")
+                {
+                    #expect(CookieHeaderCache.load(provider: .langdock) == nil)
+                    CookieHeaderCache.markNonpersistentRefreshValidated(provider: .langdock)
+                    return CookieRefreshResult(provider: "langdock", status: .refreshed, message: "validated")
+                }
+                #expect(result.status == .refreshed)
+                #expect(CookieHeaderCache.load(provider: .langdock)?.cookieHeader == "old-test-cookie")
             }
         }
     }
@@ -279,6 +332,141 @@ struct CLICookieRefreshTests {
     }
 
     @Test
+    func `classified cookie failures retain safe category hints`() throws {
+        BrowserCookieAccessGate.resetForTesting()
+        defer { BrowserCookieAccessGate.resetForTesting() }
+        try KeychainAccessGate.withTaskOverrideForTesting(false) {
+            let hints: [ProviderFetchClassifiedError.Kind: String] = [
+                .authenticationExpired: "The provider rejected the browser session. Sign in again and retry.",
+                .permissionDenied:
+                    "Permission was denied while refreshing the browser session. Check access and retry.",
+                .rateLimited: "The provider rate limited the refresh. Wait and retry.",
+                .providerUnavailable: "The provider is temporarily unavailable. Retry later.",
+                .parseFailure: "The provider response could not be read. Check for a CodexBar update.",
+                .networkFailure: "The provider could not be reached. Check your connection and retry.",
+                .apiFailure: "The provider could not validate the browser session. Retry later.",
+            ]
+            for kind in ProviderFetchClassifiedError.Kind.allCases {
+                let result = CodexBarCLI.cookieRefreshFailure(
+                    provider: .raycast,
+                    error: ProviderFetchClassifiedError(kind: kind, message: "opaque-test-marker"))
+                #expect(result.status == .failed)
+                if let hint = hints[kind] {
+                    #expect(result.message == hint)
+                } else {
+                    #expect(result.message.contains("No browser session cookie was refreshed"))
+                }
+                #expect(!CodexBarCLI.cookieRefreshText([result]).contains("opaque-test-marker"))
+                let data = try JSONEncoder().encode(result)
+                let json = try #require(String(data: data, encoding: .utf8))
+                #expect(!json.contains("opaque-test-marker"))
+            }
+        }
+    }
+
+    @Test(arguments: ["edge", "chrome", "safari"], [false, true])
+    func `wrapped profile failures use only the selected browser access hints`(browserID: String, disabled: Bool) {
+        BrowserCookieAccessGate.resetForTesting()
+        defer { BrowserCookieAccessGate.resetForTesting() }
+        BrowserCookieAccessGate.recordDenied(for: .edge)
+        BrowserCookieAccessGate.recordDenied(for: .chrome)
+        var provider = ProviderConfig(id: .langdock)
+        provider.browserID = browserID
+        provider.browserProfileID = "/synthetic/Profile"
+        KeychainAccessGate.withTaskOverrideForTesting(disabled) {
+            for kind in [ProviderFetchClassifiedError.Kind.permissionDenied, .missingCredential] {
+                let result = CodexBarCLI.cookieRefreshFailure(
+                    provider: .langdock,
+                    error: ProviderBrowserSessionFailure(owner: nil, underlyingError: ProviderFetchClassifiedError(
+                        kind: kind, message: "opaque-test-marker")),
+                    config: CodexBarConfig(providers: [provider]))
+                if browserID == "safari" {
+                    let expected = kind == .permissionDenied
+                        ? "Permission was denied while refreshing the browser session. Check access and retry."
+                        : "No browser session cookie was refreshed. Sign in in a configured browser and retry."
+                    #expect(result.message == expected)
+                } else {
+                    let browserName = browserID == "edge" ? "Edge" : "Chrome"
+                    #expect(result.message.contains("\(browserName) cookie decryption"))
+                    #expect(result.message.contains(disabled ? "disabled" : "declined"))
+                }
+                #expect(!result.message.contains("opaque-test-marker"))
+            }
+        }
+    }
+
+    @Test(arguments: BundledPluginTestSupport.engines)
+    func `plugin HTTP rejection reaches cookie refresh output`(engine: ProviderPluginEngineKind) async throws {
+        BrowserCookieAccessGate.resetForTesting()
+        defer { BrowserCookieAccessGate.resetForTesting() }
+        let runtime = try ProviderPluginRuntime(source: """
+        defineProvider({id: 'raycast', name: 'Fixture', endpoints: ['https://cookies.example.test'],
+          settings: [], capabilities: ['http-status'],
+          async fetchUsage(ctx) {
+            const response = await ctx.http.getJSON('https://cookies.example.test/session');
+            if (response.status === 401) throw ctx.fail.authenticationExpired('opaque-test-marker');
+            throw new Error('Expected HTTP 401');
+          }
+        });
+        """, transport: ProviderHTTPTransportHandler { request in
+            let url = try #require(request.url)
+            return try (Data("{}".utf8), #require(HTTPURLResponse(
+                url: url, statusCode: 401, httpVersion: nil, headerFields: nil)))
+        }, engine: engine)
+        do {
+            _ = try await runtime.fetchUsage()
+            Issue.record("Expected authentication failure")
+        } catch {
+            #expect((error as? ProviderFetchClassifiedError)?.kind == .authenticationExpired)
+            KeychainAccessGate.withTaskOverrideForTesting(false) {
+                let result = CodexBarCLI.cookieRefreshFailure(provider: .raycast, error: error)
+                #expect(result.message == "The provider rejected the browser session. Sign in again and retry.")
+                #expect(!result.message.contains("opaque-test-marker"))
+            }
+        }
+    }
+
+    @Test
+    func `header importer retains explicit retry after leaving its task`() async throws {
+        BrowserCookieAccessGate.resetForTesting()
+        defer { BrowserCookieAccessGate.resetForTesting() }
+        BrowserCookieAccessGate.recordDenied(for: .chrome)
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: storage) }
+        let service = "com.steipete.codexbar.tests.header-import.\(UUID().uuidString)"
+        let domain = "cookies.example.test"
+        let broker = ProviderInteractionContext.$current.withValue(.userInitiated) {
+            BrowserCookieAccessGate.withExplicitRetry {
+                ProviderPluginCookieBroker(
+                    provider: .raycast,
+                    domains: [domain],
+                    settings: .init(cookieSource: .auto, manualCookieHeader: nil),
+                    batches: { _, batch in
+                        #expect(ProviderInteractionContext.current == .userInitiated)
+                        return KeychainAccessGate.withTaskOverrideForTesting(false) {
+                            KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in
+                                .interactionRequired
+                            } operation: {
+                                #expect(BrowserCookieAccessGate.shouldAttempt(.chrome))
+                                return batch == 0 ? [("session=synthetic", "Chrome")] : nil
+                            }
+                        }
+                    })
+            }
+        }
+        let session = try await Task.detached {
+            try KeychainCacheStore.withServiceOverrideForTesting(service) {
+                try KeychainCacheStore.withImplicitTestStoreForTesting {
+                    try CookieHeaderCache.withLegacyBaseURLOverrideForTesting(storage) {
+                        try broker.nextSession(domain: domain)
+                    }
+                }
+            }
+        }.value
+        #expect(session?.header == "session=synthetic")
+    }
+
+    @Test
     func `raw provider failures cannot leak cookie values`() {
         KeychainAccessGate.withTaskOverrideForTesting(false) {
             let privateMarker = "opaque-test-marker"
@@ -298,20 +486,24 @@ struct CLICookieRefreshTests {
         }
     }
 
-    @Test
-    func `keychain failure reuses actionable denial hint`() {
+    @Test(arguments: [false, true], ProviderFetchClassifiedError.Kind.allCases)
+    func `keychain failure takes precedence over classified hints`(
+        disabled: Bool, kind: ProviderFetchClassifiedError.Kind)
+    {
         BrowserCookieAccessGate.resetForTesting()
         defer { BrowserCookieAccessGate.resetForTesting() }
         BrowserCookieAccessGate.recordDenied(for: .chrome)
 
-        KeychainAccessGate.withTaskOverrideForTesting(false) {
+        KeychainAccessGate.withTaskOverrideForTesting(disabled) {
             let result = CodexBarCLI.cookieRefreshFailure(
                 provider: .opencode,
-                error: NSError(domain: "opaque-test-marker", code: 1))
+                error: ProviderFetchClassifiedError(kind: kind, message: "opaque-test-marker"))
 
-            #expect(result.message ==
+            let expected = disabled ?
+                "Chrome cookie decryption is disabled in CodexBar; enable Keychain access and refresh." :
                 "Chrome cookie decryption was declined in Keychain; " +
-                "rerun with --allow-keychain-prompt to request Keychain access again.")
+                "rerun with --allow-keychain-prompt to request Keychain access again."
+            #expect(result.message == expected)
             #expect(!result.message.contains("opaque-test-marker"))
         }
     }

@@ -9,14 +9,22 @@ extension AntigravityLocalReader {
     static func readDatabases(_ paths: [URL], budget: Budget) throws -> SourceResult {
         var result = SourceResult()
         for url in paths {
-            try budget.check()
-            budget.statistics.files += 1
-            guard budget.statistics.files <= budget.limits.databases else { throw ScanFailure.exhausted }
-            let source = try self.readDatabase(url, budget: budget)
-            result.events.append(contentsOf: source.events)
-            result.isComplete = result.isComplete && source.isComplete
-            result.containsHistorySource = result.containsHistorySource || source.containsHistorySource
-            result.evidenceIsUnstable = result.evidenceIsUnstable || source.evidenceIsUnstable
+            do {
+                try budget.check()
+                budget.statistics.files += 1
+                guard budget.statistics.files <= budget.limits.databases else { throw ScanFailure.exhausted }
+                budget.beginDatabase()
+                let source = try self.readDatabase(url, budget: budget)
+                result.events.append(contentsOf: source.events)
+                result.isComplete = result.isComplete && source.isComplete
+                result.containsHistorySource = result.containsHistorySource || source.containsHistorySource
+                result.evidenceIsUnstable = result.evidenceIsUnstable || source.evidenceIsUnstable
+            } catch ScanFailure.schemaExhausted {
+                // Schema limits apply to each database, so an oversized schema costs only its own database.
+                // Rows from the other databases stay valid partial history. Hard row, byte, and duration
+                // limits are not caught here and continue to withhold newly truncated reports as documented.
+                result.isComplete = false
+            }
         }
         return result
     }
@@ -254,7 +262,8 @@ extension AntigravityLocalReader {
             // Release the gen_metadata cursor before the optional steps pass reuses the same snapshot.
             sqlite3_finalize(activeStatement)
             statement = nil
-            let hasSteps = try self.hasSupportedStepsTable(database, budget: budget)
+            let hasSteps = try self.inspectSQLiteTableSupport(
+                database, table: "steps", payloadColumn: "metadata", budget: budget) == .supported
             if let failure = progress.failure {
                 throw failure
             }
