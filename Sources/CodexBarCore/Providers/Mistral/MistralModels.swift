@@ -5,6 +5,8 @@ import Foundation
 /// Top-level response from `GET https://admin.mistral.ai/api/billing/v2/usage`.
 struct MistralBillingResponse: Codable {
     let completion: MistralModelUsageCategory?
+    let chat: MistralModelUsageCategory?
+    let vibeCode: MistralVibeCodeUsageCategory?
     let ocr: MistralModelUsageCategory?
     let connectors: MistralModelUsageCategory?
     let librariesApi: MistralLibrariesUsageCategory?
@@ -21,7 +23,8 @@ struct MistralBillingResponse: Codable {
     let prices: [MistralPrice]?
 
     enum CodingKeys: String, CodingKey {
-        case completion, ocr, connectors, audio, date, currency, prices
+        case completion, chat, ocr, connectors, audio, date, currency, prices
+        case vibeCode = "vibe_code"
         case librariesApi = "libraries_api"
         case fineTuning = "fine_tuning"
         case vibeUsage = "vibe_usage"
@@ -35,6 +38,10 @@ struct MistralBillingResponse: Codable {
 
 struct MistralModelUsageCategory: Codable {
     let models: [String: MistralModelUsageData]?
+}
+
+struct MistralVibeCodeUsageCategory: Codable {
+    let completion: MistralModelUsageCategory?
 }
 
 struct MistralLibrariesUsageCategory: Codable {
@@ -59,6 +66,8 @@ struct MistralUsageEntry: Codable {
     let billingMetric: String?
     let billingDisplayName: String?
     let billingGroup: String?
+    let apiZone: String?
+    let serviceTier: String?
     let timestamp: String?
     let value: Int?
     let valuePaid: Int?
@@ -70,6 +79,8 @@ struct MistralUsageEntry: Codable {
         case billingMetric = "billing_metric"
         case billingDisplayName = "billing_display_name"
         case billingGroup = "billing_group"
+        case apiZone = "api_zone"
+        case serviceTier = "service_tier"
         case valuePaid = "value_paid"
     }
 }
@@ -78,6 +89,8 @@ struct MistralPrice: Codable {
     let eventType: String?
     let billingMetric: String?
     let billingGroup: String?
+    let apiZone: String?
+    let serviceTier: String?
     let price: String?
 
     enum CodingKeys: String, CodingKey {
@@ -85,6 +98,8 @@ struct MistralPrice: Codable {
         case eventType = "event_type"
         case billingMetric = "billing_metric"
         case billingGroup = "billing_group"
+        case apiZone = "api_zone"
+        case serviceTier = "service_tier"
     }
 }
 

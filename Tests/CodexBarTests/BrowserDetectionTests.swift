@@ -118,8 +118,10 @@ struct BrowserDetectionTests {
         #expect(detection.isCookieSourceAvailable(.safari))
     }
 
-    @Test
-    func `cookie client permits isolated chromium stores during tests`() throws {
+    @Test(arguments: [false, true])
+    func `profile discovery needs no Keychain permission while record reads stay gated`(
+        keychainDisabled: Bool) throws
+    {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let profile = temp
             .appendingPathComponent("Library/Application Support/Google/Chrome/Default/Network")
@@ -128,14 +130,22 @@ struct BrowserDetectionTests {
         defer { try? FileManager.default.removeItem(at: temp) }
 
         let client = BrowserCookieClient(configuration: .init(homeDirectories: [temp]))
-        let stores = try KeychainAccessGate.withTaskOverrideForTesting(false) {
-            try KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in .allowed } operation: {
-                try ProviderInteractionContext.$current.withValue(.userInitiated) {
-                    try client.codexBarStores(for: .chrome)
+        let preflights = OSAllocatedUnfairLock(initialState: 0)
+        try KeychainAccessGate.withTaskOverrideForTesting(keychainDisabled) {
+            try KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in
+                preflights.withLock { $0 += 1 }
+                return .interactionRequired
+            } operation: {
+                try ProviderInteractionContext.$current.withValue(.background) {
+                    let stores = try client.codexBarStores(for: .chrome)
+                    #expect(stores.count == 1)
+                    #expect(preflights.withLock { $0 } == 0)
+                    let query = BrowserCookieQuery(domains: ["langdock.com"], domainMatch: .exact)
+                    #expect(try client.codexBarRecords(matching: query, in: .chrome).isEmpty)
+                    #expect(try client.codexBarRecords(matching: query, in: #require(stores.first)).isEmpty)
                 }
             }
         }
-        #expect(stores.count == 1)
     }
 
     @Test
@@ -585,6 +595,7 @@ struct BrowserDetectionTests {
         let detection = BrowserDetection(
             homeDirectory: temp.path,
             cacheTTL: 600,
+            now: Date.init,
             fileExists: { path in
                 if path == "/Applications/Google Chrome.app" {
                     return installed.withLock { $0 }
@@ -593,15 +604,18 @@ struct BrowserDetectionTests {
             },
             directoryContents: { path in
                 try? FileManager.default.contentsOfDirectory(atPath: path)
-            })
+            },
+            // Another host Chrome registration must not survive this test's simulated uninstall.
+            applicationURLs: { _ in [] },
+            profileAccessIssue: { _ in nil })
 
         #expect(detection.isCookieSourceAvailable(.chrome))
         installed.withLock { $0 = false }
         #expect(!detection.isCookieSourceAvailable(.chrome))
     }
 
-    @Test
-    func `registered browser outside Applications is a candidate`() throws {
+    @Test(arguments: [true, false])
+    func `registered browser outside Applications requires a live registration`(registered: Bool) throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let cookies = temp
             .appendingPathComponent("Library/Application Support/Google/Chrome/Default/Network/Cookies")
@@ -617,17 +631,18 @@ struct BrowserDetectionTests {
             cacheTTL: 0,
             now: Date.init,
             fileExists: { path in
-                path == appURL.path || FileManager.default.fileExists(atPath: path)
+                if path.hasSuffix(".app") { return path == appURL.path }
+                return FileManager.default.fileExists(atPath: path)
             },
             directoryContents: { path in
                 try? FileManager.default.contentsOfDirectory(atPath: path)
             },
             applicationURLs: { appName in
-                appName == Browser.chrome.appBundleName ? [appURL] : []
+                registered && appName == Browser.chrome.appBundleName ? [appURL] : []
             },
             profileAccessIssue: { _ in nil })
 
-        #expect(detection.isCookieSourceAvailable(.chrome))
+        #expect(detection.isCookieSourceAvailable(.chrome) == registered)
     }
 
     @Test

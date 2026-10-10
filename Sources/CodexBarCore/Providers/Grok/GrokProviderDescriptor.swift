@@ -1,5 +1,4 @@
 import Foundation
-import SweetCookieKit
 
 public enum GrokProviderDescriptor {
     public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
@@ -24,13 +23,14 @@ public enum GrokProviderDescriptor {
                 manualCookieHeader: nil).sourceMode ?? base
         })
 
-    /// Grok is normally signed in through Chrome; avoid touching unrelated browser keychains.
-    private static var browserCookieOrder: BrowserCookieImportOrder? {
-        #if os(macOS)
-        [.chrome]
-        #else
-        nil
-        #endif
+    fileprivate static func withResetCreditDetails(
+        usage: UsageSnapshot,
+        resetCredits: GrokRateLimitResetCreditsSnapshot?,
+        now: Date) -> UsageSnapshot
+    {
+        let enriched = usage.withGrokResetCredits(resetCredits)
+        let resetSections = GrokRemainingResetsFetcher.detailSections(snapshot: resetCredits, now: now)
+        return enriched.replacing(details: .value(resetSections + enriched.details))
     }
 
     static func makeDescriptor() -> ProviderDescriptor {
@@ -70,7 +70,8 @@ public enum GrokProviderDescriptor {
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
                 debugLogUnavailableMessage: "Grok debug log not yet implemented",
-                browserCookieOrder: self.browserCookieOrder,
+                browserCookieOrder: BrowserCookieImportSupport.chromeOnly(
+                    reason: "Avoid unrelated browser Keychain prompts"),
                 dashboardURL: "https://grok.com/?_s=usage",
                 changelogURL: "https://x.ai/news",
                 statusPageURL: nil,
@@ -210,12 +211,10 @@ struct GrokCLIFetchStrategy: ProviderFetchStrategy {
             at: snapshot.updatedAt,
             requiresCompleteness: context.requiresOptionalUsageCompleteness)
         return self.makeResult(
-            usage: usage
-                .withGrokResetCredits(resetResolution.snapshot)
-                .replacing(details: .value(
-                    GrokRemainingResetsFetcher.detailSections(
-                        snapshot: resetResolution.snapshot,
-                        now: snapshot.updatedAt))),
+            usage: GrokProviderDescriptor.withResetCreditDetails(
+                usage: usage,
+                resetCredits: resetResolution.snapshot,
+                now: snapshot.updatedAt),
             sourceLabel: "grok-cli",
             supplementalUsageTask: resetResolution.supplementalUsageTask,
             diagnostic: snapshot.diagnostic)
@@ -539,12 +538,10 @@ struct GrokWebFetchStrategy: ProviderFetchStrategy {
             at: snapshot.updatedAt,
             requiresCompleteness: context.requiresOptionalUsageCompleteness)
         return self.makeResult(
-            usage: usage
-                .withGrokResetCredits(resetResolution.snapshot)
-                .replacing(details: .value(
-                    GrokRemainingResetsFetcher.detailSections(
-                        snapshot: resetResolution.snapshot,
-                        now: snapshot.updatedAt))),
+            usage: GrokProviderDescriptor.withResetCreditDetails(
+                usage: usage,
+                resetCredits: resetResolution.snapshot,
+                now: snapshot.updatedAt),
             sourceLabel: billingResult.sourceLabel,
             supplementalUsageTask: resetResolution.supplementalUsageTask,
             diagnostic: enrichedBilling.usedPercent == nil ? GrokStatusProbe.usageUnavailableMessage : nil)

@@ -83,11 +83,16 @@ public struct ProviderTokenCostConfig: Sendable {
 public struct ProviderHistoryCapability: Sendable, Equatable {
     public static let optIn = ProviderHistoryCapability(alwaysTracksPlanUtilization: false)
     public static let alwaysTracked = ProviderHistoryCapability(alwaysTracksPlanUtilization: true)
+    public static let unavailable = ProviderHistoryCapability(
+        alwaysTracksPlanUtilization: false,
+        supportsPlanUtilization: false)
 
     public let alwaysTracksPlanUtilization: Bool
+    public let supportsPlanUtilization: Bool
 
-    public init(alwaysTracksPlanUtilization: Bool) {
+    public init(alwaysTracksPlanUtilization: Bool, supportsPlanUtilization: Bool = true) {
         self.alwaysTracksPlanUtilization = alwaysTracksPlanUtilization
+        self.supportsPlanUtilization = supportsPlanUtilization
     }
 }
 
@@ -327,10 +332,12 @@ public struct ProviderDescriptor: Sendable {
     public let presentation: ProviderUsagePresentation
     public let settingsSection: ProviderSettingsSectionRegistration
     public let credentials: ProviderCredentialAdapter?
+    public let pluginResultPolicy: ProviderPluginResultPolicy
     public let config: ProviderConfigCapabilities
     public let menuBarMetrics: ProviderMenuBarMetricCapabilities
     public let fetchPlan: ProviderFetchPlan
     public let cli: ProviderCLIConfig
+    public let nativeAppBundleIdentifiers: Set<String>
     private let configNormalizer: @Sendable (inout ProviderConfig) -> Void
 
     public init(
@@ -338,6 +345,7 @@ public struct ProviderDescriptor: Sendable {
         menuBarMetrics: ProviderMenuBarMetricCapabilities? = nil,
         settingsSection: ProviderSettingsSectionRegistration? = nil,
         credentials: ProviderCredentialAdapter? = nil,
+        pluginResultPolicy: ProviderPluginResultPolicy = ProviderPluginResultPolicy(),
         config: ProviderConfigCapabilities = ProviderConfigCapabilities(),
         metadata: ProviderMetadata,
         branding: ProviderBranding,
@@ -347,6 +355,7 @@ public struct ProviderDescriptor: Sendable {
         presentation: ProviderUsagePresentation = ProviderUsagePresentation(),
         fetchPlan: ProviderFetchPlan,
         cli: ProviderCLIConfig,
+        nativeAppBundleIdentifiers: Set<String> = [],
         configNormalizer: @escaping @Sendable (inout ProviderConfig) -> Void = { _ in })
     {
         self.id = id
@@ -358,10 +367,12 @@ public struct ProviderDescriptor: Sendable {
         self.history = history
         self.presentation = presentation
         self.credentials = credentials
+        self.pluginResultPolicy = pluginResultPolicy
         self.config = config
         self.menuBarMetrics = menuBarMetrics ?? (metadata.balanceOnly ? .automaticOnly : .standard)
         self.fetchPlan = fetchPlan
         self.cli = cli
+        self.nativeAppBundleIdentifiers = nativeAppBundleIdentifiers
         self.configNormalizer = configNormalizer
     }
 

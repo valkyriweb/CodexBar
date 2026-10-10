@@ -62,8 +62,9 @@ public enum CursorProviderDescriptor {
             branding: ProviderBranding(
                 iconStyle: .init(provider: .cursor),
                 iconResourceName: "ProviderIcon-cursor",
-                color: ProviderColor(red: 0 / 255, green: 191 / 255, blue: 165 / 255),
+                color: ProviderColor(hex: 0xF54E00),
                 confettiPalette: [
+                    ProviderColor(hex: 0xF54E00),
                     ProviderColor(hex: 0x1B1913),
                     ProviderColor(hex: 0xEDECEC),
                 ]),
@@ -108,7 +109,8 @@ public enum CursorProviderDescriptor {
                     #else
                     false
                     #endif
-                }))
+                }),
+            nativeAppBundleIdentifiers: ["com.todesktop.230313mzl4w4u92"])
     }
 
     private static var supportsCostCommand: Bool {

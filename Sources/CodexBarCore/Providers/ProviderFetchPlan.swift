@@ -35,13 +35,15 @@ public struct ProviderFetchContext: Sendable {
     public let webTimeout: TimeInterval
     public let webDebugDumpHTML: Bool
     public let verbose: Bool
-    public let env: [String: String]
+    @ProcessEnvironment public private(set) var env: [String: String]
     public let settings: ProviderSettingsSnapshot?
     public let fetcher: UsageFetcher
     public let claudeFetcher: any ClaudeUsageFetching
     public let browserDetection: BrowserDetection
     public let selectedTokenAccountID: UUID?
     public let tokenAccountTokenUpdater: TokenAccountTokenUpdater?
+    public typealias SettingsWriter = @Sendable (UsageProvider, [String: String]) async -> ProviderSettingsSaveOutcome
+    public let settingsWriter: SettingsWriter?
     public let providerManualTokenUpdater: ProviderManualTokenUpdater?
     public let costUsageHistoryDays: Int
     /// Restricts a Claude retry to the credential-owning CLI after an ambient account mismatch rejects OAuth.
@@ -78,6 +80,7 @@ public struct ProviderFetchContext: Sendable {
         selectedTokenAccountID: UUID? = nil,
         tokenAccountTokenUpdater: TokenAccountTokenUpdater? = nil,
         providerManualTokenUpdater: ProviderManualTokenUpdater? = nil,
+        settingsWriter: SettingsWriter? = nil,
         costUsageHistoryDays: Int = 30,
         claudeOwnerCLIRecoveryOnly: Bool = false,
         persistsCLISessions: Bool = false,
@@ -101,6 +104,7 @@ public struct ProviderFetchContext: Sendable {
         self.selectedTokenAccountID = selectedTokenAccountID
         self.tokenAccountTokenUpdater = tokenAccountTokenUpdater
         self.providerManualTokenUpdater = providerManualTokenUpdater
+        self.settingsWriter = settingsWriter
         self.costUsageHistoryDays = max(1, min(365, costUsageHistoryDays))
         self.claudeOwnerCLIRecoveryOnly = claudeOwnerCLIRecoveryOnly
         self.persistsCLISessions = persistsCLISessions

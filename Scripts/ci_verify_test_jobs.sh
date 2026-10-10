@@ -10,6 +10,8 @@ macos_tests_deferred="${5:-}"
 linux_musl_build_required="${6:-}"
 linux_musl_build_result="${7:-}"
 linux_build_result="${8-<missing>}"
+macos_compatibility_result="${9-<missing>}"
+linux_build_required="${10-<missing>}"
 
 if [[ "$lint_result" != "success" ]]; then
   printf 'lint job finished with %s\n' "${lint_result:-<empty>}" >&2
@@ -21,10 +23,19 @@ if [[ "$changes_result" != "success" ]]; then
   exit 1
 fi
 
-if [[ "$linux_build_result" != "success" ]]; then
-  printf 'build-linux-cli matrix finished with %s; expected success\n' "${linux_build_result:-<empty>}" >&2
-  exit 1
-fi
+case "${linux_build_required}:${linux_build_result}" in
+  true:success)
+    printf 'Linux glibc CLI matrix passed.\n'
+    ;;
+  false:skipped)
+    printf 'Linux glibc CLI matrix skipped by its path gate.\n'
+    ;;
+  *)
+    printf 'Linux glibc build gate/result mismatch: required=%s result=%s\n' \
+      "${linux_build_required:-<empty>}" "${linux_build_result:-<empty>}" >&2
+    exit 1
+    ;;
+esac
 
 case "${macos_tests_required}:${macos_tests_deferred}:${macos_test_result}" in
   true:false:success)
@@ -45,7 +56,19 @@ case "${macos_tests_required}:${macos_tests_deferred}:${macos_test_result}" in
     ;;
 esac
 
-printf 'Linux glibc CLI matrix passed.\n'
+case "${macos_tests_required}:${macos_compatibility_result}" in
+  true:success)
+    printf 'Swift 6.2 compatibility build passed.\n'
+    ;;
+  false:skipped)
+    printf 'Swift 6.2 compatibility build skipped by the macOS test gate.\n'
+    ;;
+  *)
+    printf 'Swift 6.2 build gate/result mismatch: required=%s result=%s\n' \
+      "${macos_tests_required:-<empty>}" "${macos_compatibility_result:-<empty>}" >&2
+    exit 1
+    ;;
+esac
 
 case "${linux_musl_build_required}:${linux_musl_build_result}" in
   true:success)

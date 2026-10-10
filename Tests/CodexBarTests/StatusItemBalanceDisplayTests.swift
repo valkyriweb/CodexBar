@@ -96,7 +96,7 @@ struct StatusItemBalanceDisplayTests {
     }
 
     @Test
-    func `menu bar display text keeps open code subscription percentage`() {
+    func `menu bar display text prefers the most constrained open code subscription quota to zen balance`() {
         let settings = self.makeSettings(
             suiteName: "StatusItemBalanceDisplayTests-opencodego-subscription",
             provider: .opencodego)
@@ -118,7 +118,7 @@ struct StatusItemBalanceDisplayTests {
 
         let displayText = controller.menuBarDisplayText(for: .opencodego, snapshot: snapshot)
 
-        #expect(displayText == "12%")
+        #expect(displayText == "34%")
     }
 
     @Test
@@ -342,16 +342,16 @@ struct StatusItemBalanceDisplayTests {
             provider: .deepinfra)
         let (store, controller) = self.makeStoreAndController(settings: settings)
         defer { controller.releaseStatusItemsForTesting() }
-        let snapshot = DeepInfraUsageSnapshot(
-            availableBalanceUSD: 12.34,
-            amountOwedUSD: 0,
-            currentMonthCostUSD: 1.25,
-            recentCostUSD: 1.25,
-            spendingLimitUSD: nil,
-            suspended: false,
-            suspendReason: nil,
-            updatedAt: Date())
-            .toUsageSnapshot()
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 0,
+                windowMinutes: nil,
+                resetsAt: nil,
+                resetDescription: "$12.34 available · $1.25 spent this month"),
+            secondary: nil,
+            updatedAt: Date(),
+            identity: .init(providerID: .deepinfra, accountEmail: nil, accountOrganization: nil, loginMethod: nil),
+            dataConfidence: .exact)
 
         store._setSnapshotForTesting(snapshot, provider: .deepinfra)
         store._setErrorForTesting(nil, provider: .deepinfra)
@@ -362,16 +362,16 @@ struct StatusItemBalanceDisplayTests {
     @Test
     func `DeepInfra card shows balance text without an inferred percentage bar`() throws {
         let now = Date()
-        let snapshot = DeepInfraUsageSnapshot(
-            availableBalanceUSD: 95.81,
-            amountOwedUSD: 0,
-            currentMonthCostUSD: 3.94,
-            recentCostUSD: 3.94,
-            spendingLimitUSD: nil,
-            suspended: false,
-            suspendReason: nil,
-            updatedAt: now)
-            .toUsageSnapshot()
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 0,
+                windowMinutes: nil,
+                resetsAt: nil,
+                resetDescription: "$95.81 available · $3.94 spent this month"),
+            secondary: nil,
+            updatedAt: now,
+            identity: .init(providerID: .deepinfra, accountEmail: nil, accountOrganization: nil, loginMethod: nil),
+            dataConfidence: .exact)
         let metadata = try #require(ProviderDefaults.metadata[.deepinfra])
 
         let model = UsageMenuCardView.Model.make(.init(
@@ -402,34 +402,34 @@ struct StatusItemBalanceDisplayTests {
 
     @Test
     func `menu bar display text marks DeepInfra amount owed`() {
-        let snapshot = DeepInfraUsageSnapshot(
-            availableBalanceUSD: 0,
-            amountOwedUSD: 2.75,
-            currentMonthCostUSD: 3,
-            recentCostUSD: 3,
-            spendingLimitUSD: nil,
-            suspended: false,
-            suspendReason: nil,
-            updatedAt: Date())
-            .toUsageSnapshot()
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 100,
+                windowMinutes: nil,
+                resetsAt: nil,
+                resetDescription: "$2.75 owed · $3.00 spent this month"),
+            secondary: nil,
+            updatedAt: Date(),
+            identity: .init(providerID: .deepinfra, accountEmail: nil, accountOrganization: nil, loginMethod: nil),
+            dataConfidence: .exact)
 
-        #expect(StatusItemController.menuBarBalanceDisplayText(provider: .deepinfra, snapshot: snapshot) == "-$2.75")
+        #expect(MenuBarLayoutBalanceResolver.balance(provider: .deepinfra, snapshot: snapshot) == "-$2.75")
     }
 
     @Test
     func `menu bar display text keeps DeepInfra balance when suspended`() {
-        let snapshot = DeepInfraUsageSnapshot(
-            availableBalanceUSD: 4,
-            amountOwedUSD: 0,
-            currentMonthCostUSD: 3,
-            recentCostUSD: 3,
-            spendingLimitUSD: nil,
-            suspended: true,
-            suspendReason: "Payment review",
-            updatedAt: Date())
-            .toUsageSnapshot()
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 100,
+                windowMinutes: nil,
+                resetsAt: nil,
+                resetDescription: "Suspended: Payment review · $4.00 available · $3.00 spent this month"),
+            secondary: nil,
+            updatedAt: Date(),
+            identity: .init(providerID: .deepinfra, accountEmail: nil, accountOrganization: nil, loginMethod: nil),
+            dataConfidence: .exact)
 
-        #expect(StatusItemController.menuBarBalanceDisplayText(provider: .deepinfra, snapshot: snapshot) == "$4.00")
+        #expect(MenuBarLayoutBalanceResolver.balance(provider: .deepinfra, snapshot: snapshot) == "$4.00")
     }
 
     @Test
@@ -855,7 +855,7 @@ struct StatusItemBalanceDisplayTests {
         #expect(StatusItemController.statusItemAccessibilityTitle(isDebugApp: false) == "CodexBar")
     }
 
-    private func makeSettings(suiteName: String, provider: UsageProvider) -> SettingsStore {
+    func makeSettings(suiteName: String, provider: UsageProvider) -> SettingsStore {
         let settings = testSettingsStore(suiteName: suiteName, userDefaults: InMemoryUserDefaults())
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
@@ -871,7 +871,7 @@ struct StatusItemBalanceDisplayTests {
         return settings
     }
 
-    private func makeStoreAndController(settings: SettingsStore) -> (UsageStore, StatusItemController) {
+    func makeStoreAndController(settings: SettingsStore) -> (UsageStore, StatusItemController) {
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
         let controller = StatusItemController(
@@ -941,6 +941,27 @@ struct StatusItemBalanceDisplayTests {
 }
 
 extension StatusItemBalanceDisplayTests {
+    @Test
+    func `merged selection shows the balance only plugin in legacy and stored layouts`() throws {
+        let settings = self.makeSettings(suiteName: #function, provider: .lithosai)
+        settings.menuBarDisplayMode = .percent
+        let (store, controller) = self.makeStoreAndController(settings: settings)
+        defer { controller.releaseStatusItemsForTesting() }
+        let snapshot = try UsageSnapshot(
+            primary: nil,
+            secondary: nil,
+            details: [ProviderDetailSection(title: "Billing", rows: [.init(label: "Balance", value: "$2.57")])],
+            updatedAt: Date())
+        store._setSnapshotForTesting(snapshot, provider: .lithosai)
+        let selected = controller.primaryProviderForUnifiedIcon()
+        #expect(selected == .lithosai)
+        #expect(controller.menuBarDisplayText(for: selected, snapshot: snapshot) == "$2.57")
+        let data = controller.menuBarLayoutRenderData(provider: selected, snapshot: snapshot, warningFlash: false)
+        #expect(data.balance == "$2.57")
+        #expect(data.automaticText == "$2.57")
+        #expect(data.automatic == nil)
+    }
+
     @Test
     func `Codex direct layout lanes suppress exhausted windows after reset in status item and preview`() {
         let settings = self.makeSettings(
@@ -1298,15 +1319,16 @@ extension StatusItemBalanceDisplayTests {
         settings.setMenuBarLayout(layout, for: nil)
         let (store, controller) = self.makeStoreAndController(settings: settings)
         defer { controller.releaseStatusItemsForTesting() }
-        let snapshot = DeepInfraUsageSnapshot(
-            availableBalanceUSD: 42,
-            amountOwedUSD: 0,
-            currentMonthCostUSD: 3,
-            recentCostUSD: 3,
-            spendingLimitUSD: nil,
-            suspended: false,
-            suspendReason: nil,
-            updatedAt: Date()).toUsageSnapshot()
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 0,
+                windowMinutes: nil,
+                resetsAt: nil,
+                resetDescription: "$42.00 available · $3.00 spent this month"),
+            secondary: nil,
+            updatedAt: Date(),
+            identity: .init(providerID: .deepinfra, accountEmail: nil, accountOrganization: nil, loginMethod: nil),
+            dataConfidence: .exact)
 
         store._setSnapshotForTesting(snapshot, provider: .deepinfra)
         store._setErrorForTesting(nil, provider: .deepinfra)
@@ -1350,15 +1372,17 @@ extension StatusItemBalanceDisplayTests {
         settings.setMenuBarLayout(layout, for: nil)
         let (store, controller) = self.makeStoreAndController(settings: settings)
         defer { controller.releaseStatusItemsForTesting() }
-        let snapshot = DeepInfraUsageSnapshot(
-            availableBalanceUSD: 42,
-            amountOwedUSD: 0,
-            currentMonthCostUSD: 5,
-            recentCostUSD: 5,
-            spendingLimitUSD: 20,
-            suspended: false,
-            suspendReason: nil,
-            updatedAt: Date()).toUsageSnapshot()
+        let snapshot = UsageSnapshot(
+            primary: .init(
+                usedPercent: 0,
+                windowMinutes: nil,
+                resetsAt: nil,
+                resetDescription: "$42.00 available · $5.00 spent this month"),
+            secondary: nil,
+            providerCost: .init(used: 5, limit: 20, currencyCode: "USD", period: "Billing cycle", updatedAt: Date()),
+            updatedAt: Date(),
+            identity: .init(providerID: .deepinfra, accountEmail: nil, accountOrganization: nil, loginMethod: nil),
+            dataConfidence: .exact)
 
         store._setSnapshotForTesting(snapshot, provider: .deepinfra)
         store._setErrorForTesting(nil, provider: .deepinfra)
@@ -1445,11 +1469,18 @@ extension StatusItemBalanceDisplayTests {
         }
     }
 
-    @Test
-    func `stored Poe icon and percent layout shows point balance in status item and preview`() {
+    @Test(arguments: [
+        (UsageProvider.poe, "Balance: 512 points", "512 points"),
+        (UsageProvider.typesafe, "Balance: $4.98", "$4.98"),
+    ])
+    func `stored balance-only icon and percent layout shows balance in status item and preview`(
+        provider: UsageProvider,
+        loginMethod: String,
+        balance: String)
+    {
         let settings = self.makeSettings(
-            suiteName: "StatusItemBalanceDisplayTests-poe-layout-balance",
-            provider: .poe)
+            suiteName: "StatusItemBalanceDisplayTests-\(provider.rawValue)-layout-balance",
+            provider: provider)
         let layout = MenuBarLayout(lines: [[.icon, .percent(window: .automatic)]])
         settings.setMenuBarLayout(layout, for: nil)
         let (store, controller) = self.makeStoreAndController(settings: settings)
@@ -1459,24 +1490,24 @@ extension StatusItemBalanceDisplayTests {
             secondary: nil,
             updatedAt: Date(),
             identity: ProviderIdentitySnapshot(
-                providerID: .poe,
+                providerID: provider.instanceID,
                 accountEmail: nil,
                 accountOrganization: nil,
-                loginMethod: "Balance: 512 points"))
+                loginMethod: loginMethod))
 
-        store._setSnapshotForTesting(snapshot, provider: .poe)
-        store._setErrorForTesting(nil, provider: .poe)
+        store._setSnapshotForTesting(snapshot, provider: provider)
+        store._setErrorForTesting(nil, provider: provider)
 
         let statusItemData = controller.menuBarLayoutRenderData(
-            provider: .poe,
+            provider: provider,
             snapshot: snapshot,
             warningFlash: false)
         let previewData = MenuBarLayoutPreview(
             layout: layout,
-            provider: .poe,
+            provider: provider,
             settings: settings,
             store: store)
-            .liveData(provider: .poe, snapshot: snapshot)
+            .liveData(provider: provider, snapshot: snapshot)
 
         for data in [statusItemData, previewData] {
             let rendered = MenuBarLayoutRenderer().render(
@@ -1493,8 +1524,8 @@ extension StatusItemBalanceDisplayTests {
                     now: Date()))
 
             #expect(data.automatic == nil)
-            #expect(data.automaticText == "512 points")
-            #expect(rendered.attributedTitle.string.hasSuffix("512 points"))
+            #expect(data.automaticText == balance)
+            #expect(rendered.attributedTitle.string.hasSuffix(balance))
         }
     }
 
@@ -1646,5 +1677,27 @@ extension StatusItemBalanceDisplayTests {
         #expect(statusItemData.automatic != nil)
         #expect(statusItemData.automaticText == nil)
         #expect(rendered.attributedTitle.string.hasSuffix("25%"))
+    }
+}
+
+extension StatusItemBalanceDisplayTests {
+    @Test(arguments: AppLanguage.allCases.filter { $0 != .system })
+    func `kiro overage menu text is localized in every supported language`(language: AppLanguage) {
+        let settings = self.makeSettings(
+            suiteName: "StatusItemBalanceDisplayTests-kiro-overage-localized-\(language.rawValue)",
+            provider: .kiro)
+        settings.kiroMenuBarDisplayMode = .overageCostWhenExhausted
+        let (store, controller) = self.makeStoreAndController(settings: settings)
+        defer { controller.releaseStatusItemsForTesting() }
+        let snapshot = Self.exhaustedKiroSnapshot()
+
+        store._setSnapshotForTesting(snapshot, provider: .kiro)
+        store._setErrorForTesting(nil, provider: .kiro)
+
+        CodexBarLocalizationOverride.$appLanguage.withValue(language.rawValue) {
+            let displayText = controller.menuBarDisplayText(for: .kiro, snapshot: snapshot)
+            #expect(displayText == L("%@ over", "$1.61"))
+            if language != .english { #expect(displayText != "$1.61 over") }
+        }
     }
 }

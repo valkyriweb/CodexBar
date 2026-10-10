@@ -32,6 +32,7 @@ struct ProviderCredentialCharacterizationTests {
             .init(provider: .elevenlabs, environmentKey: "ELEVENLABS_API_KEY"),
             .init(provider: .kimi, environmentKey: "KIMI_CODE_API_KEY"),
             .init(provider: .ollama, environmentKey: "OLLAMA_API_KEY"),
+            .init(provider: .llmman, environmentKey: "LLMMAN_API_KEY"),
             .init(provider: .venice, environmentKey: "VENICE_API_KEY"),
             .init(provider: .deepgram, environmentKey: "DEEPGRAM_API_KEY"),
             .init(provider: .groq, environmentKey: "GROQ_API_KEY"),
@@ -213,11 +214,13 @@ struct ProviderCredentialCharacterizationTests {
             (.llmproxy, "LLM_PROXY_API_KEY"),
             (.litellm, "LITELLM_API_KEY"),
             (.bifrost, "BIFROST_API_KEY"),
+            (.aixy, "AIXY_API_KEY"),
             (.sub2api, "SUB2API_API_KEY"),
             (.ibmbob, "BOBSHELL_API_KEY"),
             (.grok, "GROK_OAUTH_TOKEN"),
             (.huggingface, "CODEXBAR_HUGGINGFACE_API_KEY"),
             (.doubao, "ARK_API_KEY"),
+            (.clinepass, "CLINE_API_KEY"),
         ]
         let cookieProviders: [UsageProvider] = [
             .claude, .cursor, .opencode, .opencodego, .factory, .minimax, .manus,
@@ -293,9 +296,11 @@ struct ProviderCredentialCharacterizationTests {
             (.neuralwatt, "NEURALWATT_API_KEY"), (.groq, "GROQ_API_KEY"),
             (.llmproxy, "LLM_PROXY_API_KEY"), (.litellm, "LITELLM_API_KEY"),
             (.bifrost, "BIFROST_API_KEY"),
+            (.aixy, "AIXY_API_KEY"),
             (.sub2api, "SUB2API_API_KEY"), (.antigravity, "ANTIGRAVITY_OAUTH_CREDENTIALS_JSON"),
             (.ibmbob, "BOBSHELL_API_KEY"),
             (.huggingface, "CODEXBAR_HUGGINGFACE_API_KEY"),
+            (.clinepass, "CLINE_API_KEY"),
         ]
         let account = ProviderTokenAccount(
             id: UUID(), label: "fixture", token: "account-token", addedAt: 0, lastUsed: nil)
@@ -385,6 +390,7 @@ struct ProviderCredentialCharacterizationTests {
             .init(provider: .sub2api, environment: ["SUB2API_API_KEY": "token"], mode: "api"),
             .init(provider: .moonshot, environment: ["MOONSHOT_API_KEY": "token"], mode: "api"),
             .init(provider: .ollama, environment: ["OLLAMA_API_KEY": "token"], mode: "api"),
+            .init(provider: .llmman, environment: ["LLMMAN_API_KEY": "token"], mode: "api"),
             .init(provider: .openai, environment: ["OPENAI_ADMIN_KEY": "token"], mode: "api"),
             .init(provider: .openrouter, environment: ["OPENROUTER_API_KEY": "token"], mode: "api"),
             .init(provider: .stepfun, environment: ["STEPFUN_TOKEN": "token"], mode: "api"),

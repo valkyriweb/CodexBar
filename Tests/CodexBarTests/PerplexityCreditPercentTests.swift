@@ -10,7 +10,7 @@ struct PerplexityCreditPercentTests {
     private let now = Date(timeIntervalSince1970: 1_790_000_000)
 
     @Test(arguments: [false, true])
-    func `explicit credit pools render without a duration or fabricated pace`(showUsed: Bool) throws {
+    func `explicit credit pools render without a duration or fabricated pace`(showUsed: Bool) async throws {
         let json = """
         {
           "balance_cents": 3000,
@@ -23,7 +23,7 @@ struct PerplexityCreditPercentTests {
           "total_usage_cents": 9000
         }
         """
-        let snapshot = try PerplexityUsageFetcher._parseResponseForTesting(Data(json.utf8), now: self.now)
+        let snapshot = try await CookiePluginFixtures.perplexity(Data(json.utf8), now: self.now)
             .toUsageSnapshot()
         let text = CLIRenderer.renderText(
             provider: .perplexity,
@@ -85,7 +85,7 @@ struct PerplexityCreditPercentTests {
                     now: self.now))
             if let path = ProcessInfo.processInfo.environment["CODEXBAR_PERPLEXITY_PERCENT_PROOF_DIR"] {
                 let file = URL(fileURLWithPath: path)
-                    .appendingPathComponent("\(preference.rawValue)-\(showUsed ? "used" : "remaining").txt")
+                    .appendingPathComponent("\(preference.id)-\(showUsed ? "used" : "remaining").txt")
                 try output.attributedTitle.string.write(to: file, atomically: true, encoding: .utf8)
             }
             #expect(output.attributedTitle.string == expected)

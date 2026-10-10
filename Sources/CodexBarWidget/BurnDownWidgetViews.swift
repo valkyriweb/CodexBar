@@ -18,24 +18,27 @@ struct BurnDownWidgetView: View {
             if let state, let window = state.selectedWindow {
                 BurnDownLayout(
                     window: window,
+                    title: state.selectedTitle,
                     provider: self.entry.provider,
                     blankChart: state.blankPrimaryChart,
                     resetsAtOverride: state.selectedResetOverride)
             } else {
-                self.emptyState
+                BurnDownEmptyState()
             }
         }
         .containerBackground(for: .widget) {
             BurnWidgetBackground()
         }
     }
+}
 
-    private var emptyState: some View {
+struct BurnDownEmptyState: View {
+    var body: some View {
         VStack(spacing: 6) {
-            Text("Open CodexBar")
+            Text(W("Open CodexBar"))
                 .font(.body)
                 .fontWeight(.semibold)
-            Text("Usage data will appear once the app refreshes.")
+            Text(W("Usage data will appear once the app refreshes."))
                 .font(.caption)
                 .multilineTextAlignment(.center)
                 .opacity(0.55)
@@ -51,6 +54,7 @@ private struct BurnDownLayout: View {
     @Environment(\.colorScheme) private var colorScheme
 
     let window: RateWindow
+    let title: String
     let provider: UsageProvider
     /// True when the session window is blocked because the weekly budget is exhausted:
     /// suppress the chart and retarget "Resets in" to the weekly reset.
@@ -93,8 +97,8 @@ private struct BurnDownLayout: View {
         // (◆ full / ■ spent) with no pace number — the margin is meaningless once the
         // budget is full or gone.
         let showBadgeNumber = !geom.depleted && !geom.fresh
-        let statusWord: String = geom.depleted ? "spent" : geom.fresh ? "full"
-            : geom.status == .ahead ? "conserving" : geom.status == .behind ? "over pace" : "on pace"
+        let statusWord: String = geom.depleted ? W("spent") : geom.fresh ? W("full")
+            : geom.status == .ahead ? W("conserving") : geom.status == .behind ? W("over pace") : W("on pace")
         let arrow: String = geom.depleted ? "■" : geom.fresh ? "◆"
             : geom.status == .ahead ? "▲" : geom.status == .behind ? "▼" : "●"
 
@@ -119,7 +123,7 @@ private struct BurnDownLayout: View {
                             .foregroundStyle(theme.text)
                             .lineLimit(1)
                     }
-                    Text(burnWindowLabel(self.window.windowMinutes))
+                    Text("\(self.title) · \(burnWindowLabel(self.window.windowMinutes))")
                         .font(.system(size: 11))
                         .foregroundStyle(theme.sub)
                         .kerning(0.2)
@@ -152,10 +156,10 @@ private struct BurnDownLayout: View {
                     VStack(spacing: 5) {
                         BurnResetStatRow(resetAt: effectiveResetAt, theme: theme)
                         BurnStatRow(
-                            label: geom.depleted ? "Ran out" : runsDryBefore ? "Runs out in" : "Runs out",
+                            label: geom.depleted ? W("Ran out") : runsDryBefore ? W("Runs out in") : W("Runs out"),
                             value: geom
-                                .depleted ? "budget spent" : runsDryBefore ? "~\(burnFmtDuration(outInMins))" :
-                                "after reset",
+                                .depleted ? W("budget spent") : runsDryBefore ? "~\(burnFmtDuration(outInMins))" :
+                                W("after reset"),
                             theme: theme,
                             danger: geom.depleted || runsDryBefore)
                     }
@@ -173,7 +177,7 @@ private struct BurnDownLayout: View {
                         Text("%")
                             .font(.system(size: 19, weight: .medium))
                             .foregroundStyle(theme.sub)
-                        Text("left")
+                        Text(W("left"))
                             .font(.system(size: 11))
                             .foregroundStyle(theme.sub)
                     }
@@ -219,7 +223,7 @@ private struct BurnStatRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text(self.label)
+            Text(W(self.label))
                 .font(.system(size: 11.5))
                 .foregroundStyle(self.theme.sub)
             Spacer()
@@ -238,12 +242,12 @@ private struct BurnResetStatRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text("Resets in")
+            Text(W("Resets in"))
                 .font(.system(size: 11.5))
                 .foregroundStyle(self.theme.sub)
             Spacer()
             if let resetAt {
-                Text(resetAt, style: .relative)
+                WidgetDateText.offset(resetAt)
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(self.theme.text)
                     .monospacedDigit()
@@ -289,7 +293,7 @@ private struct BurnAxisRow: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 if showNow {
-                    Text("now")
+                    Text(W("now"))
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundStyle(self.theme.text)
                         .position(x: nowX, y: geo.size.height / 2)
@@ -307,15 +311,17 @@ private struct BurnAxisRow: View {
 
 // MARK: - Chart Canvas
 
-private struct BurnChartCanvas: View {
+struct BurnChartCanvas: View {
     let geom: BurnGeom
     let theme: BurnTheme
+    var periods: Int?
+    var dark = false
 
     var body: some View {
         Canvas { context, size in
             let w = size.width
             let h = size.height
-            let padT: CGFloat = 8
+            let padT: CGFloat = self.periods == nil ? 8 : 5
             let padB: CGFloat = 2
             let padL: CGFloat = 1
             let padR: CGFloat = 1
@@ -329,6 +335,86 @@ private struct BurnChartCanvas: View {
 
             let tNow = self.geom.tNow
             let vNow = self.geom.vNow
+
+            if let periods = self.periods {
+                let barColor = self.dark ? Color.white : Color.black
+
+                // --- Usage bars (background texture) ---
+                // Drawn first so the actual line renders on top.
+                // Heights are relative-to-ideal: idealPerPeriod maps to ~46% of plot height.
+                let plotH = h - padT - padB
+                let refH = 0.46 * plotH // reference height = ideal-pace bar height
+                let idealPerPeriod = 100.0 / Double(periods)
+                let burnRate = tNow > 0.001 ? (100.0 - vNow) / tNow : 0.0 // %/unit-t
+                let slotW = (w - padL - padR) / CGFloat(periods)
+
+                for i in 0..<periods {
+                    let slotStart = Double(i) / Double(periods)
+                    let slotEnd = Double(i + 1) / Double(periods)
+                    let slotX = padL + CGFloat(slotStart) * (w - padL - padR)
+
+                    if slotEnd <= tNow {
+                        // Completed period — full-width bar
+                        let consumed = burnRate * (slotEnd - slotStart)
+                        let ratio = consumed / idealPerPeriod
+                        let totalBarH = CGFloat(ratio) * refH
+                        let baseH = min(totalBarH, refH)
+
+                        if baseH > 0 {
+                            let rect = CGRect(
+                                x: slotX,
+                                y: h - padB - baseH,
+                                width: slotW - 1,
+                                height: baseH)
+                            context.fill(Path(rect), with: .color(barColor.opacity(0.17)))
+                        }
+                        // Overage segment — above ideal reference line
+                        if totalBarH > refH {
+                            let overH = totalBarH - refH
+                            let rect = CGRect(
+                                x: slotX,
+                                y: h - padB - totalBarH,
+                                width: slotW - 1,
+                                height: overH)
+                            context.fill(Path(rect), with: .color(barColor.opacity(0.34)))
+                        }
+                    } else if slotStart < tNow {
+                        // Current (partial) period — narrower bar ending at tNow
+                        let partialFrac = (tNow - slotStart) / (slotEnd - slotStart)
+                        let consumed = burnRate * (tNow - slotStart)
+                        let ratio = consumed / idealPerPeriod
+                        let totalBarH = CGFloat(ratio) * refH
+                        let baseH = min(totalBarH, refH)
+                        let barW = CGFloat(partialFrac) * (slotW - 1)
+
+                        if baseH > 0 {
+                            let rect = CGRect(
+                                x: slotX,
+                                y: h - padB - baseH,
+                                width: barW,
+                                height: baseH)
+                            context.fill(Path(rect), with: .color(barColor.opacity(0.13)))
+                        }
+                        if totalBarH > refH {
+                            let overH = totalBarH - refH
+                            let rect = CGRect(
+                                x: slotX,
+                                y: h - padB - totalBarH,
+                                width: barW,
+                                height: overH)
+                            context.fill(Path(rect), with: .color(barColor.opacity(0.26)))
+                        }
+                    } else {
+                        // Future period — faint full-height placeholder
+                        let rect = CGRect(
+                            x: slotX,
+                            y: h - padB - refH,
+                            width: slotW - 1,
+                            height: refH)
+                        context.fill(Path(rect), with: .color(barColor.opacity(0.045)))
+                    }
+                }
+            }
 
             // --- Now vertical hairline ---
             do {
@@ -347,7 +433,7 @@ private struct BurnChartCanvas: View {
             }
 
             // --- Area fill (gradient from actual line down to baseline) ---
-            do {
+            if self.periods == nil {
                 var p = Path()
                 p.move(to: CGPoint(x: X(0), y: Y(100)))
                 p.addLine(to: CGPoint(x: X(tNow), y: Y(vNow)))
@@ -604,15 +690,13 @@ struct BurnGeom {
 // MARK: - Helpers
 
 func burnWindowLabel(_ windowMinutes: Int?) -> String {
-    guard let mins = windowMinutes else { return "Usage limit" }
+    guard let mins = windowMinutes else { return W("Usage limit") }
     if mins < 60 {
-        return "\(mins)-minute limit"
+        return W("%@-minute limit", String(describing: mins))
     }
-    let hours = mins / 60
-    if hours < 24 {
-        return "\(hours)-hour limit"
-    }
-    return "\(hours / 24)-day limit"
+    if mins % 1440 == 0 { return W("%@-day limit", String(describing: mins / 1440)) }
+    if mins % 60 == 0 { return W("%@-hour limit", String(describing: mins / 60)) }
+    return W("%@-minute limit", String(describing: mins))
 }
 
 func burnEffectiveResetDate(
@@ -638,14 +722,9 @@ func burnAxisDateRange(
 
 func burnCompactWindowLabel(_ windowMinutes: Int?, fallback: String) -> String {
     guard let minutes = windowMinutes else { return fallback }
-    if minutes < 60 {
-        return "\(minutes)M"
-    }
-    let hours = minutes / 60
-    if hours < 24 {
-        return "\(hours)H"
-    }
-    return "\(hours / 24)D"
+    if minutes > 1440, minutes % 1440 == 0 { return W("%@D", String(describing: minutes / 1440)) }
+    if minutes % 60 == 0 { return W("%@H", String(describing: minutes / 60)) }
+    return W("%@M", String(describing: minutes))
 }
 
 func burnFmtDuration(_ minutes: Double) -> String {
@@ -653,14 +732,14 @@ func burnFmtDuration(_ minutes: Double) -> String {
     if minutes >= 1440 {
         let d = Int(minutes / 1440)
         let h = Int(minutes / 60) % 24
-        return "\(d)d \(h)h"
+        return W("%@d %@h", String(describing: d), String(describing: h))
     }
     let h = Int(minutes / 60)
     let m = Int(minutes) % 60
     if h <= 0 {
-        return "\(max(1, m))m"
+        return W("%@m", String(describing: max(1, m)))
     }
-    return "\(h)h \(String(format: "%02d", m))m"
+    return W("%@h %@m", String(describing: h), String(describing: String(format: "%02d", m)))
 }
 
 func burnAxisLabel(_ date: Date, isDailyWindow: Bool) -> String {
