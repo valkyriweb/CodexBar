@@ -71,6 +71,16 @@ struct OverviewAccountRowsTests {
             #expect(rows.contains { $0.identifier.hasSuffix(account.id.uuidString) })
         }
 
+        store.accountSnapshots[.claude]?[1] = TokenAccountUsageSnapshot(
+            account: accounts[1],
+            snapshot: nil,
+            error: "Sign in again",
+            sourceLabel: "test",
+            cacheKey: store.tokenAccountSnapshotCacheKey(provider: .claude, account: accounts[1]))
+        let rowsWithExpiredAccount = controller.overviewAccountRows(for: .claude)
+        #expect(rowsWithExpiredAccount.count == 3)
+        #expect(rowsWithExpiredAccount.contains { $0.model.email == "Secondary" && $0.model.isOverviewErrorOnly })
+
         settings.multiAccountMenuLayout = .segmented
         #expect(controller.overviewAccountRows(for: .claude).count <= 1)
     }
@@ -79,26 +89,31 @@ struct OverviewAccountRowsTests {
     func `stacked Codex profiles use their own cached snapshots`() {
         let settings = self.makeSettings()
         enableTestProviders([.codex], settings: settings)
-        let accounts = (0..<3).map { index in
-            CodexVisibleAccount(
-                id: "profile-\(index)",
+        let managedAccounts = (0..<3).map { index in
+            ManagedCodexAccount(
+                id: UUID(),
                 email: "profile\(index)@example.com",
-                storedAccountID: nil,
-                selectionSource: .profileHome(path: "/fixture/profile-\(index)"),
-                isActive: index == 0,
-                isLive: false,
-                canReauthenticate: false,
-                canRemove: false)
+                managedHomePath: "/fixture/profile-\(index)",
+                createdAt: 1,
+                updatedAt: 1,
+                lastAuthenticatedAt: 1)
         }
-        settings.codexActiveSource = accounts[0].selectionSource
+        let reconciliation = CodexAccountReconciliationSnapshot(
+            storedAccounts: managedAccounts,
+            activeStoredAccount: managedAccounts[0],
+            liveSystemAccount: nil,
+            matchingStoredAccountForLiveSystemAccount: nil,
+            activeSource: .managedAccount(id: managedAccounts[0].id),
+            hasUnreadableAddedAccountStore: false)
+        let projection = CodexVisibleAccountProjection.make(from: reconciliation)
+        let accounts = projection.visibleAccounts
+        settings._test_codexAccountSnapshotLoader = { _ in reconciliation }
+        defer { settings._test_codexAccountSnapshotLoader = nil }
+        settings.codexActiveSource = reconciliation.activeSource
         settings.cachedCodexAccountMenuProjection = CachedCodexAccountMenuProjection(
-            activeSource: accounts[0].selectionSource,
+            activeSource: reconciliation.activeSource,
             loadedAt: Date(),
-            projection: CodexVisibleAccountProjection(
-                visibleAccounts: accounts,
-                activeVisibleAccountID: accounts[0].id,
-                liveVisibleAccountID: nil,
-                hasUnreadableAddedAccountStore: false))
+            projection: projection)
         let store = UsageStore(
             fetcher: UsageFetcher(), browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
         store.codexAccountSnapshots = accounts.enumerated().map { index, account in
@@ -119,5 +134,16 @@ struct OverviewAccountRowsTests {
         #expect(Set(rows.map(\.model.email)) == Set(accounts.map(\.email)))
         #expect(Set(rows.compactMap { $0.model.metrics.first?.percent }).count == 3)
         #expect(rows.allSatisfy { $0.provider == .codex })
+
+        store.codexAccountSnapshots[1] = CodexAccountUsageSnapshot(
+            account: accounts[1],
+            snapshot: nil,
+            error: "Sign in again",
+            sourceLabel: "test")
+        let rowsWithExpiredAccount = controller.overviewAccountRows(for: .codex)
+        #expect(rowsWithExpiredAccount.count == 3)
+        #expect(rowsWithExpiredAccount.contains {
+            $0.model.email == accounts[1].email && $0.model.isOverviewErrorOnly
+        })
     }
 }

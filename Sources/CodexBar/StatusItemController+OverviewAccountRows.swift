@@ -30,7 +30,6 @@ extension StatusItemController {
                 guard let model = self.codexAccountMenuCardModel(
                     for: account,
                     accountSnapshot: accountSnapshot) else { return nil }
-                guard !model.isOverviewErrorOnly else { return nil }
                 return OverviewAccountRow(
                     provider: provider,
                     model: model,
@@ -51,7 +50,6 @@ extension StatusItemController {
                 guard let model = self.tokenAccountMenuCardModel(
                     for: provider,
                     accountSnapshot: accountSnapshot) else { return nil }
-                guard !model.isOverviewErrorOnly else { return nil }
                 return OverviewAccountRow(
                     provider: provider,
                     model: model,

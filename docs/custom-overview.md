@@ -1,6 +1,6 @@
 # Custom Overview fork
 
-This fork keeps one compact Overview row per account when the multi-account layout is **Stacked**. Codex rows use upstream visible-account projections and account-scoped snapshots; token-account rows use upstream credential-scoped snapshots. Row identities and height-cache keys stay distinct. Shared storage usage appears once per provider. Segmented mode retains upstream’s single-provider row.
+This fork keeps one compact Overview row per account when the multi-account layout is **Stacked**. Codex rows use upstream visible-account projections and account-scoped snapshots; token-account rows use upstream credential-scoped snapshots. Row identities and height-cache keys stay distinct. Shared storage usage appears once per provider. An account requiring reauthentication stays visible with its own error instead of disappearing. Segmented mode retains upstream’s single-provider row.
 
 ## Upstream sync
 
@@ -14,7 +14,7 @@ This fork keeps one compact Overview row per account when the multi-account layo
 
 ## Verification
 
-`OverviewAccountRowsTests` checks separate identities, cache scopes and quota values for three Claude token accounts and three Codex profiles, plus segmented fallback. Also run the upstream account-display, account-switcher and provider-architecture suites, `make check`, and `make test`.
+`OverviewAccountRowsTests` checks separate identities, cache scopes and quota values for three Claude token accounts and three Codex profiles, plus expired-account visibility and segmented fallback. Also run the upstream account-display, account-switcher and provider-architecture suites, `make check`, and `make test`.
 
 Build/package with full Xcode and the pinned SwiftPM dependencies. Test scripts require a recent Python with `waitid`/`WNOWAIT`; on the M2 Max, prepend `/opt/homebrew/opt/python@3.14/libexec/bin` to PATH. Use `--disable-keychain` for initial SwiftPM resolution: public dependencies do not need GitHub Keychain credentials.
 
