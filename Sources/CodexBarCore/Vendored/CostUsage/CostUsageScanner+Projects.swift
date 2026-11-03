@@ -1,25 +1,58 @@
 import Foundation
 
 extension CostUsageScanner {
-    static func buildCodexProjectBreakdownsFromCache(
+    static func codexCache(_ cache: CostUsageCache, scopedTo roots: [URL]) -> CostUsageCache {
+        var scoped = cache
+        scoped.files = cache.files.filter { filePath, _ in
+            Self.isWithinCodexRoots(fileURL: URL(fileURLWithPath: filePath), roots: roots)
+        }
+        scoped.days = [:]
+        for usage in scoped.files.values {
+            Self.applyFileDays(cache: &scoped, fileDays: usage.days, sign: 1)
+        }
+        return scoped
+    }
+
+    static func buildCodexReportProjectionsFromCache(
         cache: CostUsageCache,
         range: CostUsageDayRange,
         modelsDevCatalog: ModelsDevCatalog? = nil,
         modelsDevCacheRoot: URL? = nil,
-        priorityTurns: [String: CodexPriorityTurnMetadata] = [:],
+        sessionRoots: [URL]? = nil,
+        includeBreakdowns: Bool = true,
+        includeProjects: Bool = true,
+        priorityTurns: [String: CodexPriorityTurnMetadata]? = nil,
         modelsDevCatalogLoader: (URL?) -> ModelsDevCatalog? = {
             CostUsagePricing.modelsDevCatalog(cacheRoot: $0)
-        }) -> [CostUsageProjectBreakdown]
+        })
+        -> (
+            daily: CostUsageDailyReport,
+            projects: [CostUsageProjectBreakdown],
+            sessions: [CostUsageSessionBreakdown])
     {
-        // Project rollups build one report per cached session file. Resolve pricing once so every
-        // row does not fall back through ModelsDevCache.load and repeat filesystem metadata reads.
+        let priorityTurns = priorityTurns ?? cache.codexResolvedPriorityTurns ?? [:]
+        // One refresh owns the pricing context; file reports feed both session and project projections.
         let resolvedModelsDevCatalog = modelsDevCatalog
             ?? modelsDevCatalogLoader(modelsDevCacheRoot)
             ?? ModelsDevCatalog(providers: [:])
+        let pricingResolver = CostUsagePricing.CodexResolver(catalog: resolvedModelsDevCatalog)
+        let daily = Self.buildCodexReportFromCache(
+            cache: cache,
+            range: range,
+            modelsDevCatalog: resolvedModelsDevCatalog,
+            priorityTurns: priorityTurns,
+            pricingResolver: pricingResolver)
+        guard includeBreakdowns else { return (daily, [], []) }
+        var latestSessions: [String: (usage: CostUsageFileUsage, report: CostUsageDailyReport, path: String)] = [:]
         let projectPathResolver = CodexCanonicalProjectPathResolver()
         var accumulatorsByProjectPath: [String: CodexProjectBreakdownAccumulator] = [:]
         for (filePath, usage) in cache.files {
-            guard usage.touchesCodexScanWindow(sinceKey: range.scanSinceKey, untilKey: range.scanUntilKey) else {
+            guard usage.touchesCodexScanWindow(
+                sinceKey: range.scanSinceKey,
+                untilKey: range.scanUntilKey,
+                calendar: range.calendar)
+                || !Self.codexTurnPerformanceSamples(usage: usage, range: range).isEmpty
+            else {
                 continue
             }
             var fileCache = CostUsageCache()
@@ -29,38 +62,114 @@ extension CostUsageScanner {
                 cache: fileCache,
                 range: range,
                 modelsDevCatalog: resolvedModelsDevCatalog,
-                priorityTurns: priorityTurns)
-            guard !report.data.isEmpty else { continue }
+                priorityTurns: priorityTurns,
+                pricingResolver: pricingResolver)
+            let includeSession = sessionRoots.map {
+                Self.isWithinCodexRoots(fileURL: URL(fileURLWithPath: filePath), roots: $0)
+            } ?? true
+            if includeSession {
+                let id = usage.sessionId ?? URL(fileURLWithPath: filePath).deletingPathExtension().lastPathComponent
+                if !id.isEmpty, latestSessions[id].map({ $0.usage.mtimeUnixMs < usage.mtimeUnixMs }) ?? true {
+                    latestSessions[id] = (usage, report, filePath)
+                }
+            }
+            guard includeProjects, !report.data.isEmpty else { continue }
             let projectKey = usage.canonicalProjectPath
                 ?? projectPathResolver.canonicalProjectPath(for: usage.projectPath)
                 ?? ""
             let sourceKey = usage.projectPath ?? ""
             var accumulator = accumulatorsByProjectPath[projectKey] ?? CodexProjectBreakdownAccumulator()
-            accumulator.add(report: report, sourcePath: sourceKey)
+            accumulator.files[filePath] = usage
+            accumulator.reportsBySourcePath[sourceKey, default: []].append(report)
             accumulatorsByProjectPath[projectKey] = accumulator
         }
 
-        return accumulatorsByProjectPath.map { projectPath, accumulator in
-            let merged = CostUsageDailyReport.merged(accumulator.reports)
+        let projects = accumulatorsByProjectPath.map { projectPath, accumulator in
+            var projectCache = CostUsageCache()
+            projectCache.files = accumulator.files
+            for usage in accumulator.files.values {
+                Self.applyFileDays(cache: &projectCache, fileDays: usage.days, sign: 1)
+            }
+            let report = Self.buildCodexReportFromCache(
+                cache: projectCache,
+                range: range,
+                modelsDevCatalog: resolvedModelsDevCatalog,
+                priorityTurns: priorityTurns,
+                pricingResolver: pricingResolver)
             let resolvedPath = projectPath.isEmpty ? nil : projectPath
             return CostUsageProjectBreakdown(
                 name: Self.codexProjectName(path: resolvedPath),
                 path: resolvedPath,
-                totalTokens: merged.summary?.totalTokens,
-                totalCostUSD: merged.summary?.totalCostUSD,
-                daily: merged.data,
-                modelBreakdowns: Self.codexProjectModelBreakdowns(from: merged.data),
+                totalTokens: report.summary?.totalTokens,
+                totalCostUSD: report.summary?.totalCostUSD,
+                daily: report.data,
+                modelBreakdowns: Self.codexProjectModelBreakdowns(from: report.data),
                 sources: Self.codexProjectSourceBreakdowns(from: accumulator.reportsBySourcePath))
         }
         .sorted { lhs, rhs in
-            let lhsCost = lhs.totalCostUSD ?? -1
-            let rhsCost = rhs.totalCostUSD ?? -1
-            if lhsCost != rhsCost { return lhsCost > rhsCost }
-            let lhsTokens = lhs.totalTokens ?? -1
-            let rhsTokens = rhs.totalTokens ?? -1
-            if lhsTokens != rhsTokens { return lhsTokens > rhsTokens }
+            let lhsRank = (lhs.totalCostUSD ?? -1, lhs.totalTokens ?? -1)
+            let rhsRank = (rhs.totalCostUSD ?? -1, rhs.totalTokens ?? -1)
+            if lhsRank != rhsRank {
+                return lhsRank > rhsRank
+            }
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
+        let databaseURL = CostUsageStore.databaseURL(cacheRoot: modelsDevCacheRoot)
+        let sessions = latestSessions.compactMap { id, file -> CostUsageSessionBreakdown? in
+            let performanceSamples = Self.codexTurnPerformanceSamples(usage: file.usage, range: range)
+            // A turn can complete after midnight with all billed requests on the previous day.
+            guard !file.report.data.isEmpty || !performanceSamples.isEmpty else { return nil }
+            return Self.codexSessionBreakdown(
+                detailSource: CostUsageSessionDetailSource(
+                    databaseURL: databaseURL,
+                    sessionSource: SessionToolActivitySource(fileURL: URL(fileURLWithPath: file.path), sessionID: id),
+                    parsedBytes: file.usage.parsedBytes),
+                usage: file.usage,
+                report: file.report,
+                projectPathResolver: projectPathResolver,
+                performanceSamples: performanceSamples)
+        }
+        .sorted { lhs, rhs in
+            if lhs.lastActivity != rhs.lastActivity {
+                return lhs.lastActivity > rhs.lastActivity
+            }
+            return lhs.sessionID > rhs.sessionID
+        }
+        return (daily, projects, sessions)
+    }
+
+    private static func codexSessionBreakdown(
+        detailSource: CostUsageSessionDetailSource,
+        usage: CostUsageFileUsage,
+        report: CostUsageDailyReport,
+        projectPathResolver: CodexCanonicalProjectPathResolver,
+        performanceSamples: [CostUsageTurnPerformanceSample]) -> CostUsageSessionBreakdown
+    {
+        let source = detailSource.sessionSource
+        let summary = report.summary
+        let requestCounts = report.data.compactMap(\.requestCount)
+        let resolvedProjectPath = usage.canonicalProjectPath
+            ?? projectPathResolver.canonicalProjectPath(for: usage.projectPath)
+        let projectPath = resolvedProjectPath?.isEmpty == false ? resolvedProjectPath : nil
+        var session = CostUsageSessionBreakdown(
+            sessionID: source.sessionID,
+            lastActivity: Date(timeIntervalSince1970: TimeInterval(usage.mtimeUnixMs) / 1000),
+            inputTokens: summary?.totalInputTokens,
+            cachedInputTokens: summary?.cacheReadTokens,
+            outputTokens: summary?.totalOutputTokens,
+            reasoningTokens: summary?.reasoningTokens,
+            totalTokens: summary?.totalTokens,
+            requestCount: requestCounts.isEmpty ? nil : requestCounts.reduce(0, +),
+            costUSD: summary?.totalCostUSD,
+            modelBreakdowns: Self.codexProjectModelBreakdowns(from: report.data) ?? [],
+            projectPath: projectPath,
+            projectName: projectPath.map { Self.codexProjectName(path: $0) },
+            title: usage.codexSession?.title,
+            turnPerformanceSamples: performanceSamples,
+            toolActivitySource: source,
+            requestDetailSource: detailSource)
+        session.workingDirectory = usage.projectPath
+        return session
     }
 
     private static func codexProjectName(path: String?) -> String {
@@ -70,13 +179,8 @@ extension CostUsageScanner {
     }
 
     private struct CodexProjectBreakdownAccumulator {
-        var reports: [CostUsageDailyReport] = []
+        var files: [String: CostUsageFileUsage] = [:]
         var reportsBySourcePath: [String: [CostUsageDailyReport]] = [:]
-
-        mutating func add(report: CostUsageDailyReport, sourcePath: String) {
-            self.reports.append(report)
-            self.reportsBySourcePath[sourcePath, default: []].append(report)
-        }
     }
 
     private static func codexProjectSourceBreakdowns(
@@ -94,83 +198,19 @@ extension CostUsageScanner {
                 modelBreakdowns: Self.codexProjectModelBreakdowns(from: merged.data))
         }
         .sorted { lhs, rhs in
-            let lhsCost = lhs.totalCostUSD ?? -1
-            let rhsCost = rhs.totalCostUSD ?? -1
-            if lhsCost != rhsCost { return lhsCost > rhsCost }
-            let lhsTokens = lhs.totalTokens ?? -1
-            let rhsTokens = rhs.totalTokens ?? -1
-            if lhsTokens != rhsTokens { return lhsTokens > rhsTokens }
+            let lhsRank = (lhs.totalCostUSD ?? -1, lhs.totalTokens ?? -1)
+            let rhsRank = (rhs.totalCostUSD ?? -1, rhs.totalTokens ?? -1)
+            if lhsRank != rhsRank {
+                return lhsRank > rhsRank
+            }
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-        }
-    }
-
-    private struct ProjectBreakdownAccumulator {
-        var totalTokens = 0
-        var sawTotalTokens = false
-        var costUSD: Double = 0
-        var sawCost = false
-        var standardCostUSD: Double = 0
-        var sawStandardCost = false
-        var priorityCostUSD: Double = 0
-        var sawPriorityCost = false
-        var standardTokens = 0
-        var sawStandardTokens = false
-        var priorityTokens = 0
-        var sawPriorityTokens = false
-
-        mutating func add(_ breakdown: CostUsageDailyReport.ModelBreakdown) {
-            if let totalTokens = breakdown.totalTokens {
-                self.totalTokens += totalTokens
-                self.sawTotalTokens = true
-            }
-            if let costUSD = breakdown.costUSD {
-                self.costUSD += costUSD
-                self.sawCost = true
-            }
-            if let standardCostUSD = breakdown.standardCostUSD {
-                self.standardCostUSD += standardCostUSD
-                self.sawStandardCost = true
-            }
-            if let priorityCostUSD = breakdown.priorityCostUSD {
-                self.priorityCostUSD += priorityCostUSD
-                self.sawPriorityCost = true
-            }
-            if let standardTokens = breakdown.standardTokens {
-                self.standardTokens += standardTokens
-                self.sawStandardTokens = true
-            }
-            if let priorityTokens = breakdown.priorityTokens {
-                self.priorityTokens += priorityTokens
-                self.sawPriorityTokens = true
-            }
-        }
-
-        func build(modelName: String) -> CostUsageDailyReport.ModelBreakdown {
-            CostUsageDailyReport.ModelBreakdown(
-                modelName: modelName,
-                costUSD: self.sawCost ? self.costUSD : nil,
-                totalTokens: self.sawTotalTokens ? self.totalTokens : nil,
-                standardCostUSD: self.sawStandardCost ? self.standardCostUSD : nil,
-                priorityCostUSD: self.sawPriorityCost ? self.priorityCostUSD : nil,
-                standardTokens: self.sawStandardTokens ? self.standardTokens : nil,
-                priorityTokens: self.sawPriorityTokens ? self.priorityTokens : nil)
         }
     }
 
     private static func codexProjectModelBreakdowns(
         from entries: [CostUsageDailyReport.Entry]) -> [CostUsageDailyReport.ModelBreakdown]?
     {
-        var accumulators: [String: ProjectBreakdownAccumulator] = [:]
-        for entry in entries {
-            for breakdown in entry.modelBreakdowns ?? [] {
-                var accumulator = accumulators[breakdown.modelName] ?? ProjectBreakdownAccumulator()
-                accumulator.add(breakdown)
-                accumulators[breakdown.modelName] = accumulator
-            }
-        }
-        guard !accumulators.isEmpty else { return nil }
-        return Self.sortedModelBreakdowns(accumulators.map { modelName, accumulator in
-            accumulator.build(modelName: modelName)
-        })
+        let summaries = CostUsageDailyReport.modelCostSummaries(from: entries)
+        return summaries.isEmpty ? nil : Self.sortedModelBreakdowns(summaries)
     }
 }

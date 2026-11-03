@@ -21,6 +21,33 @@ struct CLIProviderSelectionTests {
             "|kiro|",
             "|warp|",
             "|ollama|",
+            "|devpass|",
+            "|atlascloud|",
+            "|vercel|",
+            "|llmman|",
+            "|aixy|",
+            "|raycast|",
+            "|xkiro|",
+            "|museai|",
+            "|lithosai|",
+            "|workbuddy|",
+            "|tavily|",
+            "|linkup|",
+            "|tinyapi|",
+            "|exa|",
+            "|cosmic|",
+            "|aerostack|",
+            "|sailresearch|",
+            "|sofya|",
+            "|fal|",
+            "|flora|",
+            "|parallel|",
+            "|claudeplatform|",
+            "|munito|",
+            "|soniox|",
+            "|traecn|",
+            "|chatbox|",
+            "|abliteration|",
             "|both|",
             "|all]",
         ]
@@ -64,6 +91,17 @@ struct CLIProviderSelectionTests {
     }
 
     @Test
+    func `help advertises the toon output format`() {
+        let usage = CodexBarCLI.usageHelp(version: "0.0.0")
+        let root = CodexBarCLI.rootHelp(version: "0.0.0")
+
+        #expect(usage.contains("--format text|json|toon"))
+        #expect(root.contains("--format text|json|toon"))
+        #expect(usage.contains("codexbar usage --format toon"))
+        #expect(root.contains("codexbar --format toon"))
+    }
+
+    @Test
     func `provider selection respects override`() {
         let selection = CodexBarCLI.providerSelection(rawOverride: "gemini", enabled: [.codex, .claude])
         #expect(selection.asList == [.gemini])
@@ -102,6 +140,12 @@ struct CLIProviderSelectionTests {
     func `provider selection accepts kiro alias`() {
         let selection = CodexBarCLI.providerSelection(rawOverride: "kiro-cli", enabled: [.codex])
         #expect(selection.asList == [.kiro])
+    }
+
+    @Test
+    func `provider selection accepts claude platform alias`() {
+        let selection = CodexBarCLI.providerSelection(rawOverride: "claude-platform", enabled: [.claude])
+        #expect(selection.asList == [.claudeplatform])
     }
 
     @Test

@@ -4,11 +4,32 @@ import Testing
 
 struct OpenCodeUsageParserTests {
     @Test
+    func `legacy base parser still requires two windows while Go permits rolling only`() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let text = #"{"rollingUsage":{"usagePercent":17,"resetInSec":600}}"#
+        #expect(throws: OpenCodeUsageError.self) {
+            try OpenCodeUsageFetcher.parseSubscription(text: text, now: now)
+        }
+        let go = try OpenCodeGoUsageFetcher.parseSubscription(text: text, now: now)
+        #expect(go.rollingUsagePercent == 17)
+        #expect(!go.hasWeeklyUsage)
+    }
+
+    @Test
+    func `legacy base candidate arrays retain both unnamed windows`() throws {
+        let text = #"[{"percent":17,"resetInSec":600},{"percent":75,"resetInSec":7200}]"#
+        let snapshot = try OpenCodeUsageFetcher.parseSubscription(
+            text: text, now: Date(timeIntervalSince1970: 1_700_000_000))
+        #expect(snapshot.rollingUsagePercent == 17)
+        #expect(snapshot.weeklyUsagePercent == 75)
+    }
+
+    @Test
     func `parses workspace I ds`() {
         let text = ";0x00000089;((self.$R=self.$R||{})[\"codexbar\"]=[]," +
             "($R=>$R[0]=[$R[1]={id:\"wrk_01K6AR1ZET89H8NB691FQ2C2VB\",name:\"Default\",slug:null}])" +
             "($R[\"codexbar\"]))"
-        let ids = OpenCodeUsageFetcher.parseWorkspaceIDs(text: text)
+        let ids = OpenCodeWebParsing.parseWorkspaceIDs(text: text)
         #expect(ids == ["wrk_01K6AR1ZET89H8NB691FQ2C2VB"])
     }
 
@@ -274,5 +295,55 @@ struct OpenCodeUsageParserTests {
         #expect(usage.extraRateWindows?[0].id == "renewal")
         #expect(usage.extraRateWindows?[0].title == "Renews")
         #expect(usage.extraRateWindows?[0].window.resetsAt == renewAt)
+    }
+
+    @Test
+    func `toUsageSnapshot maps pay as you go spend to the primary window and cost`() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = OpenCodeUsageSnapshot.payAsYouGo(
+            OpenCodeUsageSnapshot.PayAsYouGoUsage(
+                monthlyUsageUSD: 15,
+                monthlyLimitUSD: 20,
+                balanceUSD: 12.5),
+            updatedAt: now)
+
+        let usage = snapshot.toUsageSnapshot()
+
+        #expect(usage.primary?.usedPercent == 75)
+        #expect(usage.primary?.windowMinutes == 30 * 24 * 60)
+        #expect(usage.secondary == nil)
+        #expect(usage.providerCost?.used == 15)
+        #expect(usage.providerCost?.limit == 20)
+        #expect(usage.providerCost?.balance == 12.5)
+        #expect(usage.providerCost?.period == "Monthly")
+        #expect(usage.providerCost?.currencyCode == "USD")
+    }
+
+    @Test
+    func `toUsageSnapshot omits the usage window when no monthly limit is configured`() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let snapshot = OpenCodeUsageSnapshot.payAsYouGo(
+            OpenCodeUsageSnapshot.PayAsYouGoUsage(
+                monthlyUsageUSD: 3,
+                monthlyLimitUSD: nil,
+                balanceUSD: 1),
+            updatedAt: now)
+
+        let usage = snapshot.toUsageSnapshot()
+
+        #expect(usage.primary == nil)
+        #expect(usage.providerCost?.used == 3)
+        #expect(usage.providerCost?.limit == 0)
+        #expect(usage.providerCost?.balance == 1)
+    }
+
+    @Test
+    func `pay as you go spend above the monthly limit clamps to 100 percent`() {
+        let usage = OpenCodeUsageSnapshot.PayAsYouGoUsage(
+            monthlyUsageUSD: 25,
+            monthlyLimitUSD: 20,
+            balanceUSD: 0)
+
+        #expect(usage.usedPercent == 100)
     }
 }

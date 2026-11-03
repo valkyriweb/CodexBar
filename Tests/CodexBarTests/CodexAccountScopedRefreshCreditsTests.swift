@@ -5,6 +5,51 @@ import Testing
 
 extension CodexAccountScopedRefreshTests {
     @Test
+    func `accepted usage refreshes honor the expiry switch and retain reminder receipts`() async throws {
+        let settings = self.makeSettingsStore(suite: #function)
+        settings.refreshFrequency = .manual
+        settings.codexResetCreditExpiryNotificationsEnabled = true
+        settings.showOptionalCreditsAndExtraUsage = false
+        settings._test_liveSystemCodexAccount = self.liveAccount(email: "alpha@example.com")
+        let store = self.makeUsageStore(settings: settings)
+        let now = Date()
+        let credit = CodexRateLimitResetCredit(
+            id: "synthetic-expiring-credit",
+            resetType: "codex_rate_limits",
+            status: .available,
+            grantedAt: now.addingTimeInterval(-86400),
+            expiresAt: now.addingTimeInterval(3500),
+            redeemStartedAt: nil,
+            redeemedAt: nil,
+            title: nil,
+            description: nil)
+        let inventory = CodexRateLimitResetCreditsSnapshot(credits: [credit], availableCount: 1, updatedAt: now)
+        let snapshot = self.codexSnapshot(email: "alpha@example.com", usedPercent: 10)
+            .withCodexResetCredits(inventory)
+        self.installImmediateCodexProvider(on: store, snapshot: snapshot)
+        let defaults = settings.userDefaults
+        let key = CodexResetCreditExpiryNotifier.summaryFingerprintsKey
+
+        settings.codexResetCreditExpiryNotificationsEnabled = false
+        await store.refreshProvider(.codex, allowDisabled: true)
+        #expect(store.snapshots[.codex]?.codexResetCredits == inventory)
+        #expect(defaults.object(forKey: key) == nil)
+
+        settings.codexResetCreditExpiryNotificationsEnabled = true
+        await store.refreshProvider(.codex, allowDisabled: true)
+        let receipts = try #require(defaults.stringArray(forKey: key))
+        #expect(receipts.count == 2)
+        await store.refreshProvider(.codex, allowDisabled: true)
+        #expect(defaults.stringArray(forKey: key) == receipts)
+
+        settings.codexResetCreditExpiryNotificationsEnabled = false
+        await store.refreshProvider(.codex, allowDisabled: true)
+        settings.codexResetCreditExpiryNotificationsEnabled = true
+        await store.refreshProvider(.codex, allowDisabled: true)
+        #expect(defaults.stringArray(forKey: key) == receipts)
+    }
+
+    @Test
     func `credits refresh honors explicit codex oauth source without raw CLI fallback`() async throws {
         let settings = self.makeSettingsStore(suite: "CodexAccountScopedRefreshTests-oauth-credits-source")
         settings.refreshFrequency = .manual
@@ -89,5 +134,85 @@ extension CodexAccountScopedRefreshTests {
         #expect(store.credits?.remaining == 41)
         #expect(store.lastCreditsError == nil)
         #expect(store.lastCreditsSource == .api)
+    }
+
+    @Test
+    func `enrichment failure reattaches preserved monthly cap to account and selected usage`() async throws {
+        let settings = self.makeSettingsStore(
+            suite: "CodexAccountScopedRefreshTests-reattach-preserved-monthly-cap")
+        settings.refreshFrequency = .manual
+        settings.multiAccountMenuLayout = .stacked
+        settings.setMenuBarMetricPreference(.extraUsage, for: .codex)
+        settings._test_liveSystemCodexAccount = self.liveAccount(email: "biz@example.com")
+        settings.codexActiveSource = .liveSystem
+
+        let managedAccountID = try #require(UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-111111111111"))
+        let managedAccount = ManagedCodexAccount(
+            id: managedAccountID,
+            email: "managed@example.com",
+            managedHomePath: "/tmp/managed-home",
+            createdAt: 1,
+            updatedAt: 2,
+            lastAuthenticatedAt: 2)
+        let managedStoreURL = try self.makeManagedAccountStoreURL(accounts: [managedAccount])
+        settings._test_managedCodexAccountStoreURL = managedStoreURL
+        defer {
+            settings._test_managedCodexAccountStoreURL = nil
+            settings._test_liveSystemCodexAccount = nil
+            try? FileManager.default.removeItem(at: managedStoreURL)
+        }
+
+        let liveAccount = try #require(settings.codexVisibleAccountProjection.visibleAccounts.first {
+            $0.email == "biz@example.com"
+        })
+        let usage = self.codexSnapshot(email: liveAccount.email, usedPercent: 12)
+        let priorCredits = CreditsSnapshot(
+            remaining: 0,
+            events: [],
+            updatedAt: Date(),
+            codexCreditLimit: CodexCreditLimitSnapshot(
+                used: 27,
+                limit: 1000,
+                remainingPercent: 97.3,
+                resetsAt: nil,
+                updatedAt: Date()))
+        let priorSnapshots = settings.codexVisibleAccountProjection.visibleAccounts.map { account in
+            CodexAccountUsageSnapshot(
+                account: account,
+                snapshot: self.codexSnapshot(email: account.email, usedPercent: 17),
+                error: nil,
+                sourceLabel: "cached",
+                credits: account.id == liveAccount.id ? priorCredits : nil)
+        }
+        let snapshotStore = RecordingCodexAccountUsageSnapshotStore(initialSnapshots: priorSnapshots)
+        let store = self.makeUsageStore(
+            settings: settings,
+            codexAccountUsageSnapshotStore: snapshotStore)
+        store._test_codexResetCreditsFetcherOverride = { _ in nil }
+
+        let strategy = TestCodexFetchStrategy(
+            loader: { usage },
+            credits: nil,
+            id: "stacked-test",
+            kind: .apiToken,
+            sourceLabel: "api",
+            codexMonthlyLimitEnrichmentFailed: true)
+        let baseSpec = try #require(store.providerSpecs[.codex])
+        store.providerSpecs[.codex] = Self.makeCodexProviderSpec(baseSpec: baseSpec) { _ in
+            [strategy]
+        }
+
+        await store.refreshCodexVisibleAccountsForMenu()
+
+        let accountSnapshot = try #require(store.codexAccountSnapshots.first { $0.id == liveAccount.id })
+        #expect(accountSnapshot.credits?.codexCreditLimit?.used == 27)
+        #expect(accountSnapshot.snapshot?.providerCost?.used == 27)
+        #expect(accountSnapshot.snapshot?.providerCost?.limit == 1000)
+
+        let published = try #require(store.snapshots[.codex])
+        #expect(published.providerCost?.used == 27)
+        #expect(published.providerCost?.limit == 1000)
+        #expect(settings.menuBarMetricPreference(for: .codex, snapshot: published) == .extraUsage)
+        #expect(abs((store.codexMenuBarMetricWindow(snapshot: published)?.usedPercent ?? 0) - 2.7) < 0.0001)
     }
 }

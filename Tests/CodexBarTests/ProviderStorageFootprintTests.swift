@@ -24,6 +24,12 @@ struct ProviderStorageFootprintTests {
     }
 
     @Test
+    func `global low power mode clamps automatic storage scans to thirty minutes`() {
+        #expect(UsageStore.automaticStorageRefreshInterval(lowPowerModeEnabled: false) == 5 * 60)
+        #expect(UsageStore.automaticStorageRefreshInterval(lowPowerModeEnabled: true) == 30 * 60)
+    }
+
+    @Test
     func `scanner sums nested regular files and skips symlink targets`() throws {
         let root = try Self.makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -65,6 +71,33 @@ struct ProviderStorageFootprintTests {
         #expect(footprint.paths == [symlinkRoot.path])
         #expect(footprint.totalBytes == 0)
         #expect(footprint.components.isEmpty)
+    }
+
+    @Test(arguments: [false, true])
+    func `scanner groups files without changing literal component names`(usesUnnormalizedRoot: Bool) throws {
+        let root = try Self.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let unused = root.appendingPathComponent("unused", isDirectory: true)
+        try FileManager.default.createDirectory(at: unused, withIntermediateDirectories: true)
+        let directory = root.appendingPathComponent("group %2F 空格", isDirectory: true)
+        let nested = directory.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data(repeating: 1, count: 5).write(to: directory.appendingPathComponent("first.jsonl"))
+        try Data(repeating: 2, count: 7).write(to: nested.appendingPathComponent("second.jsonl"))
+        try Data(repeating: 3, count: 3).write(to: root.appendingPathComponent("top level.bin"))
+        let candidatePath = usesUnnormalizedRoot ? unused.path + "/../" : root.path
+
+        let footprint = ProviderStorageScanner().scan(provider: .codex, candidatePaths: [candidatePath])
+
+        #expect(footprint.totalBytes == 15)
+        #expect(footprint.paths == [candidatePath])
+        #expect(footprint.unreadablePaths.isEmpty)
+        #expect(footprint.components.map(\.name) == ["group %2F 空格", "top level.bin"])
+        #expect(footprint.components.map(\.totalBytes) == [12, 3])
+        #expect(footprint.components.map(\.path) == [
+            directory.standardizedFileURL.path,
+            root.appendingPathComponent("top level.bin").standardizedFileURL.path,
+        ])
     }
 
     @Test
@@ -228,7 +261,6 @@ struct ProviderStorageFootprintTests {
             snapshot: snapshot,
             credits: nil,
             creditsError: nil,
-            dashboard: nil,
             dashboardError: nil,
             tokenSnapshot: nil,
             tokenError: nil,
@@ -271,7 +303,6 @@ struct ProviderStorageFootprintTests {
             snapshot: nil,
             credits: nil,
             creditsError: nil,
-            dashboard: nil,
             dashboardError: nil,
             tokenSnapshot: nil,
             tokenError: nil,
@@ -339,6 +370,7 @@ struct ProviderStorageFootprintTests {
             settings: settings,
             environmentBase: ["CODEX_HOME": codexHome.path])
         settings.providerStorageFootprintsEnabled = true
+        settings.backgroundWorkLowPowerModePreference = .on
         store.managedCodexAccountsForStorageOverride = []
 
         await store.refreshStorageFootprintsForOverviewNow()

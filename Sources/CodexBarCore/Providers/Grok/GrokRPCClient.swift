@@ -4,19 +4,16 @@ import Foundation
 ///
 /// The protocol mirrors Codex's app-server (newline-delimited JSON-RPC 2.0 over stdin/stdout),
 /// but uses `protocolVersion`/`clientCapabilities` for the `initialize` call instead of
-/// `clientInfo`. Billing is fetched via the `x.ai/billing` extension method.
+/// `clientInfo`. Billing uses the `_x.ai/billing` ACP extension method.
 final class GrokRPCClient: @unchecked Sendable {
-    private static let log = CodexBarLog.logger(LogCategories.grok)
+    private static let log = CodexBarLog.logger(LogCategories.provider(.grok))
 
     private let process = Process()
-    private let stdinPipe = Pipe()
-    private let stdoutPipe = Pipe()
-    private let stderrPipe = Pipe()
+    private let stdin = RPCChildProcessInput()
+    private let output = RPCChildProcessOutput()
     private let initializeTimeoutSeconds: TimeInterval
     private let requestTimeoutSeconds: TimeInterval
     private var nextID: Int = 1
-    private let stdoutLineStream: AsyncStream<Data>
-    private let stdoutLineContinuation: AsyncStream<Data>.Continuation
 
     init(
         executable: String = "grok",
@@ -27,12 +24,6 @@ final class GrokRPCClient: @unchecked Sendable {
     {
         self.initializeTimeoutSeconds = initializeTimeoutSeconds
         self.requestTimeoutSeconds = requestTimeoutSeconds
-        var stdoutContinuation: AsyncStream<Data>.Continuation!
-        self.stdoutLineStream = AsyncStream<Data> { continuation in
-            stdoutContinuation = continuation
-        }
-        self.stdoutLineContinuation = stdoutContinuation
-
         let resolvedExec = BinaryLocator.resolveGrokBinary(env: environment)
             ?? TTYCommandRunner.which(executable)
 
@@ -47,9 +38,9 @@ final class GrokRPCClient: @unchecked Sendable {
         self.process.environment = env
         self.process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         self.process.arguments = [resolvedExec] + arguments
-        self.process.standardInput = self.stdinPipe
-        self.process.standardOutput = self.stdoutPipe
-        self.process.standardError = self.stderrPipe
+        self.process.standardInput = self.stdin.pipe
+        self.process.standardOutput = self.output.stdout
+        self.process.standardError = self.output.stderr
 
         do {
             try self.process.run()
@@ -59,35 +50,12 @@ final class GrokRPCClient: @unchecked Sendable {
             throw GrokRPCError.startFailed(error.localizedDescription)
         }
 
-        let stdoutHandle = self.stdoutPipe.fileHandleForReading
-        let stdoutLineContinuation = self.stdoutLineContinuation
-        let stdoutBuffer = LineBuffer()
-        stdoutHandle.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                stdoutLineContinuation.finish()
-                return
-            }
-            let lines = stdoutBuffer.appendAndDrainLines(data)
-            for lineData in lines {
-                stdoutLineContinuation.yield(lineData)
-            }
-        }
-
-        let stderrHandle = self.stderrPipe.fileHandleForReading
-        stderrHandle.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
-            for line in text.split(whereSeparator: \.isNewline) {
-                #if !os(Linux)
-                fputs("[grok stderr] \(line)\n", stderr)
-                #endif
-            }
+        self.output.start(process: self.process, stdin: self.stdin) {
+            Self.log.warning("Grok RPC line exceeded memory limit; terminating process")
+        } onStderr: { line in
+            #if !os(Linux)
+            fputs("[grok stderr] \(line)\n", stderr)
+            #endif
         }
     }
 
@@ -109,17 +77,29 @@ final class GrokRPCClient: @unchecked Sendable {
             timeout: self.initializeTimeoutSeconds)
     }
 
-    /// Calls `x.ai/billing` and returns the decoded response.
-    func fetchBilling() async throws -> GrokBillingResponse {
-        let message = try await self.request(method: "x.ai/billing", params: [:])
-        return try self.decodeResult(from: message)
+    /// Calls the ACP billing extension and decodes current or legacy response payloads.
+    func fetchBilling() async throws -> GrokRPCBilling {
+        let message = try await self.request(method: "_x.ai/billing", params: [:])
+        guard let result = message["result"] as? [String: Any] else {
+            throw GrokRPCError.malformed("missing result field")
+        }
+        let data = try JSONSerialization.data(withJSONObject: result)
+        if let credits = try? GrokCreditsProxyFetcher.parseSnapshot(data),
+           credits.usedPercent != nil || credits.prepaidBalanceUSD != nil
+        {
+            return .credits(credits.applying(subscriptionTier: result["subscription_tier"] as? String))
+        }
+        if let billing = try? JSONDecoder().decode(GrokBillingResponse.self, from: data),
+           billing.monthlyUsedPercent != nil
+        {
+            return .legacy(billing)
+        }
+        throw GrokRPCError.malformed(GrokStatusProbe.usageUnavailableMessage)
     }
 
     func shutdown() {
-        if self.process.isRunning {
-            Self.log.debug("Grok RPC stopping")
-            self.process.terminate()
-        }
+        Self.log.debug("Grok RPC stopping")
+        RPCChildProcessTeardown.terminate(process: self.process, stdin: self.stdin)
     }
 
     // MARK: - JSON-RPC plumbing (mirrors CodexRPCClient)
@@ -135,87 +115,62 @@ final class GrokRPCClient: @unchecked Sendable {
     {
         let id = self.nextID
         self.nextID += 1
-        try self.sendRequest(id: id, method: method, params: params)
+        try self.sendPayload([
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params ?? [:],
+        ])
 
         let resolvedTimeout = timeout ?? self.requestTimeoutSeconds
-        let wrapped = try await self.withTimeout(seconds: resolvedTimeout, method: method) {
-            while true {
-                let message = try await self.readNextMessage()
-                // Skip notifications (no id) or unrelated responses.
-                if message["id"] == nil { continue }
-                guard let messageID = self.jsonID(message["id"]), messageID == id else { continue }
-                if let error = message["error"] as? [String: Any] {
-                    let messageText = (error["message"] as? String) ?? "unknown JSON-RPC error"
-                    throw GrokRPCError.requestFailed(messageText)
+        let wrapped = try await RPCRequestTimeout.run(
+            seconds: resolvedTimeout,
+            timeoutError: GrokRPCError.timeout(method: method),
+            onTimeout: { [weak self] in self?.terminateProcessForTimeout(method: method) },
+            operation: {
+                while true {
+                    let message = try await self.readNextMessage()
+                    // Skip notifications (no id) or unrelated responses.
+                    if message["id"] == nil { continue }
+                    guard let messageID = self.jsonID(message["id"]), messageID == id else { continue }
+                    if let error = message["error"] as? [String: Any] {
+                        let messageText = (error["message"] as? String) ?? "unknown JSON-RPC error"
+                        throw GrokRPCError.requestFailed(messageText, code: error["code"] as? Int)
+                    }
+                    return SendableJSONMessage(value: message)
                 }
-                return SendableJSONMessage(value: message)
-            }
-        }
+            })
         return wrapped.value
-    }
-
-    private func withTimeout<T: Sendable>(
-        seconds: TimeInterval,
-        method: String,
-        body: @escaping @Sendable () async throws -> T) async throws -> T
-    {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await body() }
-            group.addTask { [weak self] in
-                try await Task.sleep(for: .seconds(seconds))
-                self?.terminateProcessForTimeout(method: method)
-                throw GrokRPCError.timeout(method: method)
-            }
-            do {
-                guard let result = try await group.next() else {
-                    throw GrokRPCError.timeout(method: method)
-                }
-                group.cancelAll()
-                return result
-            } catch {
-                group.cancelAll()
-                throw error
-            }
-        }
     }
 
     private func terminateProcessForTimeout(method: String) {
         if self.process.isRunning {
             Self.log.warning("Grok RPC timed out on `\(method)`; terminating process")
-            self.process.terminate()
         }
-    }
-
-    private func sendRequest(id: Int, method: String, params: [String: Any]?) throws {
-        let paramsValue: Any = params ?? [:]
-        let payload: [String: Any] = [
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": paramsValue,
-        ]
-        try self.sendPayload(payload)
+        // Dispatch off the timeout task so the bounded TERM-to-KILL wait cannot delay the timeout
+        // error or let the stdout-EOF failure win the race; `shutdown()` remains the synchronous backstop.
+        let process = self.process
+        let stdin = self.stdin
+        DispatchQueue.global(qos: .userInitiated).async {
+            RPCChildProcessTeardown.terminate(process: process, stdin: stdin)
+        }
     }
 
     private func sendPayload(_ payload: [String: Any]) throws {
-        let raw = try JSONSerialization.data(withJSONObject: payload)
-        // Foundation's JSONSerialization escapes "/" as "\/" by default. Grok's
-        // ACP server treats the escaped form as a *different* method name (it does
-        // not unescape before lookup), so `x.ai/billing` becomes "Method not found"
-        // when sent as `x.ai\/billing`. Re-encode without slash escapes to match
-        // the on-the-wire shape the grok agent expects.
-        let unescaped = String(data: raw, encoding: .utf8)?
-            .replacingOccurrences(of: "\\/", with: "/")
-        let data = unescaped.flatMap { $0.data(using: .utf8) } ?? raw
+        var data = try JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes])
         if let preview = String(data: data.prefix(200), encoding: .utf8) {
             Self.log.debug("grok rpc -> \(preview)")
         }
-        self.stdinPipe.fileHandleForWriting.write(data)
-        self.stdinPipe.fileHandleForWriting.write(Data([0x0A]))
+        data.append(0x0A)
+        do {
+            try self.stdin.write(data)
+        } catch {
+            throw GrokRPCError.requestFailed("grok agent stdin closed: \(error.localizedDescription)")
+        }
     }
 
     private func readNextMessage() async throws -> [String: Any] {
-        for await lineData in self.stdoutLineStream {
+        for await lineData in self.output.lines {
             if lineData.isEmpty { continue }
             if let preview = String(data: lineData.prefix(300), encoding: .utf8) {
                 Self.log.debug("grok rpc <- \(preview)")
@@ -227,48 +182,20 @@ final class GrokRPCClient: @unchecked Sendable {
         throw GrokRPCError.malformed("grok agent stdio closed stdout")
     }
 
-    private func decodeResult<T: Decodable>(from message: [String: Any]) throws -> T {
-        guard let result = message["result"] else {
-            throw GrokRPCError.malformed("missing result field")
-        }
-        let data = try JSONSerialization.data(withJSONObject: result)
-        let decoder = JSONDecoder()
-        return try decoder.decode(T.self, from: data)
-    }
-
     private func jsonID(_ value: Any?) -> Int? {
-        switch value {
-        case let int as Int: int
-        case let number as NSNumber: number.intValue
-        default: nil
-        }
+        (value as? NSNumber)?.intValue
     }
+}
 
-    private final class LineBuffer: @unchecked Sendable {
-        private var buffer = Data()
-        private let lock = NSLock()
-
-        func appendAndDrainLines(_ data: Data) -> [Data] {
-            self.lock.lock()
-            defer { lock.unlock() }
-            self.buffer.append(data)
-            var out: [Data] = []
-            while let newline = self.buffer.firstIndex(of: 0x0A) {
-                let lineData = Data(self.buffer[..<newline])
-                self.buffer.removeSubrange(...newline)
-                if !lineData.isEmpty {
-                    out.append(lineData)
-                }
-            }
-            return out
-        }
-    }
+enum GrokRPCBilling: Sendable {
+    case credits(GrokWebBillingSnapshot)
+    case legacy(GrokBillingResponse)
 }
 
 public enum GrokRPCError: LocalizedError, Sendable {
     case binaryNotFound
     case startFailed(String)
-    case requestFailed(String)
+    case requestFailed(String, code: Int? = nil)
     case timeout(method: String)
     case malformed(String)
     case notAuthenticated
@@ -279,7 +206,7 @@ public enum GrokRPCError: LocalizedError, Sendable {
             return "Grok CLI not found. Install via `curl -fsSL https://x.ai/cli/install.sh | bash`."
         case let .startFailed(message):
             return "Grok CLI failed to start: \(message)"
-        case let .requestFailed(message):
+        case let .requestFailed(message, _):
             // Surface the auth-required hint that billing.rs emits verbatim.
             if message.localizedCaseInsensitiveContains("authentication required")
                 || message.localizedCaseInsensitiveContains("grok login")
@@ -297,7 +224,7 @@ public enum GrokRPCError: LocalizedError, Sendable {
     }
 }
 
-/// Schema for the `x.ai/billing` result.
+/// Legacy top-level billing schema; current `_x.ai/billing` results use the nested credits parser.
 ///
 /// All monetary amounts (`monthlyLimit`, `onDemandCap`, `includedUsed`, etc.) are
 /// represented as `{ val: <cents> }` in the wire format.
@@ -344,13 +271,11 @@ extension GrokBillingResponse {
     }
 
     public var billingPeriodEndDate: Date? {
-        guard let raw = self.billingCycle?.billingPeriodEnd else { return nil }
-        return GrokBillingResponse.parseISO8601(raw)
+        ISO8601DateParser.parse(self.billingCycle?.billingPeriodEnd)
     }
 
     public var billingPeriodStartDate: Date? {
-        guard let raw = self.billingCycle?.billingPeriodStart else { return nil }
-        return GrokBillingResponse.parseISO8601(raw)
+        ISO8601DateParser.parse(self.billingCycle?.billingPeriodStart)
     }
 
     public var billingPeriodMinutes: Int? {
@@ -359,13 +284,5 @@ extension GrokBillingResponse {
               end > start
         else { return nil }
         return Int(end.timeIntervalSince(start) / 60)
-    }
-
-    private static func parseISO8601(_ raw: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: raw) { return date }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: raw)
     }
 }

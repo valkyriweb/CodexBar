@@ -4,23 +4,13 @@ import FoundationNetworking
 #endif
 
 public struct MiniMaxUsageFetcher: Sendable {
-    static let log = CodexBarLog.logger(LogCategories.minimaxUsage)
-    private static let codingPlanPath = "user-center/payment/coding-plan"
-    private static let codingPlanQuery = "cycle_type=3"
-    private static let codingPlanRemainsPath = "v1/api/openplatform/coding_plan/remains"
-    private static let tokenPlanRemainsPath = "v1/token_plan/remains"
-    private static let billingHistoryPath = "account/amount"
+    static let log = CodexBarLog.logger(LogCategories.provider(.minimax, scope: "usage"))
     private static let billingHistoryLimit = 100
-    private struct RemainsContext {
-        let authorizationToken: String?
-        let groupID: String?
-    }
-
     struct WebFetchContext {
         let cookie: String
         let authorizationToken: String?
         let region: MiniMaxAPIRegion
-        let environment: [String: String]
+        @ProcessEnvironment private(set) var environment: [String: String]
         let transport: any ProviderHTTPTransport
     }
 
@@ -54,9 +44,7 @@ public struct MiniMaxUsageFetcher: Sendable {
                     Self.log.debug("MiniMax coding plan HTML lacks service quota data, trying remains API")
                     let remainsSnapshot = try await self.fetchCodingPlanRemains(
                         context: context,
-                        remainsContext: RemainsContext(
-                            authorizationToken: authorizationToken,
-                            groupID: groupID),
+                        groupID: groupID,
                         now: now)
                         .withPlanNameIfMissing(htmlSnapshot.planName)
                     let snapshot = try await self.attachingSubscriptionMetadataIfAvailable(
@@ -86,24 +74,27 @@ public struct MiniMaxUsageFetcher: Sendable {
                 includeBillingHistory: includeBillingHistory,
                 now: now)
         } catch let error as MiniMaxUsageError {
-            if case .parseFailed = error {
-                Self.log.debug("MiniMax coding plan HTML parse failed, trying remains API")
-                let snapshot = try await self.attachingSubscriptionMetadataIfAvailable(
-                    to: self.fetchCodingPlanRemains(
-                        context: context,
-                        remainsContext: RemainsContext(
-                            authorizationToken: authorizationToken,
-                            groupID: groupID),
-                        now: now),
-                    context: context,
-                    groupID: groupID)
-                return try await self.attachingBillingIfAvailable(
-                    to: snapshot,
-                    context: context,
-                    includeBillingHistory: includeBillingHistory,
-                    now: now)
+            switch error {
+            case .parseFailed:
+                break
+            case let .apiError(message) where ["HTTP 302", "HTTP 404", "HTTP 405"].contains(where: message.contains):
+                break
+            default:
+                throw error
             }
-            throw error
+            Self.log.debug("MiniMax coding plan page unavailable, trying remains API")
+            let snapshot = try await self.attachingSubscriptionMetadataIfAvailable(
+                to: self.fetchCodingPlanRemains(
+                    context: context,
+                    groupID: groupID,
+                    now: now),
+                context: context,
+                groupID: groupID)
+            return try await self.attachingBillingIfAvailable(
+                to: snapshot,
+                context: context,
+                includeBillingHistory: includeBillingHistory,
+                now: now)
         }
     }
 
@@ -163,17 +154,18 @@ public struct MiniMaxUsageFetcher: Sendable {
                     remainsURL: remainsURL,
                     now: now,
                     transport: transport)
-            } catch let error as MiniMaxUsageError {
+            } catch {
+                guard error is MiniMaxUsageError || self.shouldTryNextEndpoint(after: error) else { throw error }
                 lastError = error
                 guard remainsURL == region.tokenPlanRemainsURL,
-                      self.shouldTryLegacyAPIEndpoint(after: error)
+                      self.shouldTryNextEndpoint(after: error, retryRejectedCredentials: true)
                 else {
                     if tokenPlanCredentialFailure {
                         throw MiniMaxUsageError.invalidCredentials
                     }
                     throw error
                 }
-                if case .invalidCredentials = error {
+                if case .invalidCredentials? = error as? MiniMaxUsageError {
                     tokenPlanCredentialFailure = true
                 }
                 Self.log.debug("MiniMax token-plan API failed, trying legacy coding-plan endpoint")
@@ -196,6 +188,19 @@ public struct MiniMaxUsageFetcher: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("CodexBar", forHTTPHeaderField: "MM-API-Source")
 
+        let response = try await self.fetchResponse(for: request, transport: transport)
+
+        do {
+            return try self.parseRemainsResponse(response.data, now: now)
+        } catch let error as MiniMaxUsageError {
+            throw self.normalizedAPITokenError(error)
+        }
+    }
+
+    private static func fetchResponse(
+        for request: URLRequest,
+        transport: any ProviderHTTPTransport) async throws -> ProviderHTTPResponse
+    {
         let response: ProviderHTTPResponse
         do {
             response = try await transport.response(for: request)
@@ -212,11 +217,15 @@ public struct MiniMaxUsageFetcher: Sendable {
             throw MiniMaxUsageError.apiError("HTTP \(response.statusCode)")
         }
 
+        return response
+    }
+
+    private static func parseRemainsResponse(_ data: Data, now: Date) throws -> MiniMaxUsageSnapshot {
         let snapshot: MiniMaxUsageSnapshot
         do {
-            snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: response.data, now: now)
+            snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: data, now: now)
         } catch let error as MiniMaxUsageError {
-            throw self.normalizedAPITokenError(error)
+            throw error
         } catch {
             throw MiniMaxUsageError.parseFailed(error.localizedDescription)
         }
@@ -232,30 +241,33 @@ public struct MiniMaxUsageFetcher: Sendable {
         return normalizedMessage == "invalid api key" ? .invalidCredentials : error
     }
 
-    private static func shouldTryLegacyAPIEndpoint(after error: MiniMaxUsageError) -> Bool {
-        switch error {
+    private static func shouldTryNextEndpoint(after error: Error, retryRejectedCredentials: Bool = false) -> Bool {
+        guard let error = error as? MiniMaxUsageError else {
+            let error = error as NSError
+            return error.domain == NSURLErrorDomain && error.code != NSURLErrorCancelled
+        }
+        return switch error {
         case .invalidCredentials:
-            true
+            retryRejectedCredentials
         case let .apiError(message):
-            message.contains("HTTP 404") || message.contains("HTTP 405")
+            message.contains("HTTP 302") || message.contains("HTTP 404") || message.contains("HTTP 405")
         case .networkError, .parseFailed:
             true
         }
     }
 
-    private static func fetchCodingPlanHTML(
+    private static func makeWebRequest(
+        url: URL,
         context: WebFetchContext,
-        now: Date) async throws -> MiniMaxUsageSnapshot
+        accept: String) -> URLRequest
     {
-        let url = self.resolveCodingPlanURL(region: context.region, environment: context.environment)
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue(context.cookie, forHTTPHeaderField: "Cookie")
         if let authorizationToken = context.authorizationToken {
             request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
         }
-        let acceptHeader = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        request.setValue(acceptHeader, forHTTPHeaderField: "accept")
+        request.setValue(accept, forHTTPHeaderField: "accept")
         let userAgent =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
@@ -267,37 +279,24 @@ public struct MiniMaxUsageFetcher: Sendable {
             self.resolveCodingPlanRefererURL(region: context.region, environment: context.environment).absoluteString,
             forHTTPHeaderField: "referer")
 
-        let response: ProviderHTTPResponse
-        do {
-            response = try await context.transport.response(for: request)
-        } catch {
-            throw self.normalizedTransportError(error)
-        }
+        return request
+    }
 
-        guard response.statusCode == 200 else {
-            let body = String(data: response.data, encoding: .utf8) ?? ""
-            Self.log.error("MiniMax returned \(response.statusCode): \(body)")
-            if response.statusCode == 401 || response.statusCode == 403 {
-                throw MiniMaxUsageError.invalidCredentials
-            }
-            throw MiniMaxUsageError.apiError("HTTP \(response.statusCode)")
-        }
+    private static func fetchCodingPlanHTML(
+        context: WebFetchContext,
+        now: Date) async throws -> MiniMaxUsageSnapshot
+    {
+        let url = self.resolveCodingPlanURL(region: context.region, environment: context.environment)
+        let request = self.makeWebRequest(
+            url: url,
+            context: context,
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        let response = try await self.fetchResponse(for: request, transport: context.transport)
 
         if let contentType = response.response.value(forHTTPHeaderField: "Content-Type"),
            contentType.lowercased().contains("application/json")
         {
-            let snapshot: MiniMaxUsageSnapshot
-            do {
-                snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: response.data, now: now)
-            } catch let error as MiniMaxUsageError {
-                throw error
-            } catch {
-                throw MiniMaxUsageError.parseFailed(error.localizedDescription)
-            }
-            if let services = snapshot.services, !services.isEmpty {
-                Self.log.debug("MiniMax multi-service response detected: \(services.count) services")
-            }
-            return snapshot
+            return try self.parseRemainsResponse(response.data, now: now)
         }
 
         let html = String(data: response.data, encoding: .utf8) ?? ""
@@ -312,7 +311,7 @@ public struct MiniMaxUsageFetcher: Sendable {
 
     private static func fetchCodingPlanRemains(
         context: WebFetchContext,
-        remainsContext: RemainsContext,
+        groupID: String?,
         now: Date) async throws -> MiniMaxUsageSnapshot
     {
         var lastError: Error?
@@ -321,11 +320,11 @@ public struct MiniMaxUsageFetcher: Sendable {
                 return try await self.fetchCodingPlanRemainsOnce(
                     baseRemainsURL: baseRemainsURL,
                     context: context,
-                    remainsContext: remainsContext,
+                    groupID: groupID,
                     now: now)
-            } catch let error as MiniMaxUsageError {
+            } catch {
                 lastError = error
-                guard self.shouldTryNextRemainsURL(after: error) else { throw error }
+                guard self.shouldTryNextEndpoint(after: error) else { throw error }
                 Self.log.debug("MiniMax remains API failed for \(baseRemainsURL.host ?? "unknown host"), trying next")
             }
         }
@@ -336,61 +335,29 @@ public struct MiniMaxUsageFetcher: Sendable {
     private static func fetchCodingPlanRemainsOnce(
         baseRemainsURL: URL,
         context: WebFetchContext,
-        remainsContext: RemainsContext,
+        groupID: String?,
         now: Date) async throws -> MiniMaxUsageSnapshot
     {
-        let remainsURL = self.appendGroupID(remainsContext.groupID, to: baseRemainsURL)
-        var request = URLRequest(url: remainsURL)
-        request.httpMethod = "GET"
-        request.setValue(context.cookie, forHTTPHeaderField: "Cookie")
-        if let authorizationToken = remainsContext.authorizationToken {
-            request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
-        }
-        let acceptHeader = "application/json, text/plain, */*"
-        request.setValue(acceptHeader, forHTTPHeaderField: "accept")
+        let isCurrentChinaEndpoint = baseRemainsURL.path == "/backend/account/token_plan/remains_percent"
+        let remainsURL = isCurrentChinaEndpoint ? baseRemainsURL : self.appendGroupID(groupID, to: baseRemainsURL)
+        var request = self.makeWebRequest(
+            url: remainsURL,
+            context: context,
+            accept: "application/json, text/plain, */*")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
-        let userAgent =
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-        request.setValue(userAgent, forHTTPHeaderField: "user-agent")
-        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "accept-language")
-        let origin = self.originURL(from: baseRemainsURL)
-        request.setValue(origin.absoluteString, forHTTPHeaderField: "origin")
-        request.setValue(
-            self.resolveCodingPlanRefererURL(region: context.region, environment: context.environment).absoluteString,
-            forHTTPHeaderField: "referer")
-
-        let response: ProviderHTTPResponse
-        do {
-            response = try await context.transport.response(for: request)
-        } catch {
-            throw self.normalizedTransportError(error)
-        }
-
-        guard response.statusCode == 200 else {
-            let body = String(data: response.data, encoding: .utf8) ?? ""
-            Self.log.error("MiniMax returned \(response.statusCode): \(body)")
-            if response.statusCode == 401 || response.statusCode == 403 {
-                throw MiniMaxUsageError.invalidCredentials
+        if isCurrentChinaEndpoint {
+            let pageURL = self.resolveCodingPlanURL(region: context.region, environment: context.environment)
+            request.setValue(self.originURL(from: pageURL).absoluteString, forHTTPHeaderField: "origin")
+            if let groupID, !groupID.isEmpty {
+                request.setValue(groupID, forHTTPHeaderField: "X-Group-Id")
             }
-            throw MiniMaxUsageError.apiError("HTTP \(response.statusCode)")
         }
+        let response = try await self.fetchResponse(for: request, transport: context.transport)
 
         if let contentType = response.response.value(forHTTPHeaderField: "Content-Type"),
            contentType.lowercased().contains("application/json")
         {
-            let snapshot: MiniMaxUsageSnapshot
-            do {
-                snapshot = try MiniMaxUsageParser.parseCodingPlanRemains(data: response.data, now: now)
-            } catch let error as MiniMaxUsageError {
-                throw error
-            } catch {
-                throw MiniMaxUsageError.parseFailed(error.localizedDescription)
-            }
-            if let services = snapshot.services, !services.isEmpty {
-                Self.log.debug("MiniMax multi-service response detected: \(services.count) services")
-            }
-            return snapshot
+            return try self.parseRemainsResponse(response.data, now: now)
         }
 
         let html = String(data: response.data, encoding: .utf8) ?? ""
@@ -400,31 +367,15 @@ public struct MiniMaxUsageFetcher: Sendable {
         return try MiniMaxUsageParser.parse(html: html, now: now)
     }
 
-    private static func shouldTryNextRemainsURL(after error: MiniMaxUsageError) -> Bool {
-        switch error {
-        case .invalidCredentials:
-            false
-        case let .apiError(message):
-            message.contains("HTTP 404") || message.contains("HTTP 405")
-        case .networkError, .parseFailed:
-            true
-        }
-    }
-
     private static func normalizedTransportError(_ error: Error) -> Error {
-        if error is MiniMaxUsageError || error is CancellationError {
-            return error
-        }
-        if let urlError = error as? URLError {
-            if urlError.code == .cancelled {
-                return error
-            }
-            if urlError.code == .badServerResponse {
-                return MiniMaxUsageError.networkError("Invalid response")
-            }
-            return MiniMaxUsageError.networkError(urlError.localizedDescription)
-        }
-        return error
+        let original = error as NSError
+        guard original.domain == NSURLErrorDomain, original.code != NSURLErrorCancelled else { return error }
+        // Keep transport identity for cache/retry policy and MiniMax text for diagnostic classification.
+        var userInfo = original.userInfo
+        let description = original.code == NSURLErrorBadServerResponse ? "Invalid response" : original
+            .localizedDescription
+        userInfo[NSLocalizedDescriptionKey] = MiniMaxUsageError.networkError(description).localizedDescription
+        return NSError(domain: original.domain, code: original.code, userInfo: userInfo)
     }
 
     private static func shouldRethrowAfterHTMLFallback(_ error: Error) -> Bool {
@@ -504,22 +455,14 @@ public struct MiniMaxUsageFetcher: Sendable {
         url: URL,
         context: WebFetchContext) async throws -> ProviderHTTPResponse
     {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(context.cookie, forHTTPHeaderField: "Cookie")
-        if let authorizationToken = context.authorizationToken {
-            request.setValue("Bearer \(authorizationToken)", forHTTPHeaderField: "Authorization")
-        }
-        request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "accept")
+        var request = self.makeWebRequest(
+            url: url,
+            context: context,
+            accept: "application/json, text/plain, */*")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
-        let userAgent =
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-        request.setValue(userAgent, forHTTPHeaderField: "user-agent")
-        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "accept-language")
-        let origin = self.originURL(from: url)
-        request.setValue(origin.absoluteString, forHTTPHeaderField: "origin")
-        request.setValue(origin.appendingPathComponent("account").absoluteString, forHTTPHeaderField: "referer")
+        request.setValue(
+            self.originURL(from: url).appendingPathComponent("account").absoluteString,
+            forHTTPHeaderField: "referer")
 
         do {
             return try await context.transport.response(for: request)
@@ -531,8 +474,8 @@ public struct MiniMaxUsageFetcher: Sendable {
     }
 
     private static func appendGroupID(_ groupID: String?, to url: URL) -> URL {
-        guard let groupID, !groupID.isEmpty else { return url }
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        guard let groupID, !groupID.isEmpty,
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
         var queryItems = components.queryItems ?? []
         queryItems.append(URLQueryItem(name: "GroupId", value: groupID))
         components.queryItems = queryItems
@@ -555,7 +498,10 @@ public struct MiniMaxUsageFetcher: Sendable {
             return override
         }
         if let host = MiniMaxSettingsReader.hostOverride(environment: environment),
-           let hostURL = self.url(from: host, path: Self.codingPlanPath, query: Self.codingPlanQuery)
+           let hostURL = self.url(
+               from: host,
+               path: MiniMaxAPIRegion.codingPlanPath,
+               query: MiniMaxAPIRegion.codingPlanQuery)
         {
             return hostURL
         }
@@ -566,34 +512,10 @@ public struct MiniMaxUsageFetcher: Sendable {
         region: MiniMaxAPIRegion,
         environment: [String: String]) -> URL
     {
-        if let override = MiniMaxSettingsReader.codingPlanURL(environment: environment) {
-            if var components = URLComponents(url: override, resolvingAgainstBaseURL: false) {
-                components.query = nil
-                return components.url ?? override
-            }
-            return override
-        }
-        if let host = MiniMaxSettingsReader.hostOverride(environment: environment),
-           let hostURL = self.url(from: host, path: Self.codingPlanPath)
-        {
-            return hostURL
-        }
-        return region.codingPlanRefererURL
-    }
-
-    static func resolveRemainsURL(
-        region: MiniMaxAPIRegion,
-        environment: [String: String]) -> URL
-    {
-        if let override = MiniMaxSettingsReader.remainsURL(environment: environment) {
-            return override
-        }
-        if let host = MiniMaxSettingsReader.hostOverride(environment: environment),
-           let hostURL = self.url(from: host, path: Self.codingPlanRemainsPath)
-        {
-            return hostURL
-        }
-        return region.remainsURL
+        let url = self.resolveCodingPlanURL(region: region, environment: environment)
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
+        components.query = nil
+        return components.url ?? url
     }
 
     static func resolveRemainsURLs(
@@ -604,40 +526,17 @@ public struct MiniMaxUsageFetcher: Sendable {
             return [override]
         }
         if let host = MiniMaxSettingsReader.hostOverride(environment: environment),
-           let hostURL = self.url(from: host, path: Self.codingPlanRemainsPath)
+           let hostURL = self.url(from: host, path: MiniMaxAPIRegion.remainsPath)
         {
             return [hostURL]
         }
 
-        let primary = region.remainsURL
-        let webCandidates = self.webRemainsFallbackURLs(region: region)
-        return self.deduplicated([primary] + webCandidates)
-    }
-
-    static func resolveTokenPlanRemainsURL(region: MiniMaxAPIRegion) -> URL {
-        region.tokenPlanRemainsURL
-    }
-
-    private static func webRemainsFallbackURLs(region: MiniMaxAPIRegion) -> [URL] {
-        let hosts = switch region {
-        case .global:
-            ["https://www.minimax.io"]
-        case .chinaMainland:
-            ["https://www.minimaxi.com"]
-        }
-        return hosts.compactMap { self.url(from: $0, path: Self.codingPlanRemainsPath) }
-    }
-
-    private static func deduplicated(_ urls: [URL]) -> [URL] {
-        var seen: Set<String> = []
-        var result: [URL] = []
-        for url in urls {
-            let key = url.absoluteString
-            guard !seen.contains(key) else { continue }
-            seen.insert(key)
-            result.append(url)
-        }
-        return result
+        let currentChinaURL = URL(string: "https://www.minimax.cn/backend/account/token_plan/remains_percent")!
+        let current = region == .chinaMainland ? [currentChinaURL] : []
+        return current + [
+            region.remainsURL,
+            URL(string: region.webBaseURLString)!.appendingPathComponent(MiniMaxAPIRegion.remainsPath),
+        ]
     }
 
     static func resolveBillingHistoryURL(
@@ -650,7 +549,7 @@ public struct MiniMaxUsageFetcher: Sendable {
             return self.billingHistoryURL(from: override, page: page, limit: limit)
         }
         if let host = MiniMaxSettingsReader.hostOverride(environment: environment),
-           let hostURL = self.url(from: host, path: Self.billingHistoryPath)
+           let hostURL = self.url(from: host, path: MiniMaxAPIRegion.billingHistoryPath)
         {
             return self.billingHistoryURL(from: hostURL, page: page, limit: limit)
         }
@@ -670,37 +569,17 @@ public struct MiniMaxUsageFetcher: Sendable {
     }
 
     static func url(from raw: String, path: String? = nil, query: String? = nil) -> URL? {
-        guard let cleaned = MiniMaxSettingsReader.cleaned(raw) else { return nil }
-
-        func compose(_ base: URL) -> URL? {
-            var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
-            if let path { components.path = "/" + path }
-            if let query { components.query = query }
-            return components.url
-        }
-
-        guard let base = ProviderEndpointOverrideValidator.normalizedHTTPSURL(from: cleaned) else { return nil }
-        return compose(base)
+        guard let cleaned = SettingsValue.cleaned(raw),
+              let base = ProviderEndpointOverrideValidator.normalizedHTTPSURL(from: cleaned) else { return nil }
+        var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
+        if let path { components.path = "/" + path }
+        if let query { components.query = query }
+        return components.url
     }
 
-    private static func logCodingPlanStatus(payload: MiniMaxCodingPlanPayload) {
-        let baseResponse = payload.data.baseResp ?? payload.baseResp
-        guard let status = baseResponse?.statusCode else { return }
-        let message = baseResponse?.statusMessage ?? ""
-        if !message.isEmpty {
-            Self.log.debug("MiniMax coding plan status \(status): \(message)")
-        } else {
-            Self.log.debug("MiniMax coding plan status \(status)")
-        }
-    }
-
-    private static func looksSignedOut(html: String) -> Bool {
+    static func looksSignedOut(html: String) -> Bool {
         let lower = self.visibleText(from: html).lowercased()
         return lower.contains("sign in") || lower.contains("log in") || lower.contains("登录") || lower.contains("登入")
-    }
-
-    static func _looksSignedOutForTesting(html: String) -> Bool {
-        self.looksSignedOut(html: html)
     }
 
     private static func visibleText(from html: String) -> String {
@@ -857,13 +736,7 @@ struct MiniMaxServiceItem: Decodable {
 
 enum MiniMaxUsageParser {
     static func decodePayload(data: Data) throws -> MiniMaxCodingPlanPayload {
-        let decoder = JSONDecoder()
-        return try decoder.decode(MiniMaxCodingPlanPayload.self, from: data)
-    }
-
-    static func decodeMultiServicePayload(data: Data) throws -> MiniMaxMultiServicePayload {
-        let decoder = JSONDecoder()
-        return try decoder.decode(MiniMaxMultiServicePayload.self, from: data)
+        try JSONDecoder().decode(MiniMaxCodingPlanPayload.self, from: data)
     }
 
     static func decodePayload(json: [String: Any]) throws -> MiniMaxCodingPlanPayload {
@@ -939,7 +812,8 @@ enum MiniMaxUsageParser {
             if let intervalService = self.makeServiceUsage(
                 ServiceUsageInput(
                     serviceType: serviceTypeIdentifier,
-                    windowTypeOverride: nil,
+                    isWebPercentSchema: item.hasIntervalUsedPercent,
+                    windowTypeOverride: item.hasIntervalUsedPercent && item.startTime == nil ? "5 hours" : nil,
                     total: item.currentIntervalTotalCount,
                     remaining: item.currentIntervalUsageCount,
                     remainingPercent: item.currentIntervalRemainingPercent,
@@ -954,10 +828,11 @@ enum MiniMaxUsageParser {
             }
 
             // current_weekly_usage_count is also REMAINING quota; render only when weekly quota is real.
-            if self.shouldRenderWeeklyWindow(for: modelName),
+            if self.isTextGenerationModelName(modelName),
                let weeklyService = self.makeServiceUsage(
                    ServiceUsageInput(
                        serviceType: serviceTypeIdentifier,
+                       isWebPercentSchema: item.hasWeeklyUsedPercent,
                        windowTypeOverride: "Weekly",
                        total: item.currentWeeklyTotalCount,
                        remaining: item.currentWeeklyUsageCount,
@@ -1073,6 +948,7 @@ enum MiniMaxUsageParser {
             item.modelName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "video" &&
                 self.isUnavailableQuotaPlaceholder(ServiceUsageInput(
                     serviceType: "Text to Video",
+                    isWebPercentSchema: false,
                     windowTypeOverride: nil,
                     total: item.currentIntervalTotalCount,
                     remaining: item.currentIntervalUsageCount,
@@ -1142,32 +1018,19 @@ enum MiniMaxUsageParser {
     private static func normalizeCodingPlanPayload(_ payload: [String: Any]) -> [String: Any] {
         var normalized = payload
 
-        if normalized["model_remains"] == nil, let value = normalized["modelRemains"] {
-            normalized["model_remains"] = value
-        }
-        if normalized["current_subscribe_title"] == nil, let value = normalized["currentSubscribeTitle"] {
-            normalized["current_subscribe_title"] = value
-        }
-        if normalized["plan_name"] == nil, let value = normalized["planName"] {
-            normalized["plan_name"] = value
-        }
-        if normalized["combo_title"] == nil, let value = normalized["comboTitle"] {
-            normalized["combo_title"] = value
-        }
-        if normalized["current_plan_title"] == nil, let value = normalized["currentPlanTitle"] {
-            normalized["current_plan_title"] = value
-        }
-        if normalized["current_combo_card"] == nil, let value = normalized["currentComboCard"] {
-            normalized["current_combo_card"] = value
-        }
-        if normalized["base_resp"] == nil, let value = normalized["baseResp"] {
-            normalized["base_resp"] = value
-        }
-        if normalized["points_balance"] == nil, let value = normalized["pointsBalance"] {
-            normalized["points_balance"] = value
-        }
-        if normalized["credits_balance"] == nil, let value = normalized["creditsBalance"] {
-            normalized["credits_balance"] = value
+        let aliases = [
+            ("model_remains", "modelRemains"),
+            ("current_subscribe_title", "currentSubscribeTitle"),
+            ("plan_name", "planName"),
+            ("combo_title", "comboTitle"),
+            ("current_plan_title", "currentPlanTitle"),
+            ("current_combo_card", "currentComboCard"),
+            ("base_resp", "baseResp"),
+            ("points_balance", "pointsBalance"),
+            ("credits_balance", "creditsBalance"),
+        ]
+        for (key, alias) in aliases where normalized[key] == nil {
+            normalized[key] = normalized[alias]
         }
 
         if let data = normalized["data"] as? [String: Any] {
@@ -1182,45 +1045,15 @@ enum MiniMaxUsageParser {
 
     private static func nextDataJSONData(fromHTML html: String) -> Data? {
         let data = Data(html.utf8)
-        guard let idRange = data.range(of: self.nextDataNeedle) else { return nil }
-        guard let openTagEnd = data[idRange.upperBound...].firstIndex(of: UInt8(ascii: ">")) else { return nil }
+        guard let idRange = data.range(of: self.nextDataNeedle),
+              let openTagEnd = data[idRange.upperBound...].firstIndex(of: UInt8(ascii: ">")) else { return nil }
         let contentStart = data.index(after: openTagEnd)
         guard let closeRange = data.range(
             of: self.scriptCloseNeedle,
             options: [],
             in: contentStart..<data.endIndex)
         else { return nil }
-        let rawData = data[contentStart..<closeRange.lowerBound]
-        let trimmed = self.trimASCIIWhitespace(Data(rawData))
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func trimASCIIWhitespace(_ data: Data) -> Data {
-        guard !data.isEmpty else { return data }
-        var start = data.startIndex
-        var end = data.endIndex
-
-        while start < end, self.isASCIIWhitespace(data[start]) {
-            start = data.index(after: start)
-        }
-        while end > start {
-            let prev = data.index(before: end)
-            if self.isASCIIWhitespace(data[prev]) {
-                end = prev
-            } else {
-                break
-            }
-        }
-        return data.subdata(in: start..<end)
-    }
-
-    private static func isASCIIWhitespace(_ value: UInt8) -> Bool {
-        switch value {
-        case 9, 10, 13, 32:
-            true
-        default:
-            false
-        }
+        return Data(data[contentStart..<closeRange.lowerBound])
     }
 
     private static func parseAvailableUsage(text: String) -> (prompts: Int, windowMinutes: Int)? {
@@ -1233,11 +1066,10 @@ enum MiniMaxUsageParser {
         let unitRaw = match[2]
 
         let prompts = Int(promptsRaw.replacingOccurrences(of: ",", with: "")) ?? 0
-        guard prompts > 0 else { return nil }
-
-        guard let duration = Double(durationRaw) else { return nil }
-        let windowMinutes = self.minutes(from: duration, unit: unitRaw)
-        guard windowMinutes > 0 else { return nil }
+        guard prompts > 0,
+              let duration = Double(durationRaw),
+              let windowMinutes = self.minutes(from: duration, unit: unitRaw),
+              windowMinutes > 0 else { return nil }
         return (prompts, windowMinutes)
     }
 
@@ -1310,13 +1142,13 @@ enum MiniMaxUsageParser {
         return candidate
     }
 
-    private static func minutes(from value: Double, unit: String) -> Int {
+    private static func minutes(from value: Double, unit: String) -> Int? {
         let lower = unit.lowercased()
-        if lower.hasPrefix("d") { return Int((value * 24 * 60).rounded()) }
-        if lower.hasPrefix("h") { return Int((value * 60).rounded()) }
-        if lower.hasPrefix("m") { return Int(value.rounded()) }
-        if lower.hasPrefix("s") { return max(1, Int((value / 60).rounded())) }
-        return 0
+        if lower.hasPrefix("d") { return Int(exactly: (value * 24 * 60).rounded()) }
+        if lower.hasPrefix("h") { return Int(exactly: (value * 60).rounded()) }
+        if lower.hasPrefix("m") { return Int(exactly: value.rounded()) }
+        if lower.hasPrefix("s"), let minutes = Int(exactly: (value / 60).rounded()) { return max(1, minutes) }
+        return nil
     }
 
     private static func timeZone(from hint: String) -> TimeZone? {
@@ -1389,7 +1221,7 @@ enum MiniMaxUsageParser {
     // MARK: - Multi-Service Parsing
 
     private static func parseMultiService(data: Data, now: Date) throws -> MiniMaxUsageSnapshot? {
-        let payload = try self.decodeMultiServicePayload(data: data)
+        let payload = try JSONDecoder().decode(MiniMaxMultiServicePayload.self, from: data)
 
         guard !payload.data.services.isEmpty else {
             return nil
@@ -1407,10 +1239,7 @@ enum MiniMaxUsageParser {
                 continue
             }
 
-            var percent = item.percent ?? 0.0
-            if item.percent == nil, limit > 0 {
-                percent = Double(usage) / Double(limit) * 100.0
-            }
+            let percent = item.percent ?? (Double(usage) / Double(limit) * 100.0)
 
             let resetsAt = self.parseResetsAtFromTimeRange(timeRange: timeRange, windowType: windowType, now: now)
             let resetDescription = self.resetDescription(
@@ -1532,8 +1361,7 @@ enum MiniMaxUsageParser {
 
     private static func parseWindowInfo(
         startTime: Date?,
-        endTime: Date?,
-        now: Date) -> (windowType: String, timeRange: String)
+        endTime: Date?) -> (windowType: String, timeRange: String)
     {
         guard let startTime, let endTime else {
             return (windowType: "Unknown", timeRange: "N/A")
@@ -1542,7 +1370,6 @@ enum MiniMaxUsageParser {
         let durationSeconds = endTime.timeIntervalSince(startTime)
         let durationHours = durationSeconds / 3600
 
-        // Determine window type based on duration
         let windowType = if durationHours >= 23, durationHours <= 25 {
             "Today"
         } else if durationHours >= 4, durationHours <= 6 {
@@ -1553,7 +1380,6 @@ enum MiniMaxUsageParser {
             "Custom"
         }
 
-        // Format time range
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
         formatter.timeZone = TimeZone(identifier: "Asia/Shanghai") ?? .current
@@ -1567,6 +1393,7 @@ enum MiniMaxUsageParser {
 
     private struct ServiceUsageInput {
         let serviceType: String
+        let isWebPercentSchema: Bool
         let windowTypeOverride: String?
         let total: Int?
         let remaining: Int?
@@ -1579,11 +1406,11 @@ enum MiniMaxUsageParser {
     }
 
     private static func makeServiceUsage(_ input: ServiceUsageInput, now: Date) -> MiniMaxServiceUsage? {
-        guard self.shouldRenderQuotaWindow(input) else { return nil }
+        guard !self.isUnavailableQuotaPlaceholder(input) else { return nil }
 
         let startTime = self.dateFromEpoch(input.start)
         let endTime = self.dateFromEpoch(input.end)
-        var (windowType, timeRange) = self.parseWindowInfo(startTime: startTime, endTime: endTime, now: now)
+        var (windowType, timeRange) = self.parseWindowInfo(startTime: startTime, endTime: endTime)
         if let windowTypeOverride = input.windowTypeOverride { windowType = windowTypeOverride }
         if windowType.lowercased() == "weekly",
            let weeklyRange = self.formatMiniMaxDateTimeRange(startTime: startTime, endTime: endTime)
@@ -1639,13 +1466,8 @@ enum MiniMaxUsageParser {
         return max(1, Int((Double(boostPermille) / 10.0).rounded()))
     }
 
-    private static func shouldRenderQuotaWindow(_ input: ServiceUsageInput) -> Bool {
-        // MiniMax Token Plan returns status 3 for quota lanes that exist in the schema but are not included in
-        // the current subscription, for example Plus accounts receiving a video lane with 100% remaining and 0 count.
-        !self.isUnavailableQuotaPlaceholder(input)
-    }
-
     private static func isUnavailableQuotaPlaceholder(_ input: ServiceUsageInput) -> Bool {
+        // Status 3 with an empty quota marks a lane excluded from the subscription, except unlimited weekly text.
         if let windowType = input.windowTypeOverride, self.isUnlimitedQuotaWindow(input, windowType: windowType) {
             return false
         }
@@ -1659,6 +1481,9 @@ enum MiniMaxUsageParser {
         let normalizedService = input.serviceType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let normalizedWindow = windowType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let unlimitedServices = ["text generation", "general"]
+        if input.isWebPercentSchema, input.status == 3, unlimitedServices.contains(normalizedService) {
+            return true
+        }
         return input.status == 3 &&
             unlimitedServices.contains(normalizedService) &&
             normalizedWindow == "weekly" &&

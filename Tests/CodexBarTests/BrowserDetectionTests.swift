@@ -30,6 +30,34 @@ struct BrowserDetectionTests {
             profileAccessIssue: { _ in nil })
     }
 
+    @Test
+    func `Claude desktop discovers a root cookie store without browser profile directories`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let root = home.appendingPathComponent("Library/Application Support/Claude")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let detection = self.detection(homeDirectory: home.path, installedBrowsers: [.claudeDesktop])
+        #expect(!detection.isCookieSourceAvailable(.claudeDesktop))
+        try Data().write(to: root.appendingPathComponent("Cookies"))
+        #expect(detection.isCookieSourceAvailable(.claudeDesktop))
+        #expect(detection.hasUsableProfileData(.claudeDesktop))
+    }
+
+    @Test
+    func `Brave Origin imports only from its own installed profile`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let profile = home.appendingPathComponent("Library/Application Support/BraveSoftware/Brave-Origin/Default")
+        try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
+        let detection = self.detection(homeDirectory: home.path, installedBrowsers: [.braveOrigin])
+        #expect(!detection.isCookieSourceAvailable(.braveOrigin))
+        try Data().write(to: profile.appendingPathComponent("Cookies"))
+        #expect(detection.isCookieSourceAvailable(.braveOrigin))
+        #expect(!detection.isCookieSourceAvailable(.brave))
+        #expect(Browser.defaultImportOrder.browsersWithProfileData(using: detection) == [.braveOrigin])
+        #expect(ChromiumLocalStorageDiscovery.defaultBrowsers.contains(.braveOrigin))
+    }
+
     private static func labelIDs(for browser: Browser) -> [String] {
         browser.safeStorageLabels.map { self.labelID(service: $0.service, account: $0.account) }
     }
@@ -118,8 +146,10 @@ struct BrowserDetectionTests {
         #expect(detection.isCookieSourceAvailable(.safari))
     }
 
-    @Test
-    func `cookie client permits isolated chromium stores during tests`() throws {
+    @Test(arguments: [false, true])
+    func `profile discovery needs no Keychain permission while record reads stay gated`(
+        keychainDisabled: Bool) throws
+    {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let profile = temp
             .appendingPathComponent("Library/Application Support/Google/Chrome/Default/Network")
@@ -128,12 +158,22 @@ struct BrowserDetectionTests {
         defer { try? FileManager.default.removeItem(at: temp) }
 
         let client = BrowserCookieClient(configuration: .init(homeDirectories: [temp]))
-        let stores = try KeychainAccessGate.withTaskOverrideForTesting(false) {
-            try KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in .allowed } operation: {
-                try client.codexBarStores(for: .chrome)
+        let preflights = OSAllocatedUnfairLock(initialState: 0)
+        try KeychainAccessGate.withTaskOverrideForTesting(keychainDisabled) {
+            try KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in
+                preflights.withLock { $0 += 1 }
+                return .interactionRequired
+            } operation: {
+                try ProviderInteractionContext.$current.withValue(.background) {
+                    let stores = try client.codexBarStores(for: .chrome)
+                    #expect(stores.count == 1)
+                    #expect(preflights.withLock { $0 } == 0)
+                    let query = BrowserCookieQuery(domains: ["langdock.com"], domainMatch: .exact)
+                    #expect(try client.codexBarRecords(matching: query, in: .chrome).isEmpty)
+                    #expect(try client.codexBarRecords(matching: query, in: #require(stores.first)).isEmpty)
+                }
             }
         }
-        #expect(stores.count == 1)
     }
 
     @Test
@@ -162,6 +202,57 @@ struct BrowserDetectionTests {
     }
 
     @Test
+    func `lazy cookie candidates stop before probing later browsers`() throws {
+        BrowserCookieAccessGate.resetForTesting()
+        defer { BrowserCookieAccessGate.resetForTesting() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let chromeCookies = temp
+            .appendingPathComponent("Library/Application Support/Google/Chrome/Default/Network/Cookies")
+        try FileManager.default.createDirectory(
+            at: chromeCookies.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: chromeCookies.path, contents: Data())
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let edgeProbeCount = OSAllocatedUnfairLock(initialState: 0)
+        let detection = BrowserDetection(
+            homeDirectory: temp.path,
+            cacheTTL: 0,
+            fileExists: { path in
+                if path == "/Applications/Google Chrome.app" {
+                    return true
+                }
+                if path == "/Applications/Microsoft Edge.app" {
+                    edgeProbeCount.withLock { $0 += 1 }
+                    return true
+                }
+                return FileManager.default.fileExists(atPath: path)
+            },
+            directoryContents: { path in
+                try? FileManager.default.contentsOfDirectory(atPath: path)
+            })
+        var preflightCount = 0
+
+        let firstCandidate = KeychainAccessGate.withTaskOverrideForTesting(false) {
+            KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in
+                preflightCount += 1
+                return .allowed
+            } operation: {
+                ProviderInteractionContext.$current.withValue(.background) {
+                    Array([Browser.chrome, .edge]
+                        .lazyCookieImportCandidates(using: detection)
+                        .prefix(1))
+                }
+            }
+        }
+
+        #expect(firstCandidate == [.chrome])
+        #expect(preflightCount == 1)
+        #expect(edgeProbeCount.withLock { $0 } == 0)
+    }
+
+    @Test
     func `chrome requires profile data`() throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -185,12 +276,29 @@ struct BrowserDetectionTests {
     }
 
     @Test
+    func `Vivaldi uses its Chromium profile and Safe Storage metadata`() throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let profile = temp
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("Vivaldi")
+            .appendingPathComponent("Default")
+            .appendingPathComponent("Network")
+        try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: profile.appendingPathComponent("Cookies").path, contents: Data())
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let detection = self.detection(homeDirectory: temp.path, installedBrowsers: [.vivaldi])
+
+        #expect(Browser.vivaldi.chromiumProfileRelativePath == "Vivaldi")
+        #expect(Self.labelIDs(for: .vivaldi).contains("Vivaldi Safe Storage|Vivaldi"))
+        #expect(Browser.defaultImportOrder.contains(.vivaldi))
+        #expect(detection.isCookieSourceAvailable(.vivaldi))
+    }
+
+    @Test
     func `process filters chromium candidates despite false global keychain override`() throws {
         guard ProcessInfo.processInfo.environment["CODEXBAR_ALLOW_TEST_KEYCHAIN_ACCESS"] != "1" else { return }
-        KeychainAccessGate.resetOverrideForTesting()
-        defer { KeychainAccessGate.resetOverrideForTesting() }
-
-        KeychainAccessGate.isDisabled = false
 
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -209,11 +317,14 @@ struct BrowserDetectionTests {
 
         let detection = self.detection(homeDirectory: temp.path, installedBrowsers: [.chrome])
         let browsers: [Browser] = [.chrome, .safari]
-        #expect(browsers.cookieImportCandidates(using: detection) == [.safari])
+        let candidates = KeychainAccessGate.withStoredOverrideForTesting(false) {
+            browsers.cookieImportCandidates(using: detection)
+        }
+        #expect(candidates == [.safari])
     }
 
     @Test
-    func `keychain interaction suppresses chromium family during cooldown`() {
+    func `interaction metadata does not create a denial cooldown`() {
         BrowserCookieAccessGate.resetForTesting()
         defer { BrowserCookieAccessGate.resetForTesting() }
 
@@ -221,7 +332,7 @@ struct BrowserDetectionTests {
         var preflightCount = 0
 
         KeychainAccessGate.withTaskOverrideForTesting(false) {
-            ProviderInteractionContext.$current.withValue(.background) {
+            ProviderInteractionContext.$current.withValue(.userInitiated) {
                 KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in
                     preflightCount += 1
                     return .interactionRequired
@@ -233,8 +344,8 @@ struct BrowserDetectionTests {
                     preflightCount += 1
                     return .allowed
                 } operation: {
-                    #expect(BrowserCookieAccessGate.shouldAttempt(.chrome, now: start.addingTimeInterval(60)) == false)
-                    #expect(BrowserCookieAccessGate.shouldAttempt(.dia, now: start.addingTimeInterval(60)) == false)
+                    #expect(BrowserCookieAccessGate.shouldAttempt(.chrome, now: start.addingTimeInterval(60)) == true)
+                    #expect(BrowserCookieAccessGate.shouldAttempt(.dia, now: start.addingTimeInterval(60)) == true)
                     #expect(
                         BrowserCookieAccessGate.shouldAttempt(
                             .chrome,
@@ -243,11 +354,11 @@ struct BrowserDetectionTests {
             }
         }
 
-        #expect(preflightCount == 2)
+        #expect(preflightCount == 4)
     }
 
     @Test
-    func `background cookie import allows authorized chromium keychain sources`() {
+    func `background chromium refresh proceeds when the no-UI preflight already grants access`() {
         BrowserCookieAccessGate.resetForTesting()
         defer { BrowserCookieAccessGate.resetForTesting() }
 
@@ -259,17 +370,21 @@ struct BrowserDetectionTests {
                 return .allowed
             } operation: {
                 ProviderInteractionContext.$current.withValue(.background) {
+                    // An already-authorized Safe Storage ACL lets a scheduled refresh read cookies
+                    // without any prompt, so the gate now consults the strictly no-UI preflight instead
+                    // of skipping outright.
                     #expect(BrowserCookieAccessGate.shouldAttempt(.chrome) == true)
                     #expect(BrowserCookieAccessGate.shouldAttempt(.safari) == true)
                 }
             }
         }
 
+        // Only the Keychain-backed browser reaches the preflight; Safari short-circuits before it.
         #expect(preflightCount == 1)
     }
 
     @Test
-    func `background cookie import suppresses chromium keychain sources requiring interaction`() {
+    func `background chromium refresh skips when the no-UI preflight requires interaction`() {
         BrowserCookieAccessGate.resetForTesting()
         defer { BrowserCookieAccessGate.resetForTesting() }
 
@@ -281,72 +396,95 @@ struct BrowserDetectionTests {
                 return .interactionRequired
             } operation: {
                 ProviderInteractionContext.$current.withValue(.background) {
+                    // The no-UI preflight never prompts; when it reports interaction is required the
+                    // background refresh still skips, preserving the no-surprise-prompt boundary.
                     #expect(BrowserCookieAccessGate.shouldAttempt(.chrome) == false)
                     #expect(BrowserCookieAccessGate.shouldAttempt(.safari) == true)
                 }
             }
         }
 
+        // The gate must probe the no-UI preflight to learn that interaction is required.
         #expect(preflightCount == 1)
     }
 
     @Test
-    func `recorded browser denial suppresses automatic family and permits explicit source retry`() {
+    func `recorded browser denial permits background recovery and CLI acknowledged retry`() {
         BrowserCookieAccessGate.resetForTesting()
         defer { BrowserCookieAccessGate.resetForTesting() }
 
-        let start = Date(timeIntervalSince1970: 1500)
+        let start = Date()
         var preflightCount = 0
 
         KeychainAccessGate.withTaskOverrideForTesting(false) {
-            BrowserCookieAccessGate.recordIfNeeded(
-                BrowserCookieError.accessDenied(browser: .arc, details: "denied"),
-                now: start)
+            BrowserCookieAccessGate.recordDenied(for: .arc, now: start)
             KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in
                 preflightCount += 1
                 return .allowed
             } operation: {
                 ProviderInteractionContext.$current.withValue(.background) {
-                    #expect(BrowserCookieAccessGate.shouldAttempt(.chrome, now: start.addingTimeInterval(1)) == false)
-                    #expect(BrowserCookieAccessGate.shouldAttempt(.edge, now: start.addingTimeInterval(1)) == false)
+                    #expect(BrowserCookieAccessGate.shouldAttempt(.chrome, now: start.addingTimeInterval(1)) == true)
+                    #expect(BrowserCookieAccessGate.shouldAttempt(.edge, now: start.addingTimeInterval(1)) == true)
                     #expect(BrowserCookieAccessGate.shouldAttempt(.safari, now: start.addingTimeInterval(1)) == true)
                 }
-                BrowserCookieAccessGate.withExplicitRetry {
+                BrowserCookieAccessGate.withExplicitRetry(bypassingCooldown: true) {
                     ProviderInteractionContext.$current.withValue(.userInitiated) {
                         #expect(BrowserCookieAccessGate
-                            .shouldAttempt(.chrome, now: start.addingTimeInterval(2)) == false)
+                            .shouldAttempt(.chrome, now: start.addingTimeInterval(2)) == true)
                         #expect(BrowserCookieAccessGate.shouldAttempt(.arc, now: start.addingTimeInterval(2)) == true)
-                        #expect(BrowserCookieAccessGate.claimExplicitRetryCookieReadIfNeeded(for: .arc))
+                        let read = try? BrowserCookieAccessGate.withRecordReadInteractionPolicy {
+                            if BrowserCookieKeychainAccessGate.isUserInteractionDisallowed {
+                                throw BrowserCookieError.accessDenied(browser: .arc, details: "Synthetic")
+                            }
+                            return true
+                        }
+                        #expect(read == true)
                         BrowserCookieAccessGate.recordAllowed(for: .arc)
                     }
                 }
-                ProviderInteractionContext.$current.withValue(.background) {
+                ProviderInteractionContext.$current.withValue(.userInitiated) {
                     #expect(BrowserCookieAccessGate.shouldAttempt(.chrome, now: start.addingTimeInterval(3)) == true)
                 }
             }
         }
 
-        #expect(preflightCount == 2)
+        #expect(preflightCount == 3)
     }
 
     @Test
-    func `denied explicit cookie read closes retry scope`() {
+    func `denied acknowledged read keeps later reads noninteractive`() {
         BrowserCookieAccessGate.resetForTesting()
         defer { BrowserCookieAccessGate.resetForTesting() }
 
-        let start = Date(timeIntervalSince1970: 1700)
+        let start = Date()
         BrowserCookieAccessGate.recordDenied(for: .arc, now: start)
 
         KeychainAccessGate.withTaskOverrideForTesting(false) {
-            BrowserCookieAccessGate.withExplicitRetry {
-                ProviderInteractionContext.$current.withValue(.userInitiated) {
-                    #expect(BrowserCookieAccessGate.shouldAttempt(.arc, now: start.addingTimeInterval(1)))
-                    #expect(BrowserCookieAccessGate.claimExplicitRetryCookieReadIfNeeded(for: .arc))
+            KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { _, _ in .allowed } operation: {
+                BrowserCookieAccessGate.withExplicitRetry(bypassingCooldown: true) {
+                    ProviderInteractionContext.$current.withValue(.userInitiated) {
+                        #expect(BrowserCookieAccessGate.shouldAttempt(.arc, now: start.addingTimeInterval(1)))
+                        let read = try? BrowserCookieAccessGate.withRecordReadInteractionPolicy {
+                            if BrowserCookieKeychainAccessGate.isUserInteractionDisallowed {
+                                throw BrowserCookieError.accessDenied(browser: .arc, details: "Synthetic")
+                            }
+                            return true
+                        }
+                        #expect(read == true)
 
-                    BrowserCookieAccessGate.recordDenied(for: .arc, now: start.addingTimeInterval(2))
+                        BrowserCookieAccessGate.recordDenied(for: .arc, now: start.addingTimeInterval(2))
 
-                    #expect(BrowserCookieAccessGate.shouldAttempt(.arc, now: start.addingTimeInterval(3)) == false)
-                    #expect(BrowserCookieAccessGate.shouldAttempt(.edge, now: start.addingTimeInterval(3)) == false)
+                        #expect(BrowserCookieAccessGate.shouldAttempt(.arc, now: start.addingTimeInterval(3)))
+                        #expect(BrowserCookieAccessGate.shouldAttempt(.edge, now: start.addingTimeInterval(3)))
+                        #expect(throws: BrowserCookieError.self) {
+                            try BrowserCookieAccessGate.withRecordReadInteractionPolicy {
+                                if BrowserCookieKeychainAccessGate.isUserInteractionDisallowed {
+                                    throw BrowserCookieError.accessDenied(browser: .arc, details: "Synthetic")
+                                }
+                                Issue.record("Unexpected second interactive read")
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -367,7 +505,9 @@ struct BrowserDetectionTests {
                 queriedLabels.append(label)
                 return .notFound
             } operation: {
-                #expect(BrowserCookieAccessGate.shouldAttempt(.chrome) == true)
+                ProviderInteractionContext.$current.withValue(.userInitiated) {
+                    #expect(BrowserCookieAccessGate.shouldAttempt(.chrome) == true)
+                }
             }
         }
 
@@ -390,7 +530,9 @@ struct BrowserDetectionTests {
                 queriedLabels.append(label)
                 return .notFound
             } operation: {
-                #expect(BrowserCookieAccessGate.shouldAttempt(.dia) == true)
+                ProviderInteractionContext.$current.withValue(.userInitiated) {
+                    #expect(BrowserCookieAccessGate.shouldAttempt(.dia) == true)
+                }
             }
         }
 
@@ -399,7 +541,7 @@ struct BrowserDetectionTests {
     }
 
     @Test
-    func `browser keychain interaction suppresses family and permits scoped explicit retry`() throws {
+    func `browser denial suppresses family including manual retries`() throws {
         BrowserCookieAccessGate.resetForTesting()
         defer { BrowserCookieAccessGate.resetForTesting() }
 
@@ -415,13 +557,18 @@ struct BrowserDetectionTests {
             KeychainAccessPreflight.withCheckGenericPasswordOverrideForTesting { service, account in
                 let label = Self.labelID(service: service, account: account)
                 queriedLabels.append(label)
-                if label == firstChromeLabel { return .allowed }
-                if label == firstDiaLabel { return .interactionRequired }
+                if label == firstChromeLabel {
+                    return .allowed
+                }
+                if label == firstDiaLabel {
+                    return .interactionRequired
+                }
                 return .notFound
             } operation: {
-                ProviderInteractionContext.$current.withValue(.background) {
+                ProviderInteractionContext.$current.withValue(.userInitiated) {
                     #expect(BrowserCookieAccessGate.shouldAttempt(.chrome, now: start) == true)
                     #expect(BrowserCookieAccessGate.shouldAttempt(.dia, now: start.addingTimeInterval(1)) == false)
+                    BrowserCookieAccessGate.recordDenied(for: .dia, now: start.addingTimeInterval(1))
                     #expect(BrowserCookieAccessGate.shouldAttempt(.chrome, now: start.addingTimeInterval(60)) == false)
                     #expect(BrowserCookieAccessGate.shouldAttempt(.dia, now: start.addingTimeInterval(60)) == false)
                 }
@@ -429,7 +576,7 @@ struct BrowserDetectionTests {
                     ProviderInteractionContext.$current.withValue(.userInitiated) {
                         #expect(BrowserCookieAccessGate
                             .shouldAttempt(.chrome, now: start.addingTimeInterval(61)) == false)
-                        #expect(BrowserCookieAccessGate.shouldAttempt(.dia, now: start.addingTimeInterval(61)) == true)
+                        #expect(BrowserCookieAccessGate.shouldAttempt(.dia, now: start.addingTimeInterval(61)) == false)
                         #expect(BrowserCookieAccessGate
                             .shouldAttempt(.edge, now: start.addingTimeInterval(61)) == false)
                     }
@@ -437,7 +584,7 @@ struct BrowserDetectionTests {
             }
         }
 
-        #expect(queriedLabels == [firstChromeLabel, firstDiaLabel, firstDiaLabel])
+        #expect(queriedLabels == [firstChromeLabel, firstDiaLabel])
         #expect(queriedLabels.allSatisfy { allowedLabels.contains($0) })
     }
 
@@ -497,6 +644,7 @@ struct BrowserDetectionTests {
         let detection = BrowserDetection(
             homeDirectory: temp.path,
             cacheTTL: 600,
+            now: Date.init,
             fileExists: { path in
                 if path == "/Applications/Google Chrome.app" {
                     return installed.withLock { $0 }
@@ -505,15 +653,18 @@ struct BrowserDetectionTests {
             },
             directoryContents: { path in
                 try? FileManager.default.contentsOfDirectory(atPath: path)
-            })
+            },
+            // Another host Chrome registration must not survive this test's simulated uninstall.
+            applicationURLs: { _ in [] },
+            profileAccessIssue: { _ in nil })
 
         #expect(detection.isCookieSourceAvailable(.chrome))
         installed.withLock { $0 = false }
         #expect(!detection.isCookieSourceAvailable(.chrome))
     }
 
-    @Test
-    func `registered browser outside Applications is a candidate`() throws {
+    @Test(arguments: [true, false])
+    func `registered browser outside Applications requires a live registration`(registered: Bool) throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let cookies = temp
             .appendingPathComponent("Library/Application Support/Google/Chrome/Default/Network/Cookies")
@@ -529,17 +680,78 @@ struct BrowserDetectionTests {
             cacheTTL: 0,
             now: Date.init,
             fileExists: { path in
-                path == appURL.path || FileManager.default.fileExists(atPath: path)
+                if path.hasSuffix(".app") { return path == appURL.path }
+                return FileManager.default.fileExists(atPath: path)
             },
             directoryContents: { path in
                 try? FileManager.default.contentsOfDirectory(atPath: path)
             },
             applicationURLs: { appName in
-                appName == Browser.chrome.appBundleName ? [appURL] : []
+                registered && appName == Browser.chrome.appBundleName ? [appURL] : []
             },
             profileAccessIssue: { _ in nil })
 
-        #expect(detection.isCookieSourceAvailable(.chrome))
+        #expect(detection.isCookieSourceAvailable(.chrome) == registered)
+    }
+
+    @Test
+    func `interactive source accepts an installed browser before its cookie store exists`() {
+        let home = "/tmp/codexbar-fresh-browser-profile"
+        let profileRoot = "\(home)/Library/Application Support/Google/Chrome"
+        let applicationPath = "/Applications/Google Chrome.app"
+        let freshInstall = BrowserDetection(
+            homeDirectory: home,
+            cacheTTL: 600,
+            now: Date.init,
+            fileExists: { $0 == applicationPath },
+            directoryContents: { _ in nil },
+            applicationURLs: { _ in [] },
+            profileAccessIssue: { _ in nil })
+
+        #expect(!freshInstall.isCookieSourceAvailable(.chrome))
+        #expect(freshInstall.isInteractiveCookieSourceAvailable(.chrome))
+
+        let inaccessibleProfile = BrowserDetection(
+            homeDirectory: home,
+            cacheTTL: 600,
+            now: Date.init,
+            fileExists: { $0 == applicationPath },
+            directoryContents: { _ in nil },
+            applicationURLs: { _ in [] },
+            profileAccessIssue: { _ in .accessDenied })
+
+        #expect(!inaccessibleProfile.isInteractiveCookieSourceAvailable(.chrome))
+
+        let emptyReadableProfile = BrowserDetection(
+            homeDirectory: home,
+            cacheTTL: 600,
+            now: Date.init,
+            fileExists: { $0 == applicationPath || $0 == profileRoot },
+            directoryContents: { $0 == profileRoot ? [] : nil },
+            applicationURLs: { _ in [] },
+            profileAccessIssue: { _ in nil })
+
+        #expect(!emptyReadableProfile.isCookieSourceAvailable(.chrome))
+        #expect(emptyReadableProfile.isInteractiveCookieSourceAvailable(.chrome))
+    }
+
+    @Test
+    func `interactive source treats a missing production profile path as fresh`() throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let detection = BrowserDetection(
+            homeDirectory: temp.path,
+            cacheTTL: 0,
+            fileExists: { path in
+                path == "/Applications/Google Chrome.app" || FileManager.default.fileExists(atPath: path)
+            },
+            directoryContents: { path in
+                try? FileManager.default.contentsOfDirectory(atPath: path)
+            })
+
+        #expect(detection.isInteractiveCookieSourceAvailable(.chrome))
     }
 
     @Test
@@ -592,6 +804,7 @@ struct BrowserDetectionTests {
 
         #expect(detection.cookieSourceProfileAccessIssue(.chrome) == .accessDenied)
         #expect(!detection.isCookieSourceAvailable(.chrome))
+        #expect(!detection.isInteractiveCookieSourceAvailable(.chrome))
     }
 
     @Test
@@ -617,6 +830,50 @@ struct BrowserDetectionTests {
     }
 
     @Test
+    func `firefox developer edition unlocks the shared Firefox cookie store`() {
+        let home = "/tmp/codexbar-firefox-developer-edition"
+        let profiles = "\(home)/Library/Application Support/Firefox/Profiles"
+        let cookieDB = "\(profiles)/abc.default-release/cookies.sqlite"
+        let detection = BrowserDetection(
+            homeDirectory: home,
+            cacheTTL: 0,
+            now: Date.init,
+            fileExists: { path in
+                path == "/Applications/Firefox Developer Edition.app" ||
+                    path == profiles ||
+                    path == cookieDB
+            },
+            directoryContents: { path in
+                path == profiles ? ["abc.default-release"] : nil
+            },
+            applicationURLs: { _ in [] },
+            profileAccessIssue: { _ in nil })
+
+        #expect(detection.isCookieSourceAvailable(.firefox))
+    }
+
+    @Test
+    func `firefox developer edition default profile provides a cookie store`() throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        // Firefox Developer Edition creates its default profile as `<salt>.dev-edition-default`.
+        let profile = temp
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("Firefox")
+            .appendingPathComponent("Profiles")
+            .appendingPathComponent("abc.dev-edition-default")
+        try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: profile.appendingPathComponent("cookies.sqlite").path, contents: Data())
+
+        let detection = self.detection(homeDirectory: temp.path, installedBrowsers: [.firefoxDeveloperEdition])
+        #expect(detection.isCookieSourceAvailable(.firefoxDeveloperEdition) == true)
+        #expect(detection.hasUsableProfileData(.firefoxDeveloperEdition) == true)
+    }
+
+    @Test
     func `zen accepts uppercase default profile dir`() throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
@@ -636,6 +893,43 @@ struct BrowserDetectionTests {
         try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: profile.appendingPathComponent("cookies.sqlite").path, contents: Data())
         #expect(detection.isCookieSourceAvailable(.zen) == true)
+    }
+
+    @Test(arguments: [
+        // Beta ships as Firefox.app, so release Firefox also passes detection.
+        (browser: Browser.firefoxBeta, profile: "abc.default-beta", channel: Browser.firefoxBeta),
+        (
+            browser: Browser.firefoxDeveloperEdition,
+            profile: "abc.dev-edition-default",
+            channel: Browser.firefoxDeveloperEdition),
+        (browser: Browser.firefoxNightly, profile: "abc.default-nightly", channel: Browser.firefoxNightly),
+    ])
+    func `channel only install stays reachable through shipped provider orders`(
+        browser: Browser,
+        profile: String,
+        channel: Browser) throws
+    {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let profileDir = temp
+            .appendingPathComponent("Library")
+            .appendingPathComponent("Application Support")
+            .appendingPathComponent("Firefox")
+            .appendingPathComponent("Profiles")
+            .appendingPathComponent(profile)
+        try FileManager.default.createDirectory(at: profileDir, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: profileDir.appendingPathComponent("cookies.sqlite").path,
+            contents: Data())
+
+        let detection = self.detection(homeDirectory: temp.path, installedBrowsers: [browser])
+        let orders = ProviderDefaults.metadata.values.compactMap(\.browserCookieOrder)
+            .filter { $0.contains(.firefox) }
+        for order in orders {
+            #expect(order.cookieImportCandidates(using: detection).contains(channel))
+        }
     }
 }
 

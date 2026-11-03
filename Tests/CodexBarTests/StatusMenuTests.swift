@@ -4,7 +4,7 @@ import Testing
 @testable import CodexBar
 
 @MainActor
-@Suite(.serialized)
+@Suite(.serialized, CodexCredentialFixtures())
 struct StatusMenuTests {
     func disableMenuCardsForTesting() {
         StatusItemController.menuCardRenderingEnabled = false
@@ -160,13 +160,23 @@ struct StatusMenuTests {
             preferencesSelection: PreferencesSelection(),
             statusBar: self.makeStatusBarForTesting())
 
+        // A legacy workspace URL still resolves, but the action opens the console route.
         #expect(controller.dashboardURL(for: .opencodego)?
-            .absoluteString == "https://opencode.ai/workspace/wrk_abc123/go")
+            .absoluteString == "https://opencode.ai/console/wrk_abc123/go")
     }
 
     @Test
-    func `claude subscription dashboard action opens usage page`() {
-        for plan in ["Claude Pro", "Claude Team"] {
+    func `claude dashboard action opens usage page for account type`() {
+        let cases: [(String?, String)] = [
+            (nil, "https://platform.claude.com/usage"),
+            ("API", "https://platform.claude.com/usage"),
+            ("Claude Enterprise", "https://platform.claude.com/usage"),
+            ("Claude Pro", "https://claude.ai/settings/usage"),
+            ("Claude Max", "https://claude.ai/settings/usage"),
+            ("Claude Team", "https://claude.ai/settings/usage"),
+            ("Claude Ultra", "https://claude.ai/settings/usage"),
+        ]
+        for (plan, expectedURL) in cases {
             self.disableMenuCardsForTesting()
             let settings = self.makeSettings()
             settings.statusChecksEnabled = false
@@ -201,7 +211,7 @@ struct StatusMenuTests {
                 preferencesSelection: PreferencesSelection(),
                 statusBar: self.makeStatusBarForTesting())
 
-            #expect(controller.dashboardURL(for: .claude)?.absoluteString == "https://claude.ai/settings/usage")
+            #expect(controller.dashboardURL(for: .claude)?.absoluteString == expectedURL)
         }
     }
 
@@ -259,13 +269,7 @@ struct StatusMenuTests {
         settings.mergeIcons = true
         settings.selectedMenuProvider = nil
 
-        let registry = ProviderRegistry.shared
-        let selectedProviders: Set<UsageProvider> = [.codex, .claude]
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = selectedProviders.contains(provider)
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude], settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -571,12 +575,7 @@ struct StatusMenuTests {
         settings.selectedMenuProvider = .codex
         settings.usageBarsShowUsed = false
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude], settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -632,12 +631,7 @@ struct StatusMenuTests {
         settings.selectedMenuProvider = .claude
         settings.mergedMenuLastSelectedWasOverview = false
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude], settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -668,12 +662,7 @@ struct StatusMenuTests {
         settings.selectedMenuProvider = .claude
         settings.mergedMenuLastSelectedWasOverview = false
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude], settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -713,14 +702,9 @@ struct StatusMenuTests {
         settings.selectedMenuProvider = .codex
         settings.mergedMenuLastSelectedWasOverview = false
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude], settings: settings)
 
-        let activeProviders: [UsageProvider] = [.codex, .claude]
+        let activeProviders: [ProviderInstanceID] = [.codex, .claude]
         _ = settings.setMergedOverviewProviderSelection(
             provider: .codex,
             isSelected: false,
@@ -770,12 +754,7 @@ struct StatusMenuTests {
         settings.selectedMenuProvider = .codex
         settings.mergedMenuLastSelectedWasOverview = true
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude || provider == .cursor
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude, .cursor], settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -828,11 +807,7 @@ extension StatusMenuTests {
         settings.refreshFrequency = .manual
         settings.mergeIcons = false
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: provider == .codex)
-        }
+        enableTestProviders([.codex], settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -1414,6 +1389,8 @@ extension StatusMenuTests {
         settings.costUsageEnabled = true
         settings.costSummaryDisplayStyle = .both
         settings.claudeWebExtrasEnabled = true
+        settings.showOptionalCreditsAndExtraUsage = true
+        settings.preferredCurrencyCode = "EUR"
 
         let registry = ProviderRegistry.shared
         if let codexMeta = registry.metadata[.codex] {
@@ -1477,6 +1454,24 @@ extension StatusMenuTests {
         controller.menuWillOpen(menu)
         let ids = menu.items.compactMap { $0.representedObject as? String }
         #expect(ids.contains("menuCardExtraUsage"))
+        let model = controller.menuCardModel(for: .claude)
+        #expect(model?.providerCost?.spendLine == "Monthly: €0.00 / €2,000.00")
+        #expect(model?.metrics.contains { $0.id == "claude-extra-usage" } == false)
+        controller.menuDidClose(menu)
+
+        settings.setUsageItemVisible(false, itemID: .claudeExtraUsage, for: .claude)
+        let hiddenMenu = controller.makeMenu()
+        controller.menuWillOpen(hiddenMenu)
+        #expect(!self.representedIDs(in: hiddenMenu).contains("menuCardExtraUsage"))
+        #expect(controller.menuCardModel(for: .claude)?.providerCost == nil)
+        controller.menuDidClose(hiddenMenu)
+
+        settings.setUsageItemVisible(true, itemID: .claudeExtraUsage, for: .claude)
+        let restoredMenu = controller.makeMenu()
+        controller.menuWillOpen(restoredMenu)
+        #expect(self.representedIDs(in: restoredMenu).contains("menuCardExtraUsage"))
+        #expect(controller.menuCardModel(for: .claude)?.providerCost?.spendLine == "Monthly: €0.00 / €2,000.00")
+        controller.menuDidClose(restoredMenu)
     }
 
     @Test
@@ -1539,7 +1534,7 @@ extension StatusMenuTests {
 
 extension StatusMenuTests {
     @Test
-    func `overview tab renders overview rows for all active providers when three or fewer`() {
+    func `overview tab renders overview rows for six active providers`() {
         self.disableMenuCardsForTesting()
         let settings = self.makeSettings()
         settings.statusChecksEnabled = false
@@ -1548,12 +1543,8 @@ extension StatusMenuTests {
         settings.selectedMenuProvider = .claude
         settings.mergedMenuLastSelectedWasOverview = true
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude || provider == .cursor
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        let enabledProviders: Set<UsageProvider> = [.codex, .claude, .cursor, .opencode, .warp, .gemini]
+        enableTestProviders(enabledProviders, settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -1567,18 +1558,14 @@ extension StatusMenuTests {
 
         let menu = controller.makeMenu()
         controller.menuWillOpen(menu)
-
         let ids = self.representedIDs(in: menu)
         let overviewRows = ids.filter { $0.hasPrefix("overviewRow-") }
-        #expect(overviewRows.count == 3)
-        #expect(overviewRows.contains("overviewRow-codex"))
-        #expect(overviewRows.contains("overviewRow-claude"))
-        #expect(overviewRows.contains("overviewRow-cursor"))
-        #expect(ids.contains("menuCard") == false)
+        #expect(Set(overviewRows) == Set(enabledProviders.map { "overviewRow-\($0.rawValue)" }))
+        #expect(menu.items.count(where: \.isSeparatorItem) == overviewRows.count + 1)
     }
 
     @Test
-    func `overview tab honors stored subset when three or fewer`() {
+    func `overview tab honors stored subset when within the provider limit`() {
         self.disableMenuCardsForTesting()
         let settings = self.makeSettings()
         settings.statusChecksEnabled = false
@@ -1587,12 +1574,7 @@ extension StatusMenuTests {
         settings.selectedMenuProvider = .claude
         settings.mergedMenuLastSelectedWasOverview = true
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude || provider == .cursor
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude, .cursor], settings: settings)
         _ = settings.setMergedOverviewProviderSelection(
             provider: .claude,
             isSelected: false,
@@ -1630,16 +1612,8 @@ extension StatusMenuTests {
         settings.selectedMenuProvider = .codex
         settings.mergedMenuLastSelectedWasOverview = true
         settings.mergedOverviewSelectedProviders = []
-
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex ||
-                provider == .claude ||
-                provider == .cursor ||
-                provider == .opencode
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        let enabledProviders: Set<UsageProvider> = [.codex, .claude, .cursor, .opencode, .warp, .gemini, .grok]
+        enableTestProviders(enabledProviders, settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)
@@ -1678,12 +1652,7 @@ extension StatusMenuTests {
         settings.selectedMenuProvider = .codex
         settings.mergedMenuLastSelectedWasOverview = true
 
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            let shouldEnable = provider == .codex || provider == .claude
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: shouldEnable)
-        }
+        enableTestProviders([.codex, .claude], settings: settings)
 
         let fetcher = UsageFetcher()
         let store = UsageStore(fetcher: fetcher, browserDetection: BrowserDetection(cacheTTL: 0), settings: settings)

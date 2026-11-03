@@ -11,7 +11,7 @@ read_when:
 `codexbar config` edits the same resolved config file used by the app's Settings → Providers pane.
 New installs use `~/.config/codexbar/config.json`; absolute `XDG_CONFIG_HOME` paths and `CODEXBAR_CONFIG` are
 supported, and existing `~/.codexbar/config.json` installs keep using the legacy file when no XDG config exists.
-The CLI writes the file with `0600` permissions.
+The CLI stages writes in a private `0700` directory on the destination volume, creates the file with `0600` permissions before writing any bytes, then syncs and atomically replaces the config.
 
 ## Providers
 
@@ -34,6 +34,34 @@ command override and does not edit config.
 
 If every provider is disabled, `codexbar usage` with no `--provider` prints no text output, and
 `codexbar usage --json` prints `[]`. Passing `--provider <name>` still fetches that provider for the one command.
+
+## Copilot device login
+
+```bash
+codexbar config login --provider copilot
+codexbar config login --provider copilot --json
+```
+
+The command prints GitHub's verification URL and user code. Open the URL on any machine, enter the code,
+and authorize access. CodexBar polls until approval, denial, expiry, or cancellation (Ctrl-C); it does not
+open a browser or access Keychain. A configured Copilot `enterpriseHost` selects the matching GitHub issuer.
+
+On approval, CodexBar verifies the GitHub identity, saves it to the existing `providers[].tokenAccounts`,
+selects that account, and enables Copilot. Repeating login updates the matching account while preserving
+its label and settings. The legacy provider-level API key is cleared, just as when adding an account in
+Settings. If config changes while login is pending, the command fails without overwriting that edit;
+retry against the updated config. Success is reported only after the private, atomic config write succeeds.
+
+JSON mode emits newline-delimited objects (one object per event; `--pretty` has no effect):
+
+```json
+{"expiresIn":900,"status":"authorization_pending","userCode":"ABCD-EFGH","verificationURI":"https://github.com/login/device"}
+{"status":"authorized"}
+```
+
+Failures after argument parsing emit `{"status":"failed","error":"..."}` and exit nonzero. Neither output
+mode prints the access token or device code used for polling. This is an interactive setup command;
+`usage` and `serve` never start login automatically. `CODEXBAR_CONFIG` also applies to login.
 
 ## API keys
 
@@ -58,6 +86,7 @@ printf '%s' "$DEEPGRAM_API_KEY" | codexbar config set-api-key --provider deepgra
 printf '%s' "$GROQ_API_KEY" | codexbar config set-api-key --provider groq --stdin
 printf '%s' "$LLM_PROXY_API_KEY" | codexbar config set-api-key --provider llmproxy --stdin
 printf '%s' "$Z_AI_API_KEY" | codexbar config set-api-key --provider zai --stdin
+printf '%s' "$XAI_MANAGEMENT_API_KEY" | codexbar config set-api-key --provider xai --stdin
 ```
 
 For a z.ai team account:
@@ -73,12 +102,44 @@ printf '%s' "$Z_AI_API_KEY" | codexbar config set-api-key --provider zai --stdin
 Use single-line BigModel organization/project IDs; see [z.ai](zai.md).
 
 Only providers that consume config-backed API keys accept this command. Admin API providers may require a key with
-organization/usage permissions, not a normal inference key. Browser/OAuth providers such as Grok use their own provider
-sessions instead of an xAI API key for CodexBar's billing view, so enable them with
+organization/usage permissions, not a normal inference key. The `xai` provider reads xAI developer-platform billing
+with a Management key plus a team ID (set `workspaceID` in the provider entry, `XAI_TEAM_ID`, or the app settings
+pane); inference API keys are not accepted. The separate Grok provider tracks consumer Grok/SuperGrok subscriptions
+through its own browser/CLI session and takes no API key, so enable it with
 `codexbar config enable --provider grok`.
 
 LLM Proxy also needs a base URL. Use `LLM_PROXY_BASE_URL` for CLI runs, or add `"enterpriseHost"` to the provider entry
 in the CodexBar config file.
+
+## Manual cookies
+
+Store a provider's `Cookie:` request header the same way Settings does when you paste a manual cookie:
+
+```bash
+pbpaste | codexbar config set-cookie --provider claude --stdin
+```
+
+`set-cookie` writes `cookieHeader` and sets `cookieSource` to `manual`, so browser import is skipped for that provider.
+Like `set-api-key`, it trims the value, enables the provider unless you pass `--no-enable`, and accepts `--cookie <header>`
+for one-off scripts. The header must be a single line; see [Manual cookies](configuration.md#manual-cookies) for how to
+copy it. Only providers whose fetchers read a manual config cookie accept this command; output never includes the cookie.
+
+## Clearing credentials
+
+Remove a stored API key and manual cookie, like emptying those fields in Settings:
+
+```bash
+codexbar config clear-credential --provider claude
+codexbar config clear-credential --provider claude --cookie
+codexbar config clear-credential --provider openrouter --api-key
+```
+
+Without flags both `apiKey` and `cookieHeader` are removed; `--api-key` or `--cookie` limits it to one. Provider
+enablement, `source`, `cookieSource`, token accounts, and other fields are unchanged. Manual cookie mode stays
+selected after its header is cleared. To request browser discovery, choose Automatic explicitly in Settings.
+Saved accounts and environment credentials are not removed.
+JSON output lists the removed fields in `cleared` (`apiKey`, `cookieHeader`); when nothing was stored, `cleared`
+is empty and the config file is not written.
 
 ## Isolated config files
 
@@ -113,3 +174,7 @@ codexbar config dump --pretty
 ```
 
 `dump` prints normalized config, including providers omitted from a hand-written file.
+
+Missing, empty, or JSON-whitespace-only config files use defaults on macOS and Linux. `validate`, `dump`, and
+`usage` leave such files unchanged; the next `config enable`, `disable`, `set-api-key`, or `set-cookie` writes valid JSON.
+Malformed non-empty JSON still produces a config error and a nonzero exit without overwriting the file.

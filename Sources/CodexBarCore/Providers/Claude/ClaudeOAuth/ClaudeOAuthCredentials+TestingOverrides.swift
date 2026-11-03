@@ -2,12 +2,103 @@ import Foundation
 
 #if DEBUG
 extension ClaudeOAuthCredentialsStore {
-    nonisolated(unsafe) static var claudeKeychainDataOverride: Data?
-    nonisolated(unsafe) static var claudeKeychainFingerprintOverride: ClaudeKeychainFingerprint?
+    /// Mirrors the production ownership decision without installing a synthetic credential fixture.
+    static var directClaudeCodeKeychainAccessAllowedForTesting: Bool {
+        self.keychainAccessAllowed
+    }
+
+    @TaskLocal static var taskBeforeClaudeKeychainPromptLockOverride: (@Sendable () -> Void)?
+    @TaskLocal static var taskInteractiveClaudeKeychainReadOverride: (@Sendable () throws -> Data)?
+
+    static func withInteractiveClaudeKeychainReadOverridesForTesting<T>(
+        beforePromptLock: (@Sendable () -> Void)? = nil,
+        read: (@Sendable () throws -> Data)? = nil,
+        operation: () async throws -> T) async rethrows -> T
+    {
+        try await self.$taskBeforeClaudeKeychainPromptLockOverride.withValue(beforePromptLock) {
+            try await self.$taskInteractiveClaudeKeychainReadOverride.withValue(read) {
+                try await operation()
+            }
+        }
+    }
+
     @TaskLocal static var taskClaudeKeychainDataOverride: Data?
     @TaskLocal static var taskClaudeKeychainFingerprintOverride: ClaudeKeychainFingerprint?
     @TaskLocal static var taskMemoryCacheStoreOverride: MemoryCacheStore?
     @TaskLocal static var taskClaudeKeychainFingerprintStoreOverride: ClaudeKeychainFingerprintStore?
+    @TaskLocal static var taskPendingCacheClearStoreOverride: ClaudeOAuthPendingCacheClearStore?
+    @TaskLocal static var taskImplicitPendingCacheClearStoreOverride: ClaudeOAuthPendingCacheClearStore?
+    @TaskLocal static var taskDirectKeychainReadConsentRevocationMarkerStoreOverride:
+        DirectKeychainReadConsentRevocationMarkerStore?
+    @TaskLocal static var taskUseEnvironmentCredentialsURLForTesting = false
+
+    typealias OAuthCacheOperation = KeychainCacheStore.Operation
+    typealias OAuthCacheOperationRecorder = KeychainCacheStore.OperationRecorder
+
+    final class PendingCacheClearMemoryStore: ClaudeOAuthPendingCacheClearStore, @unchecked Sendable {
+        private let lock = NSLock()
+        private var unscopedPending: Bool
+        private var pendingProfileGenerations: [String: String] = [:]
+        private var legacyCleanupProfileIdentifiers: Set<String> = []
+        private var legacyRecheckProfileIdentifiers: Set<String> = []
+
+        init(isPending: Bool = false) {
+            self.unscopedPending = isPending
+        }
+
+        var isPending: Bool {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.unscopedPending ||
+                !self.pendingProfileGenerations.isEmpty ||
+                !self.legacyCleanupProfileIdentifiers.isEmpty ||
+                !self.legacyRecheckProfileIdentifiers.isEmpty
+        }
+
+        func isPending(profileIdentifier: String) -> Bool {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.unscopedPending ||
+                self.pendingProfileGenerations[profileIdentifier] != nil ||
+                self.legacyCleanupProfileIdentifiers.contains(profileIdentifier) ||
+                self.legacyRecheckProfileIdentifiers.contains(profileIdentifier)
+        }
+
+        func markPending(profileIdentifier: String) {
+            self.lock.lock()
+            self.pendingProfileGenerations[profileIdentifier] = UUID().uuidString
+            self.lock.unlock()
+        }
+
+        @discardableResult
+        func withCacheTransaction(
+            profileIdentifier: String,
+            includingGeneration operation: (inout Bool, inout Bool, inout Bool, inout String?) -> Void) -> Bool
+        {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            var profilePending = self.unscopedPending ||
+                self.pendingProfileGenerations[profileIdentifier] != nil
+            var legacyCleanupPending = self.unscopedPending ||
+                self.legacyCleanupProfileIdentifiers.contains(profileIdentifier)
+            var legacyRecheckPending = self.legacyRecheckProfileIdentifiers.contains(profileIdentifier)
+            var generation = self.unscopedPending ? nil : self.pendingProfileGenerations[profileIdentifier]
+            operation(&profilePending, &legacyCleanupPending, &legacyRecheckPending, &generation)
+            self.unscopedPending = false
+            self.pendingProfileGenerations[profileIdentifier] = profilePending ? generation ?? UUID().uuidString : nil
+            if legacyCleanupPending {
+                self.legacyCleanupProfileIdentifiers.insert(profileIdentifier)
+            } else {
+                self.legacyCleanupProfileIdentifiers.remove(profileIdentifier)
+            }
+            if legacyRecheckPending {
+                self.legacyRecheckProfileIdentifiers.insert(profileIdentifier)
+            } else {
+                self.legacyRecheckProfileIdentifiers.remove(profileIdentifier)
+            }
+            return true
+        }
+    }
 
     final class ClaudeKeychainFingerprintStore: @unchecked Sendable {
         var fingerprint: ClaudeKeychainFingerprint?
@@ -20,14 +111,30 @@ extension ClaudeOAuthCredentialsStore {
     final class MemoryCacheStore: @unchecked Sendable {
         var record: ClaudeOAuthCredentialRecord?
         var timestamp: Date?
+        var profileIdentifier: String?
+        var rejectedWrite: CacheWriteRecovery?
     }
 
-    static func setClaudeKeychainDataOverrideForTesting(_ data: Data?) {
-        self.claudeKeychainDataOverride = data
+    final class DirectKeychainReadConsentRevocationMarkerStore: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: String?
+
+        var marker: String? {
+            self.lock.withLock { self.value }
+        }
+
+        func advance() {
+            self.lock.withLock { self.value = UUID().uuidString }
+        }
     }
 
-    static func setClaudeKeychainFingerprintOverrideForTesting(_ fingerprint: ClaudeKeychainFingerprint?) {
-        self.claudeKeychainFingerprintOverride = fingerprint
+    static func withDirectKeychainReadConsentRevocationMarkerStoreForTesting<T>(
+        _ store: DirectKeychainReadConsentRevocationMarkerStore,
+        operation: () throws -> T) rethrows -> T
+    {
+        try self.$taskDirectKeychainReadConsentRevocationMarkerStoreOverride.withValue(store) {
+            try operation()
+        }
     }
 
     static func withClaudeKeychainOverridesForTesting<T>(
@@ -74,31 +181,104 @@ extension ClaudeOAuthCredentialsStore {
 
     static func withIsolatedMemoryCacheForTesting<T>(operation: () throws -> T) rethrows -> T {
         let store = MemoryCacheStore()
-        return try self.$taskMemoryCacheStoreOverride.withValue(store) {
-            try operation()
+        let preAlertStore = ClaudeOAuthKeychainPreAlertGate.StateStore()
+        return try ClaudeOAuthKeychainPreAlertGate.withStateStoreOverrideForTesting(preAlertStore) {
+            try self.$taskMemoryCacheStoreOverride.withValue(store) {
+                try self.withAutoIsolatedPendingCacheClearStoreIfNeededForTesting {
+                    try operation()
+                }
+            }
         }
     }
 
     static func withIsolatedMemoryCacheForTesting<T>(operation: () async throws -> T) async rethrows -> T {
         let store = MemoryCacheStore()
-        return try await self.$taskMemoryCacheStoreOverride.withValue(store) {
+        let preAlertStore = ClaudeOAuthKeychainPreAlertGate.StateStore()
+        return try await ClaudeOAuthKeychainPreAlertGate.withStateStoreOverrideForTesting(preAlertStore) {
+            try await self.$taskMemoryCacheStoreOverride.withValue(store) {
+                try await self.withAutoIsolatedPendingCacheClearStoreIfNeededForTesting {
+                    try await operation()
+                }
+            }
+        }
+    }
+
+    private static func withAutoIsolatedPendingCacheClearStoreIfNeededForTesting<T>(
+        operation: () throws -> T) rethrows -> T
+    {
+        if self.taskPendingCacheClearStoreOverride != nil {
+            return try operation()
+        }
+        let pendingStore = PendingCacheClearMemoryStore()
+        return try self.$taskPendingCacheClearStoreOverride.withValue(pendingStore) {
+            try operation()
+        }
+    }
+
+    private static func withAutoIsolatedPendingCacheClearStoreIfNeededForTesting<T>(
+        operation: () async throws -> T) async rethrows -> T
+    {
+        if self.taskPendingCacheClearStoreOverride != nil {
+            return try await operation()
+        }
+        let pendingStore = PendingCacheClearMemoryStore()
+        return try await self.$taskPendingCacheClearStoreOverride.withValue(pendingStore) {
             try await operation()
         }
     }
 
     final class CredentialsFileFingerprintStore: @unchecked Sendable {
-        var fingerprint: CredentialsFileFingerprint?
+        private var fingerprints: [String: CredentialsFileFingerprint] = [:]
+        private var quarantines: [String: CredentialsFileFingerprint] = [:]
+        private var legacyFingerprint: CredentialsFileFingerprint?
 
         init(fingerprint: CredentialsFileFingerprint? = nil) {
-            self.fingerprint = fingerprint
+            self.legacyFingerprint = fingerprint
         }
 
-        func load() -> CredentialsFileFingerprint? {
-            self.fingerprint
+        func load(
+            profileIdentifier: String,
+            historicalProfileIdentifier: String) -> CredentialsFileFingerprint?
+        {
+            if let fingerprint = self.fingerprints[profileIdentifier] {
+                if profileIdentifier == historicalProfileIdentifier {
+                    self.legacyFingerprint = nil
+                }
+                return fingerprint
+            }
+            guard profileIdentifier == historicalProfileIdentifier,
+                  let fingerprint = self.legacyFingerprint
+            else {
+                return nil
+            }
+            self.fingerprints[profileIdentifier] = fingerprint
+            self.legacyFingerprint = nil
+            return fingerprint
         }
 
-        func save(_ fingerprint: CredentialsFileFingerprint?) {
-            self.fingerprint = fingerprint
+        func save(
+            _ fingerprint: CredentialsFileFingerprint?,
+            profileIdentifier: String,
+            historicalProfileIdentifier: String)
+        {
+            if profileIdentifier == historicalProfileIdentifier {
+                self.legacyFingerprint = nil
+            }
+            self.fingerprints[profileIdentifier] = fingerprint
+        }
+
+        func loadQuarantine(profileIdentifier: String) -> CredentialsFileFingerprint? {
+            self.quarantines[profileIdentifier]
+        }
+
+        func saveQuarantine(_ fingerprint: CredentialsFileFingerprint?, profileIdentifier: String) {
+            self.quarantines[profileIdentifier] = fingerprint
+        }
+
+        func reset() {
+            self.fingerprints.removeAll()
+            self.quarantines.removeAll()
+            self.legacyFingerprint = nil
         }
     }
 
@@ -113,7 +293,6 @@ extension ClaudeOAuthCredentialsStore {
     @TaskLocal static var taskCredentialsFileFingerprintStoreOverride: CredentialsFileFingerprintStore?
     @TaskLocal static var taskSecurityCLIReadOverride: SecurityCLIReadOverride?
     @TaskLocal static var taskSecurityCLIReadAccountOverride: String?
-    nonisolated(unsafe) static var securityCLIReadOverride: SecurityCLIReadOverride?
 
     public struct TestingOverridesSnapshot: Sendable {
         let keychainOverrideStore: ClaudeKeychainOverrideStore?
@@ -125,28 +304,8 @@ extension ClaudeOAuthCredentialsStore {
         let credentialsFileFingerprintStore: CredentialsFileFingerprintStore?
         let securityCLIReadOverride: SecurityCLIReadOverride?
         let securityCLIReadAccountOverride: String?
-
-        init(
-            keychainOverrideStore: ClaudeKeychainOverrideStore?,
-            keychainData: Data?,
-            keychainFingerprint: ClaudeKeychainFingerprint?,
-            memoryCacheStore: MemoryCacheStore?,
-            fingerprintStore: ClaudeKeychainFingerprintStore?,
-            keychainAccessOverride: Bool?,
-            credentialsFileFingerprintStore: CredentialsFileFingerprintStore?,
-            securityCLIReadOverride: SecurityCLIReadOverride?,
-            securityCLIReadAccountOverride: String?)
-        {
-            self.keychainOverrideStore = keychainOverrideStore
-            self.keychainData = keychainData
-            self.keychainFingerprint = keychainFingerprint
-            self.memoryCacheStore = memoryCacheStore
-            self.fingerprintStore = fingerprintStore
-            self.keychainAccessOverride = keychainAccessOverride
-            self.credentialsFileFingerprintStore = credentialsFileFingerprintStore
-            self.securityCLIReadOverride = securityCLIReadOverride
-            self.securityCLIReadAccountOverride = securityCLIReadAccountOverride
-        }
+        let pendingCacheClearStore: ClaudeOAuthPendingCacheClearStore?
+        let oauthCacheOperationRecorder: OAuthCacheOperationRecorder?
     }
 
     static func withKeychainAccessOverrideForTesting<T>(
@@ -167,7 +326,7 @@ extension ClaudeOAuthCredentialsStore {
         }
     }
 
-    fileprivate static func withCredentialsFileFingerprintStoreOverrideForTesting<T>(
+    static func withCredentialsFileFingerprintStoreOverrideForTesting<T>(
         _ store: CredentialsFileFingerprintStore?,
         operation: () throws -> T) rethrows -> T
     {
@@ -176,7 +335,7 @@ extension ClaudeOAuthCredentialsStore {
         }
     }
 
-    fileprivate static func withCredentialsFileFingerprintStoreOverrideForTesting<T>(
+    static func withCredentialsFileFingerprintStoreOverrideForTesting<T>(
         _ store: CredentialsFileFingerprintStore?,
         operation: () async throws -> T) async rethrows -> T
     {
@@ -192,6 +351,63 @@ extension ClaudeOAuthCredentialsStore {
         return try self.$taskCredentialsFileFingerprintStoreOverride.withValue(store) {
             try operation()
         }
+    }
+
+    /// Test-only opt-in for fixtures that supply an explicit temporary Claude profile directory.
+    /// Default test execution still resolves the normal credentials path to an isolated nonexistent file.
+    static func withEnvironmentCredentialsURLForTesting<T>(operation: () throws -> T) rethrows -> T {
+        try self.$taskUseEnvironmentCredentialsURLForTesting.withValue(true) {
+            try operation()
+        }
+    }
+
+    static func withEnvironmentCredentialsURLForTesting<T>(
+        operation: () async throws -> T) async rethrows -> T
+    {
+        try await self.$taskUseEnvironmentCredentialsURLForTesting.withValue(true) {
+            try await operation()
+        }
+    }
+
+    static func withPendingCacheClearStoreOverrideForTesting<T>(
+        _ store: ClaudeOAuthPendingCacheClearStore?,
+        operation: () throws -> T) rethrows -> T
+    {
+        try self.$taskPendingCacheClearStoreOverride.withValue(store) {
+            try operation()
+        }
+    }
+
+    static func withPendingCacheClearStoreOverrideForTesting<T>(
+        _ store: ClaudeOAuthPendingCacheClearStore?,
+        operation: () async throws -> T) async rethrows -> T
+    {
+        try await self.$taskPendingCacheClearStoreOverride.withValue(store) {
+            try await operation()
+        }
+    }
+
+    static func withImplicitPendingCacheClearStoreOverrideForTesting<T>(
+        _ store: ClaudeOAuthPendingCacheClearStore?,
+        operation: () throws -> T) rethrows -> T
+    {
+        try self.$taskImplicitPendingCacheClearStoreOverride.withValue(store) {
+            try operation()
+        }
+    }
+
+    static func withOAuthCacheOperationRecorderForTesting<T>(
+        _ recorder: OAuthCacheOperationRecorder?,
+        operation: () throws -> T) rethrows -> T
+    {
+        try KeychainCacheStore.withOperationRecorderForTesting(recorder, operation: operation)
+    }
+
+    static func withOAuthCacheOperationRecorderForTesting<T>(
+        _ recorder: OAuthCacheOperationRecorder?,
+        operation: () async throws -> T) async rethrows -> T
+    {
+        try await KeychainCacheStore.withOperationRecorderForTesting(recorder, operation: operation)
     }
 
     static func withIsolatedCredentialsFileTrackingForTesting<T>(
@@ -222,7 +438,7 @@ extension ClaudeOAuthCredentialsStore {
     }
 
     static func currentSecurityCLIReadOverrideForTesting() -> SecurityCLIReadOverride? {
-        self.taskSecurityCLIReadOverride ?? self.securityCLIReadOverride
+        self.taskSecurityCLIReadOverride
     }
 
     static func withSecurityCLIReadAccountOverrideForTesting<T>(
@@ -269,35 +485,42 @@ extension ClaudeOAuthCredentialsStore {
             keychainAccessOverride: self.taskKeychainAccessOverride,
             credentialsFileFingerprintStore: self.taskCredentialsFileFingerprintStoreOverride,
             securityCLIReadOverride: self.taskSecurityCLIReadOverride,
-            securityCLIReadAccountOverride: self.taskSecurityCLIReadAccountOverride)
+            securityCLIReadAccountOverride: self.taskSecurityCLIReadAccountOverride,
+            pendingCacheClearStore: self.taskPendingCacheClearStoreOverride,
+            oauthCacheOperationRecorder: KeychainCacheStore.currentOperationRecorderForTesting)
     }
 
     public static func withTestingOverridesSnapshotForTask<T>(
         _ snapshot: TestingOverridesSnapshot,
         operation: () async throws -> T) async rethrows -> T
     {
-        try await self.$taskClaudeKeychainOverrideStore.withValue(snapshot.keychainOverrideStore) {
-            try await self.$taskClaudeKeychainDataOverride.withValue(snapshot.keychainData) {
-                try await self.$taskClaudeKeychainFingerprintOverride.withValue(snapshot.keychainFingerprint) {
-                    try await self.$taskMemoryCacheStoreOverride.withValue(snapshot.memoryCacheStore) {
-                        try await self.$taskClaudeKeychainFingerprintStoreOverride
-                            .withValue(snapshot.fingerprintStore) {
-                                try await self.$taskKeychainAccessOverride.withValue(snapshot.keychainAccessOverride) {
-                                    try await self.$taskCredentialsFileFingerprintStoreOverride.withValue(
-                                        snapshot.credentialsFileFingerprintStore)
-                                    {
-                                        try await self.$taskSecurityCLIReadOverride.withValue(
-                                            snapshot.securityCLIReadOverride)
-                                        {
-                                            try await self.$taskSecurityCLIReadAccountOverride.withValue(
-                                                snapshot.securityCLIReadAccountOverride)
-                                            {
-                                                try await operation()
+        try await self.$taskPendingCacheClearStoreOverride.withValue(snapshot.pendingCacheClearStore) {
+            try await KeychainCacheStore.withOperationRecorderForTesting(snapshot.oauthCacheOperationRecorder) {
+                try await self.$taskClaudeKeychainOverrideStore.withValue(snapshot.keychainOverrideStore) {
+                    try await self.$taskClaudeKeychainDataOverride.withValue(snapshot.keychainData) {
+                        try await self.$taskClaudeKeychainFingerprintOverride.withValue(snapshot.keychainFingerprint) {
+                            try await self.$taskMemoryCacheStoreOverride.withValue(snapshot.memoryCacheStore) {
+                                try await self.$taskClaudeKeychainFingerprintStoreOverride
+                                    .withValue(snapshot.fingerprintStore) {
+                                        try await self.$taskKeychainAccessOverride
+                                            .withValue(snapshot.keychainAccessOverride) {
+                                                try await self.$taskCredentialsFileFingerprintStoreOverride.withValue(
+                                                    snapshot.credentialsFileFingerprintStore)
+                                                {
+                                                    try await self.$taskSecurityCLIReadOverride.withValue(
+                                                        snapshot.securityCLIReadOverride)
+                                                    {
+                                                        try await self.$taskSecurityCLIReadAccountOverride.withValue(
+                                                            snapshot.securityCLIReadAccountOverride)
+                                                        {
+                                                            try await operation()
+                                                        }
+                                                    }
+                                                }
                                             }
-                                        }
                                     }
-                                }
                             }
+                        }
                     }
                 }
             }
@@ -308,35 +531,37 @@ extension ClaudeOAuthCredentialsStore {
         _ snapshot: TestingOverridesSnapshot,
         operation: () throws -> T) rethrows -> T
     {
-        try self.$taskClaudeKeychainOverrideStore.withValue(snapshot.keychainOverrideStore) {
-            try self.$taskClaudeKeychainDataOverride.withValue(snapshot.keychainData) {
-                try self.$taskClaudeKeychainFingerprintOverride.withValue(snapshot.keychainFingerprint) {
-                    try self.$taskMemoryCacheStoreOverride.withValue(snapshot.memoryCacheStore) {
-                        try self.$taskClaudeKeychainFingerprintStoreOverride.withValue(snapshot.fingerprintStore) {
-                            try self.$taskKeychainAccessOverride.withValue(snapshot.keychainAccessOverride) {
-                                try self.$taskCredentialsFileFingerprintStoreOverride.withValue(
-                                    snapshot.credentialsFileFingerprintStore)
-                                {
-                                    try self.$taskSecurityCLIReadOverride.withValue(
-                                        snapshot.securityCLIReadOverride)
-                                    {
-                                        try self.$taskSecurityCLIReadAccountOverride.withValue(
-                                            snapshot.securityCLIReadAccountOverride)
-                                        {
-                                            try operation()
-                                        }
+        try self.$taskPendingCacheClearStoreOverride.withValue(snapshot.pendingCacheClearStore) {
+            try KeychainCacheStore.withOperationRecorderForTesting(snapshot.oauthCacheOperationRecorder) {
+                try self.$taskClaudeKeychainOverrideStore.withValue(snapshot.keychainOverrideStore) {
+                    try self.$taskClaudeKeychainDataOverride.withValue(snapshot.keychainData) {
+                        try self.$taskClaudeKeychainFingerprintOverride.withValue(snapshot.keychainFingerprint) {
+                            try self.$taskMemoryCacheStoreOverride.withValue(snapshot.memoryCacheStore) {
+                                try self.$taskClaudeKeychainFingerprintStoreOverride
+                                    .withValue(snapshot.fingerprintStore) {
+                                        try self.$taskKeychainAccessOverride
+                                            .withValue(snapshot.keychainAccessOverride) {
+                                                try self.$taskCredentialsFileFingerprintStoreOverride.withValue(
+                                                    snapshot.credentialsFileFingerprintStore)
+                                                {
+                                                    try self.$taskSecurityCLIReadOverride.withValue(
+                                                        snapshot.securityCLIReadOverride)
+                                                    {
+                                                        try self.$taskSecurityCLIReadAccountOverride.withValue(
+                                                            snapshot.securityCLIReadAccountOverride)
+                                                        {
+                                                            try operation()
+                                                        }
+                                                    }
+                                                }
+                                            }
                                     }
-                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
-
-    static func setSecurityCLIReadOverrideForTesting(_ readOverride: SecurityCLIReadOverride?) {
-        self.securityCLIReadOverride = readOverride
     }
 }
 #endif

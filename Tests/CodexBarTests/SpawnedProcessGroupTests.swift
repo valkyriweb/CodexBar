@@ -8,6 +8,112 @@ import Glibc
 #endif
 
 struct SpawnedProcessGroupTests {
+    #if DEBUG
+    @Test
+    func `owned descriptor take discard and deinit are one shot`() throws {
+        func makePipe() throws -> (read: Int32, write: Int32) {
+            var descriptors = [Int32](repeating: -1, count: 2)
+            try #require(pipe(&descriptors) == 0)
+            // Concurrent test children must not keep this fixture's writer alive.
+            try #require(fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) == 0)
+            return (descriptors[0], descriptors[1])
+        }
+
+        func expectEOF(_ readDescriptor: Int32) {
+            let flags = fcntl(readDescriptor, F_GETFL)
+            #expect(flags >= 0)
+            #expect(fcntl(readDescriptor, F_SETFL, flags | O_NONBLOCK) == 0)
+            var byte: UInt8 = 0
+            #expect(read(readDescriptor, &byte, 1) == 0)
+        }
+
+        let transferredPipe = try makePipe()
+        defer { _ = close(transferredPipe.read) }
+        let transferred = SpawnedProcessGroup._test_ownedDescriptorTakeOnce(
+            ownedFileDescriptor: transferredPipe.write)
+        let transferredDescriptor = try #require(transferred.first)
+        #expect(transferred.second == nil)
+        #expect(!transferred.discardAfterTake)
+        _ = close(transferredDescriptor)
+        expectEOF(transferredPipe.read)
+
+        let discardedPipe = try makePipe()
+        defer { _ = close(discardedPipe.read) }
+        let discarded = SpawnedProcessGroup._test_ownedDescriptorDiscardTwice(
+            ownedFileDescriptor: discardedPipe.write)
+        #expect(discarded.first)
+        #expect(!discarded.second)
+        expectEOF(discardedPipe.read)
+
+        let deinitPipe = try makePipe()
+        defer { _ = close(deinitPipe.read) }
+        SpawnedProcessGroup._test_ownedDescriptorDeinit(ownedFileDescriptor: deinitPipe.write)
+        expectEOF(deinitPipe.read)
+    }
+
+    @Test
+    func `PTY descriptor reservation failure prevents child launch`() throws {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexbar-pty-reservation-\(UUID().uuidString).marker")
+        defer { try? FileManager.default.removeItem(at: marker) }
+
+        var primaryFD: Int32 = -1
+        var secondaryFD: Int32 = -1
+        try #require(openpty(&primaryFD, &secondaryFD, nil, nil, nil) == 0)
+        defer {
+            _ = close(primaryFD)
+            _ = close(secondaryFD)
+        }
+
+        do {
+            _ = try SpawnedProcessGroup.withPTYPrimaryDescriptorReservationFailureForTesting {
+                try SpawnedProcessGroup.launchPTY(
+                    binary: "/usr/bin/python3",
+                    arguments: ["-c", "import pathlib,sys; pathlib.Path(sys.argv[1]).touch()", marker.path],
+                    environment: ProcessInfo.processInfo.environment,
+                    workingDirectory: nil,
+                    fileDescriptors: (primary: primaryFD, secondary: secondaryFD))
+            }
+            Issue.record("Expected PTY descriptor reservation to fail")
+        } catch let SpawnedProcessGroup.LaunchError.setupFailed(details) {
+            #expect(details == "reserve PTY primary descriptor")
+        } catch {
+            Issue.record("Unexpected launch error: \(error)")
+        }
+        #expect(!FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    @Test
+    func `output holder cleanup lease expires closes descriptor and disarms cleanup`() throws {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        try #require(pipe(&descriptors) == 0)
+        let readDescriptor = descriptors[0]
+        let leasedWriteDescriptor = descriptors[1]
+        defer { _ = close(readDescriptor) }
+        try #require(fcntl(leasedWriteDescriptor, F_SETFD, FD_CLOEXEC) == 0)
+
+        let now = DispatchTime(uptimeNanoseconds: 1_000_000_000)
+        let result = SpawnedProcessGroup._test_outputHolderCleanupLeaseExpiry(
+            ownedFileDescriptor: leasedWriteDescriptor,
+            maxLifetime: 0.05,
+            waitTimeout: 30,
+            now: now,
+            schedule: { deadline, expire in
+                #expect(deadline.uptimeNanoseconds == now.uptimeNanoseconds + 50_000_000)
+                #expect(fcntl(leasedWriteDescriptor, F_GETFD) >= 0)
+                expire()
+            })
+
+        #expect(result.completed)
+        #expect(!result.active)
+        let flags = fcntl(readDescriptor, F_GETFL)
+        #expect(flags >= 0)
+        #expect(fcntl(readDescriptor, F_SETFL, flags | O_NONBLOCK) == 0)
+        var byte: UInt8 = 0
+        #expect(read(readDescriptor, &byte, 1) == 0)
+    }
+    #endif
+
     @Test
     func `pipe cleanup preserves standard descriptors`() {
         let descriptors = SpawnedProcessGroup.pipeDescriptorsToClose([0, 1, 2, 3, 4, 3])
@@ -72,6 +178,81 @@ struct SpawnedProcessGroupTests {
     }
 
     @Test
+    func `launch clears the parent thread signal mask`() throws {
+        var blockedMask = sigset_t()
+        var previousMask = sigset_t()
+        sigemptyset(&blockedMask)
+        sigaddset(&blockedMask, SIGTERM)
+        try #require(pthread_sigmask(SIG_BLOCK, &blockedMask, &previousMask) == 0)
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        let script = """
+        import signal
+        import sys
+
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        sys.exit(1 if signal.SIGTERM in blocked else 0)
+        """
+        let process = try SpawnedProcessGroup.launch(
+            binary: "/usr/bin/python3",
+            arguments: ["-c", script],
+            environment: ProcessInfo.processInfo.environment,
+            stdoutPipe: stdoutPipe,
+            stderrPipe: stderrPipe)
+
+        while process.isRunning {
+            usleep(20000)
+        }
+        process.finishSynchronously()
+
+        #expect(process.terminationStatus == 0)
+    }
+
+    @Test
+    func `PTY launch clears the parent thread signal mask`() throws {
+        var blockedMask = sigset_t()
+        var previousMask = sigset_t()
+        sigemptyset(&blockedMask)
+        sigaddset(&blockedMask, SIGTERM)
+        try #require(pthread_sigmask(SIG_BLOCK, &blockedMask, &previousMask) == 0)
+        defer { pthread_sigmask(SIG_SETMASK, &previousMask, nil) }
+
+        var primaryFD: Int32 = -1
+        var secondaryFD: Int32 = -1
+        try #require(openpty(&primaryFD, &secondaryFD, nil, nil, nil) == 0)
+        let primaryHandle = FileHandle(fileDescriptor: primaryFD, closeOnDealloc: true)
+        let secondaryHandle = FileHandle(fileDescriptor: secondaryFD, closeOnDealloc: true)
+        defer {
+            try? primaryHandle.close()
+            try? secondaryHandle.close()
+        }
+
+        let script = """
+        import signal
+        import sys
+
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        sys.exit(1 if signal.SIGTERM in blocked else 0)
+        """
+        let process = try SpawnedProcessGroup.launchPTY(
+            binary: "/usr/bin/python3",
+            arguments: ["-c", script],
+            environment: ProcessInfo.processInfo.environment,
+            workingDirectory: nil,
+            fileDescriptors: (primary: primaryFD, secondary: secondaryFD))
+        try? secondaryHandle.close()
+
+        while process.isRunning {
+            usleep(20000)
+        }
+        process.finishSynchronously()
+
+        #expect(process.terminationStatus == 0)
+    }
+
+    @Test
     func `launch closes unrelated parent descriptors`() async throws {
         let sourceFD = open("/dev/null", O_RDONLY)
         let inheritedFD = fcntl(sourceFD, F_DUPFD, 200)
@@ -112,19 +293,19 @@ struct SpawnedProcessGroupTests {
         let script = """
         import subprocess
         import sys
-        import time
+        import signal
 
         child = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
-                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+                "import os,signal,sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "open(sys.argv[1], 'w').write(str(os.getpid())); \(KiroProcessTestSupport.pythonOwnerBoundedHold())",
+                sys.argv[1],
             ],
             start_new_session=True,
         )
-        with open(sys.argv[1], "w") as handle:
-            handle.write(str(child.pid))
-        time.sleep(30)
+        signal.pause()
         """
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -135,28 +316,27 @@ struct SpawnedProcessGroupTests {
             stdoutPipe: stdoutPipe,
             stderrPipe: stderrPipe)
 
-        var childPID: pid_t?
-        for _ in 0..<500 {
-            if let text = try? String(contentsOf: childPIDFile, encoding: .utf8),
-               let parsedPID = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
-            {
-                childPID = parsedPID
-                break
-            }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        guard let escapedPID = childPID else {
+        let escapedPID: pid_t
+        do {
+            escapedPID = try await KiroProcessTestSupport.waitForPID(in: childPIDFile)
+        } catch {
             await process.terminate(grace: 0)
-            Issue.record("Timed out waiting for escaped child PID")
-            return
+            throw error
         }
         defer { _ = kill(escapedPID, SIGKILL) }
 
-        let start = Date()
-        await process.terminate(grace: 0.3)
-        let elapsed = Date().timeIntervalSince(start)
+        let ticks = LockIsolated(0)
+        await process.terminate(
+            grace: 0.3,
+            now: { Date(timeIntervalSinceReferenceDate: Double(ticks.value) / 10) },
+            sleep: { duration in
+                #expect(duration == .milliseconds(20))
+                #expect(kill(escapedPID, 0) == 0, "SIGKILL must not precede the grace deadline")
+                ticks.setValue(ticks.value + 1)
+                await Task.yield()
+            })
 
-        #expect(elapsed >= 0.25, "Termination should honor the grace period before SIGKILL")
+        #expect(ticks.value == 3)
         #expect(kill(escapedPID, 0) == -1)
     }
 
@@ -307,6 +487,7 @@ struct SpawnedProcessGroupTests {
 
         let script = """
         import os
+        import select
         import signal
         import sys
         import time
@@ -327,13 +508,16 @@ struct SpawnedProcessGroupTests {
                     os.write(writer, b"1")
                     os.close(writer)
                     counter = 1
-                    while True:
+                    deadline = time.monotonic() + \(KiroProcessTestSupport.fixtureHoldLimit)
+                    while time.monotonic() < deadline:
                         counter += 1
                         heartbeat.seek(0)
                         heartbeat.write(str(counter))
                         heartbeat.truncate()
                         heartbeat.flush()
-                        time.sleep(0.02)
+                        if \(KiroProcessTestSupport.pythonOwnerExitWait(timeout: 0.02)):
+                            os._exit(0)
+                    os._exit(0)
             os.close(writer)
             os.read(reader, 1)
             os.close(reader)
@@ -446,6 +630,7 @@ struct SpawnedProcessGroupTests {
 
         let script = """
         import os
+        import select
         import signal
         import sys
         import time
@@ -459,13 +644,15 @@ struct SpawnedProcessGroupTests {
                 handle.write(str(os.getpid()))
             counter = 0
             with open(sys.argv[2], "w") as heartbeat:
-                while True:
+                deadline = time.monotonic() + \(KiroProcessTestSupport.fixtureHoldLimit)
+                while time.monotonic() < deadline:
                     counter += 1
                     heartbeat.seek(0)
                     heartbeat.write(str(counter))
                     heartbeat.truncate()
                     heartbeat.flush()
-                    time.sleep(0.02)
+                    if \(KiroProcessTestSupport.pythonOwnerExitWait(timeout: 0.02)):
+                        os._exit(0)
             os._exit(0)
         """
         let stdoutPipe = Pipe()
@@ -515,8 +702,10 @@ struct SpawnedProcessGroupTests {
         #expect(heartbeatAfterSettle == heartbeatAfterCleanup)
     }
 
-    @Test
-    func `normal exit cleanup catches helper spawned during SIGTERM`() async throws {
+    @Test(arguments: [0, 1000])
+    func `normal exit cleanup catches helper spawned during SIGTERM`(
+        firstHeartbeatDelayMilliseconds: Int) async throws
+    {
         let readyFile = FileManager.default.temporaryDirectory
             .appendingPathComponent("codexbar-process-group-post-exit-\(UUID().uuidString).ready")
         let childPIDFile = readyFile.appendingPathExtension("pid")
@@ -526,9 +715,11 @@ struct SpawnedProcessGroupTests {
             try? FileManager.default.removeItem(at: childPIDFile)
             try? FileManager.default.removeItem(at: heartbeatFile)
         }
+        try "0".write(to: heartbeatFile, atomically: true, encoding: .utf8)
 
         let script = """
         import os
+        import select
         import signal
         import sys
         import time
@@ -543,21 +734,27 @@ struct SpawnedProcessGroupTests {
                 if child == 0:
                     os.close(reader)
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                    with open(sys.argv[2], "w") as handle:
-                        handle.write(str(os.getpid()))
+                    delay = float(sys.argv[4]) / 1000
+                    if delay > 0:
+                        time.sleep(delay)
                     with open(sys.argv[3], "w") as heartbeat:
                         heartbeat.write("1")
                         heartbeat.flush()
                         os.write(writer, b"1")
                         os.close(writer)
                         counter = 1
-                        while True:
+                        deadline = time.monotonic() + \(KiroProcessTestSupport.fixtureHoldLimit)
+                        while time.monotonic() < deadline:
                             counter += 1
                             heartbeat.seek(0)
                             heartbeat.write(str(counter))
                             heartbeat.truncate()
                             heartbeat.flush()
-                            time.sleep(0.02)
+                            if \(KiroProcessTestSupport.pythonOwnerExitWait(timeout: 0.02)):
+                                os._exit(0)
+                        os._exit(0)
+                with open(sys.argv[2], "w") as handle:
+                    handle.write(str(child))
                 os.close(writer)
                 os.read(reader, 1)
                 os.close(reader)
@@ -578,7 +775,10 @@ struct SpawnedProcessGroupTests {
         let stderrPipe = Pipe()
         let process = try SpawnedProcessGroup.launch(
             binary: "/usr/bin/python3",
-            arguments: ["-c", script, readyFile.path, childPIDFile.path, heartbeatFile.path],
+            arguments: [
+                "-c", script, readyFile.path, childPIDFile.path, heartbeatFile.path,
+                String(firstHeartbeatDelayMilliseconds),
+            ],
             environment: ProcessInfo.processInfo.environment,
             stdoutPipe: stdoutPipe,
             stderrPipe: stderrPipe)
@@ -589,7 +789,6 @@ struct SpawnedProcessGroupTests {
         #expect(FileManager.default.fileExists(atPath: readyFile.path))
 
         await process.terminateResidualProcesses(grace: 0.2)
-        await process.finish()
 
         var childPID: pid_t?
         for _ in 0..<100 {
@@ -601,10 +800,23 @@ struct SpawnedProcessGroupTests {
             }
             try await Task.sleep(for: .milliseconds(20))
         }
-        let resolvedChildPID = try #require(childPID)
-        defer { _ = kill(resolvedChildPID, SIGKILL) }
+        // Capture a surviving child before reaping the root releases its process-group identity.
+        let childIdentity = childPID.flatMap { pid -> TTYProcessTreeTerminator.ProcessIdentity? in
+            guard let identity = TTYProcessTreeTerminator.processIdentity(for: pid),
+                  getpgid(pid) == process.processGroup,
+                  TTYProcessTreeTerminator.isCurrent(identity)
+            else { return nil }
+            return identity
+        }
+        await process.finish()
+        _ = try #require(childPID)
+        defer {
+            if let childIdentity, TTYProcessTreeTerminator.isCurrent(childIdentity) {
+                _ = kill(childIdentity.pid, SIGKILL)
+            }
+        }
         let heartbeatAfterCleanup = try String(contentsOf: heartbeatFile, encoding: .utf8)
-        try await Task.sleep(for: .milliseconds(200))
+        try await Task.sleep(for: .milliseconds(firstHeartbeatDelayMilliseconds + 200))
         let heartbeatAfterSettle = try String(contentsOf: heartbeatFile, encoding: .utf8)
         #expect(heartbeatAfterSettle == heartbeatAfterCleanup)
     }

@@ -17,16 +17,6 @@ struct ClaudeUsageTests {
         }
     }
 
-    private static func makeOAuthUsageResponse() throws -> OAuthUsageResponse {
-        let json = """
-        {
-          "five_hour": { "utilization": 7, "resets_at": "2025-12-23T16:00:00.000Z" },
-          "seven_day": { "utilization": 21, "resets_at": "2025-12-29T23:00:00.000Z" }
-        }
-        """
-        return try ClaudeOAuthUsageFetcher._decodeUsageResponseForTesting(Data(json.utf8))
-    }
-
     @Test
     func `parses usage JSON with sonnet limit`() {
         let json = """
@@ -40,11 +30,11 @@ struct ClaudeUsageTests {
         let data = Data(json.utf8)
         let snap = ClaudeUsageFetcher.parse(json: data)
         #expect(snap != nil)
-        #expect(snap?.primary.usedPercent == 1)
-        #expect(snap?.primary.windowMinutes == 300)
+        #expect(snap?.primary?.usedPercent == 1)
+        #expect(snap?.primary?.windowMinutes == 300)
         #expect(snap?.secondary?.usedPercent == 8)
         #expect(snap?.secondary?.windowMinutes == 10080)
-        #expect(snap?.primary.resetDescription == "11am (Europe/Vienna)")
+        #expect(snap?.primary?.resetDescription == "11am (Europe/Vienna)")
     }
 
     @Test
@@ -99,7 +89,7 @@ struct ClaudeUsageTests {
 
         #expect(await loadCounter.current() == 2)
         #expect(await delegatedCounter.current() == 1)
-        #expect(snapshot.primary.usedPercent == 7)
+        #expect(snapshot.primary?.usedPercent == 7)
         #expect(snapshot.secondary?.usedPercent == 21)
     }
 
@@ -212,7 +202,7 @@ struct ClaudeUsageTests {
     }
 
     @Test
-    func `oauth delegated retry auto mode attempted failed then non interactive reload succeeds`() async throws {
+    func `oauth delegated retry on user action retains prompt capable repair`() async throws {
         let loadCounter = AsyncCounter()
         let delegatedCounter = AsyncCounter()
         let usageResponse = try Self.makeOAuthUsageResponse()
@@ -268,12 +258,10 @@ struct ClaudeUsageTests {
 
         #expect(await loadCounter.current() == 2)
         #expect(await delegatedCounter.current() == 1)
-        #expect(snapshot.primary.usedPercent == 7)
+        #expect(snapshot.primary?.usedPercent == 7)
 
-        // User-initiated repair: if the delegated refresh couldn't sync silently, we may allow an interactive prompt
-        // on the retry to help recovery.
         #expect(flags.allowKeychainPromptFlags.count == 2)
-        #expect(flags.allowKeychainPromptFlags[1] == true)
+        #expect(flags.allowKeychainPromptFlags == [true, true])
     }
 
     @Test
@@ -327,6 +315,8 @@ struct ClaudeUsageTests {
                 return
             }
             #expect(message.contains("background repair is suppressed"))
+            #expect(message.contains("Click Refresh in the CodexBar menu"))
+            #expect(!message.contains("Open the CodexBar menu or"))
         } catch {
             Issue.record("Expected ClaudeUsageError, got \(error)")
         }
@@ -396,10 +386,9 @@ struct ClaudeUsageTests {
     }
 
     @Test
-    func `oauth bootstrap only on user action background startup allows interactive read when no cache`() async throws {
+    func `oauth bootstrap only on user action background startup does not allow interactive read`() async throws {
         final class FlagBox: @unchecked Sendable {
             var allowKeychainPromptFlags: [Bool] = []
-            var allowBackgroundPromptBootstrapFlags: [Bool] = []
         }
 
         let flags = FlagBox()
@@ -408,8 +397,7 @@ struct ClaudeUsageTests {
             browserDetection: BrowserDetection(cacheTTL: 0),
             environment: [:],
             dataSource: .oauth,
-            oauthKeychainPromptCooldownEnabled: true,
-            allowStartupBootstrapPrompt: true)
+            oauthKeychainPromptCooldownEnabled: true)
 
         let fetchOverride: (@Sendable (String, Bool) async throws -> OAuthUsageResponse)? = { _, _ in usageResponse }
         let loadCredsOverride: (@Sendable (
@@ -417,7 +405,6 @@ struct ClaudeUsageTests {
             Bool,
             Bool) async throws -> ClaudeOAuthCredentials)? = { _, allowKeychainPrompt, _ in
             flags.allowKeychainPromptFlags.append(allowKeychainPrompt)
-            flags.allowBackgroundPromptBootstrapFlags.append(ClaudeOAuthCredentialsStore.allowBackgroundPromptBootstrap)
             return ClaudeOAuthCredentials(
                 accessToken: "fresh-token",
                 refreshToken: "refresh-token",
@@ -440,9 +427,8 @@ struct ClaudeUsageTests {
             }
         }
 
-        #expect(flags.allowKeychainPromptFlags == [true])
-        #expect(flags.allowBackgroundPromptBootstrapFlags == [true])
-        #expect(snapshot.primary.usedPercent == 7)
+        #expect(flags.allowKeychainPromptFlags == [false])
+        #expect(snapshot.primary?.usedPercent == 7)
     }
 
     @Test
@@ -502,7 +488,7 @@ struct ClaudeUsageTests {
 
         #expect(await loadCounter.current() == 2)
         #expect(await delegatedCounter.current() == 1)
-        #expect(snapshot.primary.usedPercent == 7)
+        #expect(snapshot.primary?.usedPercent == 7)
         #expect(flags.allowKeychainPromptFlags.allSatisfy { !$0 })
     }
 
@@ -517,7 +503,7 @@ struct ClaudeUsageTests {
         let data = Data(json.utf8)
         let snap = ClaudeUsageFetcher.parse(json: data)
         #expect(snap != nil)
-        #expect(snap?.primary.usedPercent == 4)
+        #expect(snap?.primary?.usedPercent == 4)
         #expect(snap?.secondary == nil)
     }
 
@@ -573,8 +559,12 @@ struct ClaudeUsageTests {
                 "session_5h": ["pct_used": 0, "resets": ""],
                 "week_all_models": ["pct_used": 0, "resets": ""],
             ] as [String: Any]
-            if let email = entry["email"] { payload["account_email"] = email }
-            if let org = entry["org"] { payload["account_org"] = org }
+            if let email = entry["email"] {
+                payload["account_email"] = email
+            }
+            if let org = entry["org"] {
+                payload["account_org"] = org
+            }
             let data = try JSONSerialization.data(withJSONObject: payload)
             let snap = ClaudeUsageFetcher.parse(json: data)
             let emailRaw: String? = entry["email"] ?? String?.none
@@ -590,7 +580,7 @@ struct ClaudeUsageTests {
 
     @Test
     func `live claude fetch PTY`() async throws {
-        guard ProcessInfo.processInfo.environment["LIVE_CLAUDE_FETCH"] == "1" else {
+        guard Self.allowsLiveClaudeFetch(environment: ProcessInfo.processInfo.environment) else {
             return
         }
         let fetcher = ClaudeUsageFetcher(browserDetection: BrowserDetection(cacheTTL: 0), dataSource: .cli)
@@ -600,15 +590,15 @@ struct ClaudeUsageTests {
             let weeklyUsed = snap.secondary?.usedPercent ?? -1
             let email = snap.accountEmail ?? "nil"
             let org = snap.accountOrganization ?? "nil"
-            print(
+            try print(
                 """
                 Live Claude usage (PTY):
-                session used \(snap.primary.usedPercent)%
+                session used \(#require(snap.primary).usedPercent)%
                 week used \(weeklyUsed)% 
                 opus \(opusUsed)% 
                 email \(email) org \(org)
                 """)
-            #expect(snap.primary.usedPercent >= 0)
+            #expect(try #require(snap.primary).usedPercent >= 0)
         } catch {
             // Dump raw CLI text captured via `script` to help debug.
             let raw = try Self.captureClaudeUsageRaw(timeout: 15)
@@ -635,7 +625,9 @@ struct ClaudeUsageTests {
 
         try process.run()
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-            if process.isRunning { process.terminate() }
+            if process.isRunning {
+                process.terminate()
+            }
         }
         process.waitUntilExit()
 
@@ -655,15 +647,15 @@ struct ClaudeUsageTests {
         let snap = try await fetcher.loadLatestUsage()
         let weeklyUsed = snap.secondary?.usedPercent ?? -1
         let opusUsed = snap.opus?.usedPercent ?? -1
-        print(
+        try print(
             """
             Live Claude usage (Web API):
-            session used \(snap.primary.usedPercent)%
+            session used \(#require(snap.primary).usedPercent)%
             week used \(weeklyUsed)%
             opus \(opusUsed)%
             login method: \(snap.loginMethod ?? "nil")
             """)
-        #expect(snap.primary.usedPercent >= 0)
+        #expect(try #require(snap.primary).usedPercent >= 0)
     }
 
     @Test
@@ -882,6 +874,44 @@ struct ClaudeUsageTests {
     }
 }
 
+extension ClaudeUsageTests {
+    private static func allowsLiveClaudeFetch(environment: [String: String]) -> Bool {
+        environment["LIVE_CLAUDE_FETCH"] == "1"
+            && environment[KeychainTestSafety.allowAccessEnvironmentKey] == "1"
+    }
+
+    @Test
+    func `live Claude PTY access requires both explicit opt ins`() {
+        let feature = "LIVE_CLAUDE_FETCH"
+        let access = KeychainTestSafety.allowAccessEnvironmentKey
+        let suppression = KeychainTestSafety.suppressAccessEnvironmentKey
+        let blockedEnvironments: [[String: String]] = [
+            [:],
+            [feature: "1"],
+            [access: "1"],
+            [feature: "1", suppression: "1"],
+            [feature: "1", access: "0"],
+            [feature: "1", access: "true"],
+            [feature: "true", access: "1"],
+        ]
+        for environment in blockedEnvironments {
+            #expect(Self.allowsLiveClaudeFetch(environment: environment) == false)
+        }
+        #expect(Self.allowsLiveClaudeFetch(environment: [feature: "1", access: "1"]))
+        #expect(Self.allowsLiveClaudeFetch(environment: [feature: "1", access: "1", suppression: "1"]))
+    }
+
+    private static func makeOAuthUsageResponse() throws -> OAuthUsageResponse {
+        let json = """
+        {
+          "five_hour": { "utilization": 7, "resets_at": "2025-12-23T16:00:00.000Z" },
+          "seven_day": { "utilization": 21, "resets_at": "2025-12-29T23:00:00.000Z" }
+        }
+        """
+        return try ClaudeOAuthUsageFetcher._decodeUsageResponseForTesting(Data(json.utf8))
+    }
+}
+
 struct ClaudeOAuthUsageMappingTests {
     @Test
     func `oauth usage falls back to weekly window when five hour is absent`() throws {
@@ -893,8 +923,8 @@ struct ClaudeOAuthUsageMappingTests {
         """
         let snapshot = try ClaudeUsageFetcher._mapOAuthUsageForTesting(Data(json.utf8))
 
-        #expect(snapshot.primary.usedPercent == 42)
-        #expect(snapshot.primary.windowMinutes == 7 * 24 * 60)
+        #expect(snapshot.primary?.usedPercent == 42)
+        #expect(snapshot.primary?.windowMinutes == 7 * 24 * 60)
         #expect(snapshot.secondary?.usedPercent == 42)
         #expect(snapshot.opus?.usedPercent == 17)
     }
@@ -909,8 +939,8 @@ struct ClaudeOAuthUsageMappingTests {
         """
         let snapshot = try ClaudeUsageFetcher._mapOAuthUsageForTesting(Data(json.utf8))
 
-        #expect(snapshot.primary.usedPercent == 9)
-        #expect(snapshot.primary.windowMinutes == 7 * 24 * 60)
+        #expect(snapshot.primary?.usedPercent == 9)
+        #expect(snapshot.primary?.windowMinutes == 7 * 24 * 60)
     }
 
     @Test
@@ -972,6 +1002,10 @@ struct ClaudeAutoFetcherCharacterizationTests {
         let script = """
         #!/bin/sh
         LOG_FILE='\(logURL.path)'
+        if [ "$1" = "auth" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+          printf '%s\n' '{"loggedIn":true}'
+          exit 0
+        fi
         while IFS= read -r line; do
           case "$line" in
             *"/usage"*)
@@ -1054,7 +1088,7 @@ struct ClaudeAutoFetcherCharacterizationTests {
     }
 
     @Test
-    func `auto prefers OAuth even when web and CLI appear available`() async throws {
+    func `app Auto prefers safe OAuth before CLI and web`() async throws {
         let usageResponse = try Self.makeOAuthUsageResponse()
         let cliLogURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("claude-auto-cli-log-\(UUID().uuidString).txt")
@@ -1087,11 +1121,57 @@ struct ClaudeAutoFetcherCharacterizationTests {
                             try await fetcher.loadLatestUsage(model: "sonnet")
                         })
 
-                    #expect(snapshot.primary.usedPercent == 7)
+                    #expect(snapshot.primary?.usedPercent == 7)
                     #expect(snapshot.secondary?.usedPercent == 21)
                     #expect(log.contents().isEmpty)
                     let requests = webRequests.current()
                     #expect(requests.isEmpty)
+                })
+            }
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func `app Auto cancellation never advances beyond OAuth`(wrappedTransportCancellation: Bool) async throws {
+        let cliLogURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-auto-cancel-log-\(UUID().uuidString).txt")
+        let log = InvocationLog(url: cliLogURL)
+        let fakeCLI = try Self.makeFakeClaudeCLI(logURL: cliLogURL)
+        let webRequests = RequestLog()
+        let fetcher = ClaudeUsageFetcher(
+            browserDetection: BrowserDetection(cacheTTL: 0),
+            environment: [
+                ClaudeOAuthCredentialsStore.environmentTokenKey: "oauth-token",
+                ClaudeOAuthCredentialsStore.environmentScopesKey: "user:profile",
+            ],
+            runtime: .app,
+            dataSource: .auto,
+            manualCookieHeader: "sessionKey=sk-ant-session-token")
+
+        try await ClaudeCLISession.withIsolatedSessionForTesting {
+            try await ClaudeCLIResolver.withResolvedBinaryPathOverrideForTesting(fakeCLI.path) {
+                try await self.withClaudeWebStub(handler: { request in
+                    webRequests.append(request.url?.path ?? "<missing>")
+                    let url = try #require(request.url)
+                    return Self.makeJSONResponse(url: url, body: "{}")
+                }, operation: {
+                    let cancelledOAuth: @Sendable (String, Bool) async throws -> OAuthUsageResponse = { _, _ in
+                        if wrappedTransportCancellation {
+                            throw ClaudeOAuthFetchError.networkError(URLError(.cancelled))
+                        }
+                        throw CancellationError()
+                    }
+                    do {
+                        _ = try await ClaudeUsageFetcher.$fetchOAuthUsageOverride.withValue(cancelledOAuth) {
+                            try await fetcher.loadLatestUsage(model: "sonnet")
+                        }
+                        Issue.record("Cancelled Auto OAuth unexpectedly succeeded")
+                    } catch {
+                        #expect(ClaudeOAuthFetchError.isCancellation(error))
+                    }
+
+                    #expect(log.contents().isEmpty)
+                    #expect(webRequests.current().isEmpty)
                 })
             }
         }
@@ -1231,7 +1311,7 @@ struct ClaudeAutoFetcherCharacterizationTests {
                     }, operation: {
                         let snapshot = try await fetcher.loadLatestUsage(model: "sonnet")
 
-                        #expect(snapshot.primary.usedPercent == 11)
+                        #expect(snapshot.primary?.usedPercent == 11)
                         #expect(snapshot.secondary?.usedPercent == 22)
                         #expect(snapshot.opus?.usedPercent == 33)
                         #expect(snapshot.accountEmail == "web@example.com")
@@ -1244,7 +1324,7 @@ struct ClaudeAutoFetcherCharacterizationTests {
     }
 
     @Test
-    func `app runtime auto fails deterministically when planner has no executable steps`() async {
+    func `app runtime auto surfaces OAuth absence when no fallback source is available`() async {
         let fetcher = ClaudeUsageFetcher(
             browserDetection: BrowserDetection(cacheTTL: 0),
             environment: ["CLAUDE_CLI_PATH": "/definitely/missing/claude"],
@@ -1257,8 +1337,11 @@ struct ClaudeAutoFetcherCharacterizationTests {
                 do {
                     _ = try await fetcher.loadLatestUsage(model: "sonnet")
                     Issue.record("Expected app auto no-source fetch to fail.")
-                } catch let error as ClaudeUsageError {
-                    #expect(error.localizedDescription.contains("Claude planner produced no executable steps."))
+                } catch let error as ClaudeOAuthCredentialsError {
+                    guard case .notFound = error else {
+                        Issue.record("Unexpected OAuth failure: \(error)")
+                        return
+                    }
                 } catch {
                     Issue.record("Unexpected error: \(error)")
                 }
@@ -1291,7 +1374,11 @@ struct ClaudeAutoFetcherCharacterizationTests {
 }
 
 final class ClaudeAutoFetcherStubURLProtocol: URLProtocol {
-    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    private static let _handlerBox = LockIsolated<((URLRequest) throws -> (HTTPURLResponse, Data))?>(nil)
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))? {
+        get { Self._handlerBox.value }
+        set { Self._handlerBox.setValue(newValue) }
+    }
 
     override static func canInit(with request: URLRequest) -> Bool {
         request.url?.host == "claude.ai"
@@ -1380,7 +1467,7 @@ extension ClaudeAutoFetcherCharacterizationTests {
         }, operation: {
             let snapshot = try await fetcher.loadLatestUsage(model: "sonnet")
 
-            #expect(snapshot.primary.usedPercent == 14)
+            #expect(snapshot.primary?.usedPercent == 14)
             #expect(snapshot.secondary?.usedPercent == 28)
             #expect(snapshot.accountOrganization == "Team Org")
             #expect(snapshot.accountEmail == "linked@example.com")
@@ -1436,7 +1523,7 @@ extension ClaudeUsageTests {
         }
 
         await #expect(throws: ClaudeUsageError.self) {
-            try await ClaudeOAuthKeychainReadStrategyPreference.withTaskOverrideForTesting(
+            _ = try await ClaudeOAuthKeychainReadStrategyPreference.withTaskOverrideForTesting(
                 .securityCLIExperimental,
                 operation: {
                     try await ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.onlyOnUserAction) {
@@ -1464,7 +1551,7 @@ extension ClaudeUsageTests {
     }
 
     @Test
-    func `oauth load experimental background fallback blocked propagates O auth failure`() async throws {
+    func `oauth load experimental background preserves typed credential absence`() async throws {
         final class FlagBox: @unchecked Sendable {
             var respectPromptCooldownFlags: [Bool] = []
         }
@@ -1484,8 +1571,8 @@ extension ClaudeUsageTests {
             throw ClaudeOAuthCredentialsError.notFound
         }
 
-        await #expect(throws: ClaudeUsageError.self) {
-            try await ClaudeOAuthKeychainReadStrategyPreference.withTaskOverrideForTesting(
+        do {
+            _ = try await ClaudeOAuthKeychainReadStrategyPreference.withTaskOverrideForTesting(
                 .securityCLIExperimental,
                 operation: {
                     try await ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.onlyOnUserAction) {
@@ -1496,6 +1583,14 @@ extension ClaudeUsageTests {
                         }
                     }
                 })
+            Issue.record("Expected typed OAuth credential absence.")
+        } catch let error as ClaudeOAuthCredentialsError {
+            guard case .notFound = error else {
+                Issue.record("Unexpected OAuth failure: \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Unexpected error: \(error)")
         }
         #expect(flags.respectPromptCooldownFlags == [true])
     }

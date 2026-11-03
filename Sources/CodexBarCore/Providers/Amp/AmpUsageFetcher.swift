@@ -105,6 +105,7 @@ public struct AmpUsageFetcher: Sendable {
     @MainActor private static var recentDumps: [String] = []
 
     public let browserDetection: BrowserDetection
+    var sessionFactory = ProviderHTTPSessionFactory()
 
     public init(browserDetection: BrowserDetection) {
         self.browserDetection = browserDetection
@@ -149,13 +150,12 @@ public struct AmpUsageFetcher: Sendable {
         logger: ((String) -> Void)? = nil,
         now: Date = Date()) async throws -> AmpUsageSnapshot
     {
-        guard let token = AmpSettingsReader.cleaned(apiToken) else {
+        guard let token = SettingsValue.cleaned(apiToken) else {
             throw AmpUsageError.missingAPIToken
         }
         let request = try Self.makeUsageAPIRequest(apiToken: token)
         let diagnostics = APIRedirectDiagnostics(logger: logger)
-        let session = URLSession(configuration: .ephemeral, delegate: diagnostics, delegateQueue: nil)
-        let httpResponse = try await session.response(for: request)
+        let httpResponse = try await self.sessionFactory.response(for: request, delegate: diagnostics)
         logger?("[amp] API response: \(httpResponse.statusCode) " +
             "\(httpResponse.response.url?.absoluteString ?? "unknown")")
         try Self.validateAPIResponse(httpResponse)
@@ -268,8 +268,7 @@ public struct AmpUsageFetcher: Sendable {
             forHTTPHeaderField: "accept")
         Self.applyBrowserHeaders(to: &request)
 
-        let session = URLSession(configuration: .ephemeral, delegate: diagnostics, delegateQueue: nil)
-        let httpResponse = try await session.response(for: request)
+        let httpResponse = try await self.sessionFactory.response(for: request, delegate: diagnostics)
         let responseInfo = ResponseInfo(
             statusCode: httpResponse.statusCode,
             url: httpResponse.response.url?.absoluteString ?? "unknown")
@@ -331,7 +330,9 @@ public struct AmpUsageFetcher: Sendable {
     }
 
     @MainActor private static func recordDump(_ text: String) {
-        if self.recentDumps.count >= 5 { self.recentDumps.removeFirst() }
+        if self.recentDumps.count >= 5 {
+            self.recentDumps.removeFirst()
+        }
         self.recentDumps.append(text)
     }
 
@@ -463,27 +464,43 @@ public struct AmpUsageFetcher: Sendable {
 
     private static func isAmpHost(_ url: URL?) -> Bool {
         guard let host = url?.host?.lowercased() else { return false }
-        if host == "ampcode.com" || host == "www.ampcode.com" { return true }
+        if host == "ampcode.com" || host == "www.ampcode.com" {
+            return true
+        }
         return host.hasSuffix(".ampcode.com")
     }
 
     static func isLoginRedirect(_ url: URL) -> Bool {
         guard self.isAmpHost(url) else { return false }
-        if url.host?.lowercased() == "auth.ampcode.com" { return true }
+        if url.host?.lowercased() == "auth.ampcode.com" {
+            return true
+        }
 
         let path = url.path.lowercased()
         let components = path.split(separator: "/").map(String.init)
-        if components.contains("login") { return true }
-        if components.contains("signin") { return true }
-        if components.contains("sign-in") { return true }
+        if components.contains("login") {
+            return true
+        }
+        if components.contains("signin") {
+            return true
+        }
+        if components.contains("sign-in") {
+            return true
+        }
 
         // Amp currently redirects to /auth/sign-in?returnTo=... when session is invalid. Keep this slightly broader
         // than one exact path so we keep working if Amp changes auth routes.
         if components.contains("auth") {
             let query = url.query?.lowercased() ?? ""
-            if query.contains("returnto=") { return true }
-            if query.contains("redirect=") { return true }
-            if query.contains("redirectto=") { return true }
+            if query.contains("returnto=") {
+                return true
+            }
+            if query.contains("redirect=") {
+                return true
+            }
+            if query.contains("redirectto=") {
+                return true
+            }
         }
 
         return false

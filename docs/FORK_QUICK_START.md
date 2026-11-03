@@ -1,12 +1,15 @@
 ---
-summary: "Fork quick start: differences, commands, and planned features."
+summary: "Historical topoffunnel fork quick start; superseded by the main README and development guide."
 read_when:
-  - Onboarding to the fork workflow
-  - Reviewing fork-specific changes
-  - Running fork maintenance commands
+  - Reviewing the original topoffunnel fork workflow
 ---
 
 # CodexBar Fork - Quick Start Guide
+
+> Historical guide for `topoffunnel/CodexBar`, not the current `steipete/CodexBar` setup process. Use the
+> [README](../README.md), [Development guide](DEVELOPMENT.md), and [release checklist](RELEASING.md) instead.
+> Augment and multi-account support are now part of the main repository. The claim below that Keychain prompts
+> are eliminated is obsolete; current boundaries and troubleshooting are in [Keychain prompts](keychain-prompts.md).
 
 **Fork Maintainer:** Brandon Charleson ([topoffunnel.com](https://topoffunnel.com))  
 **Original Author:** Peter Steinberger ([steipete](https://twitter.com/steipete))  
@@ -56,14 +59,8 @@ cd /Users/steipete/Projects/codexbar && open -n /Users/steipete/Projects/codexba
 ```
 
 ### Release
-```bash
-# Edit .mac-release.env first: MAC_RELEASE_REPO, feed URL, download URL,
-# bundle id, and Sparkle public/signing key must point at your fork.
-./Scripts/release.sh
 
-# See full release process
-cat docs/RELEASING.md
-```
+Local release publication has been retired. Use the CI workflow described in the [current release process](RELEASING.md). A fork must adapt the repository, bundle identifiers, feed URL, Sparkle key, signing credentials, and tap handoff before enabling publication. Default dry runs verify the artifacts without publishing.
 
 ### Git Workflow
 ```bash
@@ -97,7 +94,7 @@ git push origin feature/my-feature
 - `Scripts/compile_and_run.sh` - Main development script
 - `Scripts/package_app.sh` - Package app bundle
 - `Scripts/sign-and-notarize.sh` - Release signing
-- `Scripts/make_appcast.sh` - Generate appcast XML
+- `.github/workflows/release.yml` - CI release and Sparkle publication
 
 ### Documentation
 - `docs/augment.md` - Augment provider guide

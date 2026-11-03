@@ -69,7 +69,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -136,7 +136,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -193,7 +193,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -238,7 +238,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -292,7 +292,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -341,7 +341,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -379,7 +379,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -423,7 +423,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -465,7 +465,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -506,7 +506,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -731,8 +731,9 @@ extension StatusMenuTests {
 
         store.isRefreshing = false
         controller.handleObservedStoreMenuChange()
-        for _ in 0..<20 where rebuildCount == 0 {
-            await Task.yield()
+        let rebuildDeadline = ContinuousClock.now + .seconds(2)
+        while rebuildCount == 0, ContinuousClock.now < rebuildDeadline {
+            try? await Task.sleep(for: .milliseconds(1))
         }
 
         #expect(rebuildCount == 1)
@@ -771,21 +772,22 @@ extension StatusMenuTests {
         controller.openMenus[submenuKey] = submenu
         controller.menuRefreshEnabledOverrideForTesting = true
 
-        var rebuildCount = 0
-        controller._test_openMenuRebuildObserver = { _ in
-            rebuildCount += 1
+        var rootRebuildCount = 0
+        controller._test_openMenuRebuildObserver = { rebuiltMenu in
+            guard rebuiltMenu === menu else { return }
+            rootRebuildCount += 1
         }
         defer { controller._test_openMenuRebuildObserver = nil }
 
         controller.deferSwitcherMenuRebuildIfStillVisible(menu, provider: .codex)
         controller.refreshOpenMenuIfStillVisible(menu, provider: .codex)
 
-        for _ in 0..<20 where rebuildCount == 0 {
+        for _ in 0..<20 where rootRebuildCount == 0 {
             await Task.yield()
         }
 
         #expect(controller.openMenus[submenuKey] == nil)
-        #expect(rebuildCount == 1)
+        #expect(rootRebuildCount == 1)
         #expect(controller.menuVersions[menuKey] == controller.menuContentVersion)
     }
 
@@ -877,7 +879,7 @@ extension StatusMenuTests {
         settings.openAIWebAccessEnabled = true
         settings.openAIWebBatterySaverEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         store.openAIDashboard = nil
@@ -923,9 +925,11 @@ extension StatusMenuTests {
         #expect(await blocker.startedCount() == 1)
         #expect(refreshInteractions == [.background])
 
+        let dashboardTask = store.openAIDashboardRefreshTask
         await blocker.resumeNext(with: .success(self.makeOpenAIDashboard(
             dailyBreakdown: [],
             updatedAt: Date())))
+        await dashboardTask?.value
     }
 
     @Test
@@ -938,7 +942,7 @@ extension StatusMenuTests {
         settings.openAIWebAccessEnabled = true
         settings.openAIWebBatterySaverEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         store.openAIDashboard = nil
@@ -974,9 +978,11 @@ extension StatusMenuTests {
         await blocker.waitUntilStarted(count: 1)
         #expect(await blocker.startedCount() == 1)
 
+        let dashboardTask = store.openAIDashboardRefreshTask
         await blocker.resumeNext(with: .success(self.makeOpenAIDashboard(
             dailyBreakdown: [],
             updatedAt: Date())))
+        await dashboardTask?.value
     }
 
     @Test
@@ -989,7 +995,7 @@ extension StatusMenuTests {
         settings.openAIWebAccessEnabled = true
         settings.openAIWebBatterySaverEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         store.openAIDashboard = nil
@@ -1024,9 +1030,11 @@ extension StatusMenuTests {
         await blocker.waitUntilStarted(count: 1)
         #expect(await blocker.startedCount() == 1)
 
+        let dashboardTask = store.openAIDashboardRefreshTask
         await blocker.resumeNext(with: .success(self.makeOpenAIDashboard(
             dailyBreakdown: [],
             updatedAt: Date())))
+        await dashboardTask?.value
     }
 
     @Test
@@ -1039,7 +1047,7 @@ extension StatusMenuTests {
         settings.openAIWebAccessEnabled = true
         settings.openAIWebBatterySaverEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         store._setSnapshotForTesting(nil, provider: .codex)
@@ -1081,9 +1089,11 @@ extension StatusMenuTests {
         await dashboardBlocker.waitUntilStarted(count: 1)
         #expect(await dashboardBlocker.startedCount() == 1)
 
+        let dashboardTask = store.openAIDashboardRefreshTask
         await dashboardBlocker.resumeNext(with: .success(self.makeOpenAIDashboard(
             dailyBreakdown: [],
             updatedAt: Date())))
+        await dashboardTask?.value
     }
 
     @Test
@@ -1096,7 +1106,7 @@ extension StatusMenuTests {
         settings.openAIWebAccessEnabled = true
         settings.openAIWebBatterySaverEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         store._setSnapshotForTesting(nil, provider: .codex)
@@ -1143,9 +1153,11 @@ extension StatusMenuTests {
         await dashboardBlocker.waitUntilStarted(count: 1)
         #expect(await dashboardBlocker.startedCount() == 1)
 
+        let dashboardTask = store.openAIDashboardRefreshTask
         await dashboardBlocker.resumeNext(with: .success(self.makeOpenAIDashboard(
             dailyBreakdown: [],
             updatedAt: Date())))
+        await dashboardTask?.value
     }
 
     @Test
@@ -1158,7 +1170,7 @@ extension StatusMenuTests {
         settings.openAIWebAccessEnabled = true
         settings.openAIWebBatterySaverEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         store.openAIDashboard = self.makeOpenAIDashboard(dailyBreakdown: [], updatedAt: Date())
@@ -1196,11 +1208,13 @@ extension StatusMenuTests {
         await blocker.waitUntilStarted(count: 1)
         #expect(await blocker.startedCount() == 1)
 
+        let dashboardTask = store.openAIDashboardRefreshTask
         await blocker.resumeNext(with: .success(self.makeOpenAIDashboard(
             dailyBreakdown: [
                 OpenAIDashboardDailyBreakdown(day: "2026-05-24", services: [], totalCreditsUsed: 12),
             ],
             updatedAt: Date())))
+        await dashboardTask?.value
     }
 
     @Test
@@ -1213,7 +1227,7 @@ extension StatusMenuTests {
         settings.openAIWebAccessEnabled = true
         settings.openAIWebBatterySaverEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let now = Date()
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
@@ -1255,7 +1269,7 @@ extension StatusMenuTests {
         settings.refreshFrequency = .manual
         settings.mergeIcons = false
         settings.showOptionalCreditsAndExtraUsage = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let now = Date()
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: true)
@@ -1307,7 +1321,7 @@ extension StatusMenuTests {
         settings.refreshFrequency = .manual
         settings.mergeIcons = false
         settings.showOptionalCreditsAndExtraUsage = true
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let now = Date(timeIntervalSince1970: 100)
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: true)
@@ -1362,7 +1376,7 @@ extension StatusMenuTests {
         settings.mergeIcons = false
         settings.costUsageEnabled = true
         settings.costSummaryDisplayStyle = .both
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -1406,7 +1420,7 @@ extension StatusMenuTests {
         settings.mergeIcons = false
         settings.costUsageEnabled = true
         settings.costSummaryDisplayStyle = .both
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         store._setTokenSnapshotForTesting(
@@ -1462,7 +1476,7 @@ extension StatusMenuTests {
         settings.statusChecksEnabled = false
         settings.refreshFrequency = .manual
         settings.mergeIcons = false
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
         let controller = StatusItemController(
@@ -1509,7 +1523,7 @@ extension StatusMenuTests {
         settings.mergeIcons = false
         settings.openAIWebAccessEnabled = true
         settings.codexCookieSource = .auto
-        self.enableOnlyCodex(settings)
+        enableTestProviders([.codex], settings: settings)
 
         let now = Date()
         let store = self.makeCodexStore(settings: settings, dashboardAuthorized: false)
@@ -1545,14 +1559,6 @@ extension StatusMenuTests {
         #expect(controller.menuVersions[key] == openedVersion)
 
         await self.closeMenuAndWaitUntilFresh(controller, menu: menu, key: key)
-    }
-
-    private func enableOnlyCodex(_ settings: SettingsStore) {
-        let registry = ProviderRegistry.shared
-        for provider in UsageProvider.allCases {
-            guard let metadata = registry.metadata[provider] else { continue }
-            settings.setProviderEnabled(provider: provider, metadata: metadata, enabled: provider == .codex)
-        }
     }
 
     private func menuItem(in menu: NSMenu, id: String) -> NSMenuItem? {

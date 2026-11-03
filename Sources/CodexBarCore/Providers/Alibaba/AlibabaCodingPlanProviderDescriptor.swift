@@ -1,29 +1,35 @@
 import Foundation
 
-#if os(macOS)
-import SweetCookieKit
-#endif
-
 public enum AlibabaCodingPlanProviderDescriptor {
     public static let descriptor: ProviderDescriptor = Self.makeDescriptor()
+    private static let credentials = ProviderCredentialAdapter.apiKey(
+        environmentKey: AlibabaCodingPlanSettingsReader.apiTokenKey,
+        resolve: AlibabaCodingPlanSettingsReader.apiToken,
+        usesRegion: true,
+        configValidator: ProviderCredentialAdapter.regionValidator(
+            displayName: "Alibaba Coding Plan",
+            isValid: { AlibabaCodingPlanAPIRegion(rawValue: $0) != nil }))
 
     static func makeDescriptor() -> ProviderDescriptor {
-        #if os(macOS)
-        let browserOrder: BrowserCookieImportOrder = [
-            .chrome,
-            .chromeBeta,
-            .brave,
-            .edge,
-            .arc,
-            .firefox,
-            .safari,
-        ]
-        #else
-        let browserOrder: BrowserCookieImportOrder? = nil
-        #endif
-
-        return ProviderDescriptor(
+        ProviderDescriptor(
             id: .alibaba,
+            settingsSection: .init(
+                AlibabaCodingPlanProviderSettingsKey.self,
+                cookieSettings: { settings in
+                    CookieProviderSettings(
+                        cookieSource: settings.cookieSource,
+                        manualCookieHeader: settings.manualCookieHeader)
+                },
+                credentialSettings: { context in
+                    let settings = context.cookieSettings(for: .alibaba)
+                    let region = context.config?.sanitizedRegion
+                        .flatMap(AlibabaCodingPlanAPIRegion.init(rawValue:)) ?? .international
+                    return AlibabaCodingPlanProviderSettings(
+                        cookieSource: settings.cookieSource,
+                        manualCookieHeader: settings.manualCookieHeader,
+                        apiRegion: region)
+                }),
+            credentials: self.credentials,
             metadata: ProviderMetadata(
                 id: .alibaba,
                 displayName: "Alibaba",
@@ -38,17 +44,31 @@ public enum AlibabaCodingPlanProviderDescriptor {
                 defaultEnabled: false,
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
-                browserCookieOrder: browserOrder,
+                sharePlanLabels: [
+                    "lite": "Lite", "coding plan lite": "Lite", "pro": "Pro", "active pro": "Pro",
+                    "alibaba coding plan pro": "Pro", "starter": "Starter", "enterprise": "Enterprise",
+                ],
+                debugLogUnavailableMessage: "Alibaba Coding Plan debug log not yet implemented",
+                browserCookieOrder: ProviderBrowserCookieDefaults.defaultImportOrder,
                 dashboardURL: AlibabaCodingPlanAPIRegion.international.dashboardURL.absoluteString,
                 statusPageURL: nil,
                 statusLinkURL: "https://status.aliyun.com"),
             branding: ProviderBranding(
-                iconStyle: .alibaba,
+                iconStyle: .init(provider: .alibaba),
                 iconResourceName: "ProviderIcon-alibaba",
-                color: ProviderColor(red: 1.0, green: 106 / 255, blue: 0)),
+                color: ProviderColor(red: 1.0, green: 106 / 255, blue: 0),
+                confettiPalette: [
+                    ProviderColor(hex: 0xFF6A00),
+                    ProviderColor(hex: 0x111111),
+                    ProviderColor(hex: 0xFFFFFF),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Alibaba Coding Plan cost summary is not supported." }),
+            pace: .calendarMonthResetWindow,
+            presentation: ProviderUsagePresentation(
+                primaryBindingQuotaLanes: [.secondary, .tertiary],
+                menuCard: ProviderMenuCardPresentation(showsPrimaryBalanceDescription: true)),
             fetchPlan: ProviderFetchPlan(
                 sourceModes: [.auto, .web, .api],
                 pipeline: ProviderFetchPipeline(resolveStrategies: self.resolveStrategies)),
@@ -261,6 +281,6 @@ struct AlibabaCodingPlanAPIFetchStrategy: ProviderFetchStrategy {
     }
 
     private static func resolveToken(environment: [String: String]) -> String? {
-        ProviderTokenResolver.alibabaToken(environment: environment)
+        ProviderTokenResolver.token(for: .alibaba, environment: environment)
     }
 }

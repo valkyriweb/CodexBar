@@ -1,3 +1,4 @@
+import AppKit
 import CodexBarCore
 import Foundation
 import SwiftUI
@@ -15,9 +16,6 @@ struct ProviderSettingsContext {
     let settings: SettingsStore
     let store: UsageStore
 
-    let boolBinding: (ReferenceWritableKeyPath<SettingsStore, Bool>) -> Binding<Bool>
-    let stringBinding: (ReferenceWritableKeyPath<SettingsStore, String>) -> Binding<String>
-
     let statusText: (String) -> String?
     let setStatusText: (String, String?) -> Void
 
@@ -27,12 +25,49 @@ struct ProviderSettingsContext {
     let requestConfirmation: (ProviderSettingsConfirmation) -> Void
     let runLoginFlow: () async -> Void
 
+    func binding<Value>(_ keyPath: ReferenceWritableKeyPath<SettingsStore, Value>) -> Binding<Value> {
+        let settings = self.settings
+        return Binding(
+            get: { settings[keyPath: keyPath] },
+            set: { settings[keyPath: keyPath] = $0 })
+    }
+
+    func rawValueBinding<Value: RawRepresentable>(
+        _ keyPath: ReferenceWritableKeyPath<SettingsStore, Value>,
+        fallback: Value) -> Binding<Value.RawValue>
+    {
+        let settings = self.settings
+        return Binding(
+            get: { settings[keyPath: keyPath].rawValue },
+            set: { settings[keyPath: keyPath] = Value(rawValue: $0) ?? fallback })
+    }
+
+    func providerConfigBinding(_ field: ProviderConfigStringField) -> Binding<String> {
+        self.settings.providerConfigBinding(provider: self.provider, field: field)
+    }
+
+    func modelRateLimitsBinding(scope: ProviderModelRateLimitScope) -> Binding<[ProviderModelRateLimit]> {
+        Binding(
+            get: {
+                self.settings.providerConfig(for: self.provider)?.modelRateLimits(for: scope) ?? []
+            },
+            set: { limits in
+                self.settings.updateProviderConfig(provider: self.provider, affectsBackgroundWork: false) {
+                    $0.setModelRateLimits(
+                        ProviderModelRateLimit.validated(limits),
+                        for: scope)
+                }
+            })
+    }
+
+    func providerConfigSecretBinding(key: String, logField: String) -> Binding<String> {
+        self.settings.providerConfigSecretBinding(provider: self.provider, key: key, logField: logField)
+    }
+
     init(
         provider: UsageProvider,
         settings: SettingsStore,
         store: UsageStore,
-        boolBinding: @escaping (ReferenceWritableKeyPath<SettingsStore, Bool>) -> Binding<Bool>,
-        stringBinding: @escaping (ReferenceWritableKeyPath<SettingsStore, String>) -> Binding<String>,
         statusText: @escaping (String) -> String?,
         setStatusText: @escaping (String, String?) -> Void,
         lastAppActiveRunAt: @escaping (String) -> Date?,
@@ -43,8 +78,6 @@ struct ProviderSettingsContext {
         self.provider = provider
         self.settings = settings
         self.store = store
-        self.boolBinding = boolBinding
-        self.stringBinding = stringBinding
         self.statusText = statusText
         self.setStatusText = setStatusText
         self.lastAppActiveRunAt = lastAppActiveRunAt
@@ -79,6 +112,9 @@ struct ProviderSettingsToggleDescriptor: Identifiable {
     /// Optional actions shown under the toggle when enabled.
     let actions: [ProviderSettingsActionDescriptor]
 
+    /// Optional text fields shown inline under the toggle when enabled.
+    let inlineFields: [ProviderSettingsFieldDescriptor]
+
     /// Optional runtime visibility gate.
     let isVisible: (() -> Bool)?
 
@@ -101,6 +137,7 @@ struct ProviderSettingsToggleDescriptor: Identifiable {
         binding: Binding<Bool>,
         statusText: (() -> String?)?,
         actions: [ProviderSettingsActionDescriptor],
+        inlineFields: [ProviderSettingsFieldDescriptor] = [],
         isVisible: (() -> Bool)?,
         isEnabled: (() -> Bool)? = nil,
         onChange: ((_ enabled: Bool) async -> Void)?,
@@ -113,6 +150,7 @@ struct ProviderSettingsToggleDescriptor: Identifiable {
         self.binding = binding
         self.statusText = statusText
         self.actions = actions
+        self.inlineFields = inlineFields
         self.isVisible = isVisible
         self.isEnabled = isEnabled
         self.onChange = onChange
@@ -138,7 +176,27 @@ struct ProviderSettingsFieldDescriptor: Identifiable {
     let binding: Binding<String>
     let actions: [ProviderSettingsActionDescriptor]
     let isVisible: (() -> Bool)?
-    let onActivate: (() -> Void)?
+}
+
+/// Shared opt-in directory list; provider implementations supply data, not custom views.
+@MainActor
+struct ProviderSettingsDirectoryListDescriptor: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let binding: Binding<[String]>
+}
+
+/// Shared per-model throughput editor; providers contribute only data and actions.
+@MainActor
+struct ProviderSettingsModelLimitsDescriptor: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let binding: Binding<[ProviderModelRateLimit]>
+    let actions: [ProviderSettingsActionDescriptor]
+    var scopeText: String?
+    var scope: ProviderModelRateLimitScope?
 }
 
 /// Shared action row descriptor rendered in the Providers settings pane.
@@ -170,7 +228,8 @@ struct ProviderSettingsTokenAccountsDescriptor: Identifiable {
         _ token: String,
         _ usageScope: String?,
         _ organizationID: String?,
-        _ workspaceID: String?) -> Void
+        _ workspaceID: String?,
+        _ claudeConfigDirectory: String?) -> Void
     let updateAccount: (
         _ accountID: UUID,
         _ usageScope: String?,
@@ -181,6 +240,9 @@ struct ProviderSettingsTokenAccountsDescriptor: Identifiable {
     let primaryAddAction: (() async -> Void)?
     let openConfigFile: () -> Void
     let reloadFromDisk: () -> Void
+    var claudeConfigDirectory: ((UUID) -> Binding<String?>)?
+    var editAccount: ((_ accountID: UUID, _ label: String, _ token: String?) -> Void)?
+    var moveAccount: ((_ accountID: UUID, _ destination: Int) -> Void)?
 }
 
 /// Shared organizations descriptor rendered in the Providers settings pane.
@@ -232,11 +294,17 @@ struct ProviderSettingsOrganizationsDescriptor: Identifiable {
 }
 
 /// Shared picker descriptor rendered in the Providers settings pane.
+enum ProviderSettingsPickerPlacement: Equatable {
+    case menuBar
+    case connection
+}
+
 @MainActor
 struct ProviderSettingsPickerDescriptor: Identifiable {
     let id: String
     let title: String
     let subtitle: String
+    let placement: ProviderSettingsPickerPlacement
     let dynamicSubtitle: (() -> String?)?
     let binding: Binding<String>
     let options: [ProviderSettingsPickerOption]
@@ -244,22 +312,26 @@ struct ProviderSettingsPickerDescriptor: Identifiable {
     let isEnabled: (() -> Bool)?
     let onChange: ((_ selection: String) async -> Void)?
     let trailingText: (() -> String?)?
+    let trailingActions: [ProviderSettingsActionDescriptor]
 
     init(
         id: String,
         title: String,
         subtitle: String,
+        placement: ProviderSettingsPickerPlacement = .connection,
         dynamicSubtitle: (() -> String?)? = nil,
         binding: Binding<String>,
         options: [ProviderSettingsPickerOption],
         isVisible: (() -> Bool)?,
         isEnabled: (() -> Bool)? = nil,
         onChange: ((_ selection: String) async -> Void)?,
-        trailingText: (() -> String?)? = nil)
+        trailingText: (() -> String?)? = nil,
+        trailingActions: [ProviderSettingsActionDescriptor] = [])
     {
         self.id = id
         self.title = title
         self.subtitle = subtitle
+        self.placement = placement
         self.dynamicSubtitle = dynamicSubtitle
         self.binding = binding
         self.options = options
@@ -267,6 +339,7 @@ struct ProviderSettingsPickerDescriptor: Identifiable {
         self.isEnabled = isEnabled
         self.onChange = onChange
         self.trailingText = trailingText
+        self.trailingActions = trailingActions
     }
 }
 
@@ -278,6 +351,22 @@ struct ProviderSettingsPickerOption: Identifiable {
 /// Shared action descriptor rendered under a settings toggle.
 @MainActor
 struct ProviderSettingsActionDescriptor: Identifiable {
+    static func openURL(
+        id: String,
+        title: String,
+        url: @autoclosure @escaping () -> URL?) -> Self
+    {
+        Self(
+            id: id,
+            title: title,
+            style: .link,
+            isVisible: nil,
+            perform: {
+                guard let destination = url() else { return }
+                NSWorkspace.shared.open(destination)
+            })
+    }
+
     enum Style {
         case bordered
         case link

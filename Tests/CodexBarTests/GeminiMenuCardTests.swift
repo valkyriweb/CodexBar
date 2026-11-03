@@ -5,6 +5,43 @@ import Testing
 
 struct GeminiMenuCardTests {
     @Test
+    func `gemini plan preserves upstream acronym casing`() throws {
+        let identity = ProviderIdentitySnapshot(
+            providerID: .gemini,
+            accountEmail: nil,
+            accountOrganization: nil,
+            loginMethod: "Gemini Code Assist in Google One AI Pro")
+        let snapshot = UsageSnapshot(
+            primary: nil,
+            secondary: nil,
+            tertiary: nil,
+            updatedAt: Date(timeIntervalSince1970: 0),
+            identity: identity)
+        let metadata = try #require(ProviderDefaults.metadata[.gemini])
+
+        let model = UsageMenuCardView.Model.make(.init(
+            provider: .gemini,
+            metadata: metadata,
+            snapshot: snapshot,
+            credits: nil,
+            creditsError: nil,
+            dashboardError: nil,
+            tokenSnapshot: nil,
+            tokenError: nil,
+            account: AccountInfo(email: nil, plan: nil),
+            isRefreshing: false,
+            lastError: nil,
+            usageBarsShowUsed: false,
+            resetTimeDisplayStyle: .countdown,
+            tokenCostUsageEnabled: false,
+            showOptionalCreditsAndExtraUsage: true,
+            hidePersonalInfo: false,
+            now: Date(timeIntervalSince1970: 0)))
+
+        #expect(model.planText == "Gemini Code Assist in Google One AI Pro")
+    }
+
+    @Test
     func `gemini model uses flash lite title for tertiary metric`() throws {
         let now = Date()
         let identity = ProviderIdentitySnapshot(
@@ -38,7 +75,6 @@ struct GeminiMenuCardTests {
             snapshot: snapshot,
             credits: nil,
             creditsError: nil,
-            dashboard: nil,
             dashboardError: nil,
             tokenSnapshot: nil,
             tokenError: nil,
@@ -53,5 +89,53 @@ struct GeminiMenuCardTests {
             now: now))
 
         #expect(model.metrics.map(\.title) == ["Pro", "Flash", "Flash Lite"])
+    }
+
+    @Test
+    func `gemini web snapshot uses five hour and weekly titles`() throws {
+        let now = Date()
+        let snapshot = UsageSnapshot(
+            primary: RateWindow(
+                usedPercent: 71,
+                windowMinutes: 300,
+                resetsAt: now.addingTimeInterval(3600),
+                resetDescription: nil),
+            secondary: RateWindow(
+                usedPercent: 4,
+                windowMinutes: 10080,
+                resetsAt: now.addingTimeInterval(86400),
+                resetDescription: nil),
+            tertiary: nil,
+            updatedAt: now,
+            identity: ProviderIdentitySnapshot(
+                providerID: .gemini,
+                accountEmail: nil,
+                accountOrganization: nil,
+                loginMethod: "Pro"))
+        let metadata = try #require(ProviderDefaults.metadata[.gemini])
+
+        let model = UsageMenuCardView.Model.make(.init(
+            provider: .gemini,
+            metadata: metadata,
+            snapshot: snapshot,
+            credits: nil,
+            creditsError: nil,
+            dashboardError: nil,
+            tokenSnapshot: nil,
+            tokenError: nil,
+            account: AccountInfo(email: nil, plan: nil),
+            isRefreshing: false,
+            lastError: nil,
+            usageBarsShowUsed: false,
+            resetTimeDisplayStyle: .countdown,
+            tokenCostUsageEnabled: false,
+            showOptionalCreditsAndExtraUsage: true,
+            hidePersonalInfo: false,
+            now: now))
+
+        let titles = model.metrics.map(\.title)
+        #expect(titles.count == 2)
+        #expect(!titles.contains("Flash"))
+        #expect(titles.last == "Weekly")
     }
 }

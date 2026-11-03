@@ -3,87 +3,13 @@ import Foundation
 import FoundationNetworking
 #endif
 
-private final class OpenCodeGoZenBalanceTaskRace: @unchecked Sendable {
-    private let lock = NSLock()
-    private let sourceTask: Task<Double?, Error>
-    private var result: Result<Double?, Error>?
-    private var continuation: CheckedContinuation<Double?, Error>?
-    private var observerTask: Task<Void, Never>?
-    private var timeoutTask: Task<Void, Never>?
-
-    init(sourceTask: Task<Double?, Error>) {
-        self.sourceTask = sourceTask
-    }
-
-    func value(timeout: Duration? = nil) async throws -> Double? {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                self.lock.lock()
-                if let result = self.result {
-                    self.lock.unlock()
-                    continuation.resume(with: result)
-                    return
-                }
-
-                self.continuation = continuation
-                let sourceTask = self.sourceTask
-                self.observerTask = Task { [weak self] in
-                    do {
-                        let value = try await sourceTask.value
-                        self?.resolve(.success(value), cancelSource: false)
-                    } catch {
-                        self?.resolve(.failure(error), cancelSource: false)
-                    }
-                }
-                if let timeout {
-                    self.timeoutTask = Task { [weak self] in
-                        do {
-                            try await Task.sleep(for: timeout)
-                            self?.resolve(.success(nil), cancelSource: true)
-                        } catch {
-                            // The source completed or the caller canceled the race.
-                        }
-                    }
-                }
-                self.lock.unlock()
-            }
-        } onCancel: {
-            self.resolve(.failure(CancellationError()), cancelSource: true)
-        }
-    }
-
-    private func resolve(_ result: Result<Double?, Error>, cancelSource: Bool) {
-        self.lock.lock()
-        guard self.result == nil else {
-            self.lock.unlock()
-            return
-        }
-
-        self.result = result
-        let continuation = self.continuation
-        self.continuation = nil
-        let observerTask = self.observerTask
-        let timeoutTask = self.timeoutTask
-        self.observerTask = nil
-        self.timeoutTask = nil
-        self.lock.unlock()
-
-        if cancelSource {
-            self.sourceTask.cancel()
-        }
-        observerTask?.cancel()
-        timeoutTask?.cancel()
-        continuation?.resume(with: result)
-    }
-}
-
 extension OpenCodeGoUsageFetcher {
     static let optionalZenBalanceTimeout: TimeInterval = 5
     static let optionalZenBalanceStartDelay: Duration = .milliseconds(25)
     static let optionalZenBalanceJoinGrace: Duration = .milliseconds(250)
 
     public static func zenDashboardURL(workspaceID raw: String?) -> URL {
-        guard let workspaceID = self.normalizeWorkspaceID(raw),
+        guard let workspaceID = OpenCodeWebParsing.normalizeWorkspaceID(raw),
               let url = URL(string: "https://opencode.ai/workspace/\(workspaceID)")
         else {
             return URL(string: "https://opencode.ai")!
@@ -115,10 +41,12 @@ extension OpenCodeGoUsageFetcher {
         }
     }
 
-    static func completedOptionalZenBalance(from task: Task<Double?, Error>) async throws -> Double? {
-        let race = OpenCodeGoZenBalanceTaskRace(sourceTask: task)
+    static func completedOptionalZenBalance(
+        from task: Task<Double?, Error>,
+        timeout: Duration? = Self.optionalZenBalanceJoinGrace) async throws -> Double?
+    {
         do {
-            return try await race.value(timeout: self.optionalZenBalanceJoinGrace)
+            return try await self.completedZenBalance(from: task, timeout: timeout)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -126,9 +54,33 @@ extension OpenCodeGoUsageFetcher {
         }
     }
 
+    /// The optional balance join bound, measured from when the balance task was created so a slow
+    /// subscription cannot stack a second full wait on top of the balance request. The app's short
+    /// grace is unchanged; only completeness reads use the optional-balance timeout.
+    static func optionalZenBalanceJoinTimeout(
+        since startedAt: ContinuousClock.Instant,
+        waitForZenBalance: Bool,
+        now: ContinuousClock.Instant = ContinuousClock.now) -> Duration
+    {
+        guard waitForZenBalance else { return self.optionalZenBalanceJoinGrace }
+        let elapsed = startedAt.duration(to: now)
+        let remaining = Duration.seconds(Self.optionalZenBalanceTimeout) - elapsed
+        return max(Duration.zero, remaining)
+    }
+
     static func completedRequiredZenBalance(from task: Task<Double?, Error>) async throws -> Double? {
-        let race = OpenCodeGoZenBalanceTaskRace(sourceTask: task)
-        return try await race.value()
+        try await self.completedZenBalance(from: task, timeout: nil)
+    }
+
+    private static func completedZenBalance(
+        from task: Task<Double?, Error>,
+        timeout: Duration?) async throws -> Double?
+    {
+        switch await BoundedTaskJoin(sourceTask: task).value(joinGrace: timeout) {
+        case let .value(value): value
+        case .timedOut: nil
+        case let .failure(error): throw error
+        }
     }
 
     static func parseZenBalance(text: String) -> Double? {
@@ -136,6 +88,33 @@ extension OpenCodeGoUsageFetcher {
     }
 
     static func fetchZenBalance(
+        workspaceID: String,
+        cookieHeader: String,
+        timeout: TimeInterval,
+        session: URLSession) async throws -> Double?
+    {
+        try await OpenCodeLegacyFallback.fetch(
+            cookieHeader: cookieHeader,
+            isUsableLegacyValue: { $0 != nil },
+            console: {
+                let text = try await self.fetchConsoleText(
+                    url: self.consoleBillingStatusURL,
+                    workspaceID: workspaceID,
+                    cookieHeader: cookieHeader,
+                    timeout: timeout,
+                    session: session)
+                return try OpenCodeGoZenBalanceParser.parseConsoleBillingStatus(text: text)
+            },
+            legacy: {
+                try await self.fetchLegacyZenBalance(
+                    workspaceID: workspaceID,
+                    cookieHeader: cookieHeader,
+                    timeout: timeout,
+                    session: session)
+            })
+    }
+
+    private static func fetchLegacyZenBalance(
         workspaceID: String,
         cookieHeader: String,
         timeout: TimeInterval,

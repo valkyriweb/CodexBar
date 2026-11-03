@@ -1,6 +1,5 @@
 import CodexBarCore
 import Foundation
-import SwiftUI
 
 struct FactoryProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .factory
@@ -8,13 +7,24 @@ struct FactoryProviderImplementation: ProviderImplementation {
 
     @MainActor
     func observeSettings(_ settings: SettingsStore) {
+        _ = settings.factoryUsageDataSource
+        _ = settings.factoryAPIKey
         _ = settings.factoryCookieSource
         _ = settings.factoryCookieHeader
     }
 
     @MainActor
-    func settingsSnapshot(context: ProviderSettingsSnapshotContext) -> ProviderSettingsSnapshotContribution? {
-        .factory(context.settings.factorySettingsSnapshot(tokenOverride: context.tokenOverride))
+    func defaultSourceLabel(context: ProviderSourceLabelContext) -> String? {
+        context.settings.factoryUsageDataSource.rawValue
+    }
+
+    @MainActor
+    func sourceMode(context: ProviderSourceModeContext) -> ProviderSourceMode {
+        switch context.settings.factoryUsageDataSource {
+        case .api: .api
+        case .web: .web
+        case .auto, .cli, .oauth: .auto
+        }
     }
 
     @MainActor
@@ -33,34 +43,39 @@ struct FactoryProviderImplementation: ProviderImplementation {
 
     @MainActor
     func settingsPickers(context: ProviderSettingsContext) -> [ProviderSettingsPickerDescriptor] {
-        let cookieBinding = Binding(
-            get: { context.settings.factoryCookieSource.rawValue },
-            set: { raw in
-                context.settings.factoryCookieSource = ProviderCookieSource(rawValue: raw) ?? .auto
-            })
-        let cookieOptions = ProviderCookieSourceUI.options(
-            allowsOff: false,
-            keychainDisabled: context.settings.debugDisableKeychainAccess)
-
-        let cookieSubtitle: () -> String? = {
-            ProviderCookieSourceUI.subtitle(
-                source: context.settings.factoryCookieSource,
-                keychainDisabled: context.settings.debugDisableKeychainAccess,
-                auto: "Automatic imports browser cookies and WorkOS tokens.",
-                manual: "Paste a Cookie or Authorization header from app.factory.ai.",
-                off: "Factory cookies are disabled.")
-        }
+        let usageBinding = context.rawValueBinding(\.factoryUsageDataSource, fallback: .auto)
+        let usageOptions = [
+            ProviderSettingsPickerOption(id: ProviderSourceMode.auto.rawValue, title: "Auto"),
+            ProviderSettingsPickerOption(id: ProviderSourceMode.api.rawValue, title: "API key"),
+            ProviderSettingsPickerOption(id: ProviderSourceMode.web.rawValue, title: "Browser cookies"),
+        ]
 
         return [
             ProviderSettingsPickerDescriptor(
-                id: "factory-cookie-source",
-                title: "Cookie source",
-                subtitle: "Automatic imports browser cookies and WorkOS tokens.",
-                dynamicSubtitle: cookieSubtitle,
-                binding: cookieBinding,
-                options: cookieOptions,
+                id: "factory-usage-source",
+                title: "Usage source",
+                subtitle: "Auto tries a Factory API key first, then falls back to cookies/WorkOS on "
+                    + "auth or recoverable API failures.",
+                binding: usageBinding,
+                options: usageOptions,
                 isVisible: nil,
                 onChange: nil,
+                trailingText: {
+                    guard context.settings.factoryUsageDataSource == .auto else { return nil }
+                    let label = context.store.sourceLabel(for: .factory)
+                    return label == "auto" ? nil : label
+                }),
+            ProviderCookieSourceUI.picker(
+                id: "factory-cookie-source",
+                context: context,
+                source: \.factoryCookieSource,
+                allowsOff: false,
+                subtitles: {
+                    .init(
+                        auto: L("Automatic imports browser cookies and WorkOS tokens."),
+                        manual: L("Paste a Cookie or Authorization header from %@.", "app.factory.ai"),
+                        off: L("%@ cookies are disabled.", "Factory"))
+                },
                 trailingText: {
                     ProviderCookieSourceUI.cachedTrailingText(provider: .factory)
                 }),
@@ -69,8 +84,23 @@ struct FactoryProviderImplementation: ProviderImplementation {
 
     @MainActor
     func settingsFields(context: ProviderSettingsContext) -> [ProviderSettingsFieldDescriptor] {
-        _ = context
-        return []
+        [
+            ProviderSettingsFieldDescriptor(
+                id: "factory-api-key",
+                title: "API key",
+                subtitle: "Stored in ~/.codexbar/config.json. You can also provide FACTORY_API_KEY or "
+                    + "~/.factory/.env.",
+                kind: .secure,
+                placeholder: "fk-...",
+                binding: context.binding(\.factoryAPIKey),
+                actions: [
+                    ProviderSettingsActionDescriptor.openURL(
+                        id: "factory-open-api-keys",
+                        title: "Open API keys",
+                        url: URL(string: "https://app.factory.ai/settings/api-keys")),
+                ],
+                isVisible: nil),
+        ]
     }
 
     @MainActor
@@ -93,7 +123,10 @@ struct FactoryProviderImplementation: ProviderImplementation {
               cost.period == "Extra usage balance"
         else { return }
 
-        let balance = UsageFormatter.currencyString(cost.used, currencyCode: cost.currencyCode)
+        let balance = UsageFormatter.convertedCostString(
+            cost.used,
+            preferredCurrency: context.settings.preferredCurrencyCode,
+            providerCurrency: cost.currencyCode)
         entries.append(.text(L("Extra usage balance: %@", balance), .primary))
     }
 }

@@ -6,10 +6,27 @@ import Testing
 @MainActor
 struct SettingsStoreCoverageTests {
     @Test
+    func `settings fixtures with the same label keep independent persisted values`() {
+        let first = Self.makeSettingsStore(suiteName: #function)
+        first.refreshFrequency = .fifteenMinutes
+
+        // A second invocation used to erase the first fixture's persisted domain.
+        let second = Self.makeSettingsStore(suiteName: #function)
+        second.refreshFrequency = .thirtyMinutes
+
+        #expect(first.userDefaults.string(forKey: "refreshFrequency") == RefreshFrequency.fifteenMinutes.rawValue)
+        #expect(second.userDefaults.string(forKey: "refreshFrequency") == RefreshFrequency.thirtyMinutes.rawValue)
+        #expect(first.configStore.fileURL != second.configStore.fileURL)
+
+        second.userDefaults.removeObject(forKey: "refreshFrequency")
+        #expect(first.userDefaults.string(forKey: "refreshFrequency") == RefreshFrequency.fifteenMinutes.rawValue)
+    }
+
+    @Test
     func `provider ordering and caching`() throws {
-        let suite = "SettingsStoreCoverageTests-ordering"
+        let suite = "SettingsStoreCoverageTests-ordering-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
         let config = CodexBarConfig(providers: [
             ProviderConfig(id: .zai),
@@ -25,11 +42,17 @@ struct SettingsStoreCoverageTests {
         #expect(ordered.first == .zai)
         #expect(ordered.contains(.minimax))
 
+        let configRevisionBeforeOrder = settings.configRevision
+        let backgroundRevisionBeforeOrder = settings.backgroundWorkSettingsRevision
         settings.moveProvider(fromOffsets: IndexSet(integer: 0), toOffset: 2)
         #expect(settings.orderedProviders() != ordered)
+        #expect(settings.configRevision == configRevisionBeforeOrder + 1)
+        #expect(settings.backgroundWorkSettingsRevision == backgroundRevisionBeforeOrder)
 
         let metadata = ProviderRegistry.shared.metadata
+        let backgroundRevisionBeforeEnablement = settings.backgroundWorkSettingsRevision
         try settings.setProviderEnabled(provider: .codex, metadata: #require(metadata[.codex]), enabled: true)
+        #expect(settings.backgroundWorkSettingsRevision == backgroundRevisionBeforeEnablement + 1)
         try settings.setProviderEnabled(provider: .claude, metadata: #require(metadata[.claude]), enabled: false)
         let enabled = settings.enabledProvidersOrdered(metadataByProvider: metadata)
         #expect(enabled.contains(.codex))
@@ -101,9 +124,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `copilot budget extras default off and persist in provider snapshot`() throws {
-        let suite = "SettingsStoreCoverageTests-copilot-budget-extras"
+        let suite = "SettingsStoreCoverageTests-copilot-budget-extras-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
 
         let initial = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
@@ -118,10 +141,74 @@ struct SettingsStoreCoverageTests {
     }
 
     @Test
-    func `multi account menu layout persists and bridges legacy show all token accounts`() throws {
-        let suite = "SettingsStoreCoverageTests-multi-account-layout"
+    func `agent sessions default off and persist explicit opt in`() throws {
+        let suite = "SettingsStoreCoverageTests-agent-sessions-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let configStore = testConfigStore(suiteName: suite)
+
+        let initial = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(initial.agentSessionsEnabled == false)
+        #expect(initial.agentSessionLabelStyle == .project)
+        #expect(defaults.object(forKey: "agentSessionsEnabled") == nil)
+        #expect(defaults.object(forKey: "agentSessionLabelStyle") == nil)
+
+        initial.agentSessionsEnabled = true
+        initial.agentSessionLabelStyle = .descriptiveAndProject
+        #expect(defaults.object(forKey: "agentSessionsEnabled") as? Bool == true)
+        #expect(defaults.string(forKey: "agentSessionLabelStyle") == "descriptiveAndProject")
+
+        let reloaded = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(reloaded.agentSessionsEnabled)
+        #expect(reloaded.agentSessionLabelStyle == .descriptiveAndProject)
+    }
+
+    @Test
+    func `background low power mode defaults off persists and drives effective web saver`() throws {
+        let suite = "SettingsStoreCoverageTests-background-low-power-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let configStore = testConfigStore(suiteName: suite)
+
+        let initial = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(initial.backgroundWorkLowPowerModePreference == .off)
+        #expect(initial.backgroundWorkLowPowerModeEnabled == false)
+        #expect(defaults.string(forKey: "backgroundWorkLowPowerModePreference") == "off")
+        #expect(initial.effectiveOpenAIWebBatterySaverEnabled == false)
+
+        let revision = initial.backgroundWorkSettingsRevision
+        initial.backgroundWorkLowPowerModePreference = .on
+
+        #expect(initial.backgroundWorkSettingsRevision == revision + 1)
+        #expect(initial.effectiveOpenAIWebBatterySaverEnabled)
+
+        let reloaded = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(reloaded.backgroundWorkLowPowerModeEnabled)
+        #expect(reloaded.effectiveOpenAIWebBatterySaverEnabled)
+
+        reloaded.backgroundWorkLowPowerModePreference = .off
+        reloaded.openAIWebBatterySaverEnabled = true
+        #expect(reloaded.effectiveOpenAIWebBatterySaverEnabled)
+    }
+
+    @Test
+    func `background low power mode migrates legacy enabled flag to on preference`() throws {
+        let suite = "SettingsStoreCoverageTests-background-low-power-migration-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: "backgroundWorkLowPowerModeEnabled")
+        let configStore = testConfigStore(suiteName: suite)
+
+        let migrated = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(migrated.backgroundWorkLowPowerModePreference == .on)
+        #expect(defaults.string(forKey: "backgroundWorkLowPowerModePreference") == "on")
+    }
+
+    @Test
+    func `multi account menu layout persists and bridges legacy show all token accounts`() throws {
+        let suite = "SettingsStoreCoverageTests-multi-account-layout-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
 
         let initial = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
@@ -139,9 +226,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `legacy show all token accounts migrates to stacked layout`() throws {
-        let suite = "SettingsStoreCoverageTests-legacy-token-account-layout"
+        let suite = "SettingsStoreCoverageTests-legacy-token-account-layout-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(true, forKey: "showAllTokenAccountsInMenu")
         let configStore = testConfigStore(suiteName: suite)
 
@@ -255,9 +342,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `copilot enterprise host persists in provider config`() throws {
-        let suite = "SettingsStoreCoverageTests-copilot-enterprise-host"
+        let suite = "SettingsStoreCoverageTests-copilot-enterprise-host-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
         let first = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
 
@@ -299,7 +386,7 @@ struct SettingsStoreCoverageTests {
 
         let snapshot = settings.claudeSettingsSnapshot(tokenOverride: nil)
 
-        #expect(snapshot.usageDataSource == .auto)
+        #expect(snapshot.usageDataSource == .oauth)
         #expect(snapshot.cookieSource == .off)
         #expect(snapshot.manualCookieHeader?.isEmpty == true)
     }
@@ -311,7 +398,7 @@ struct SettingsStoreCoverageTests {
 
         let snapshot = settings.claudeSettingsSnapshot(tokenOverride: nil)
 
-        #expect(snapshot.usageDataSource == .auto)
+        #expect(snapshot.usageDataSource == .web)
         #expect(snapshot.cookieSource == .manual)
         #expect(snapshot.manualCookieHeader == "sessionKey=sk-ant-session-token")
     }
@@ -449,35 +536,18 @@ struct SettingsStoreCoverageTests {
     }
 
     @Test
-    func `ensure token loaders execute`() {
+    func `unconfigured credentials are immediately empty`() {
         let settings = Self.makeSettingsStore()
 
-        settings.ensureZaiAPITokenLoaded()
-        settings.ensureSyntheticAPITokenLoaded()
-        settings.ensureCodexCookieLoaded()
-        settings.ensureClaudeCookieLoaded()
-        settings.ensureCursorCookieLoaded()
-        settings.ensureOpenCodeCookieLoaded()
-        settings.ensureFactoryCookieLoaded()
-        settings.ensureMiniMaxCookieLoaded()
-        settings.ensureMiniMaxAPITokenLoaded()
-        settings.ensureKimiAuthTokenLoaded()
-        settings.ensureKimiK2APITokenLoaded()
-        settings.ensureAugmentCookieLoaded()
-        settings.ensureAmpCookieLoaded()
-        settings.ensureOllamaCookieLoaded()
-        settings.ensureCopilotAPITokenLoaded()
-        settings.ensureTokenAccountsLoaded()
-
         #expect(settings.zaiAPIToken.isEmpty)
-        #expect(settings.syntheticAPIToken.isEmpty)
+        #expect(settings[providerConfig: .synthetic, field: .apiKey].isEmpty)
     }
 
     @Test
     func `keychain disable forces manual cookie sources`() throws {
-        let suite = "SettingsStoreCoverageTests-keychain"
+        let suite = "SettingsStoreCoverageTests-keychain-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
         let settings = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
 
@@ -499,9 +569,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `claude keychain prompt mode persists across store reload`() throws {
-        let suite = "SettingsStoreCoverageTests-claude-keychain-prompt-mode"
+        let suite = "SettingsStoreCoverageTests-claude-keychain-prompt-mode-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
 
         let first = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
@@ -516,9 +586,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `claude keychain prompt mode invalid raw falls back to only on user action`() throws {
-        let suite = "SettingsStoreCoverageTests-claude-keychain-prompt-mode-invalid"
+        let suite = "SettingsStoreCoverageTests-claude-keychain-prompt-mode-invalid-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set("invalid-mode", forKey: "claudeOAuthKeychainPromptMode")
         let configStore = testConfigStore(suiteName: suite)
 
@@ -534,9 +604,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `claude keychain read strategy persists across store reload`() throws {
-        let suite = "SettingsStoreCoverageTests-claude-keychain-read-strategy"
+        let suite = "SettingsStoreCoverageTests-claude-keychain-read-strategy-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
 
         let first = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
@@ -551,9 +621,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `claude legacy security CLI read strategy preserves no prompt intent`() throws {
-        let suite = "SettingsStoreCoverageTests-claude-keychain-read-strategy-migration"
+        let suite = "SettingsStoreCoverageTests-claude-keychain-read-strategy-migration-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(
             ClaudeOAuthKeychainReadStrategy.securityCLIExperimental.rawValue,
             forKey: "claudeOAuthKeychainReadStrategy")
@@ -574,9 +644,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `claude legacy security CLI migration preserves explicit prompt policy`() throws {
-        let suite = "SettingsStoreCoverageTests-claude-keychain-explicit-prompt-migration"
+        let suite = "SettingsStoreCoverageTests-claude-keychain-explicit-prompt-migration-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set(
             ClaudeOAuthKeychainReadStrategy.securityCLIExperimental.rawValue,
             forKey: "claudeOAuthKeychainReadStrategy")
@@ -594,9 +664,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `claude keychain read strategy invalid raw falls back to security framework`() throws {
-        let suite = "SettingsStoreCoverageTests-claude-keychain-read-strategy-invalid"
+        let suite = "SettingsStoreCoverageTests-claude-keychain-read-strategy-invalid-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         defaults.set("invalid-strategy", forKey: "claudeOAuthKeychainReadStrategy")
         let configStore = testConfigStore(suiteName: suite)
 
@@ -762,9 +832,9 @@ struct SettingsStoreCoverageTests {
 
     @Test
     func `weekly progress work days defaults to nil and persists across store reload`() throws {
-        let suite = "SettingsStoreCoverageTests-weekly-progress-work-days"
+        let suite = "SettingsStoreCoverageTests-weekly-progress-work-days-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
         let configStore = testConfigStore(suiteName: suite)
 
         let fresh = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
@@ -792,15 +862,75 @@ struct SettingsStoreCoverageTests {
         #expect(reloaded4.weeklyProgressWorkDays == nil)
     }
 
+    @Test
+    func `workday tick appearance defaults to subtle and persists valid choices`() throws {
+        let suite = "SettingsStoreCoverageTests-workday-tick-appearance-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let configStore = testConfigStore(suiteName: suite)
+
+        let fresh = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(fresh.workdayTickAppearance == .subtle)
+
+        fresh.workdayTickAppearance = .highContrast
+        #expect(defaults.string(forKey: "workdayTickAppearance") == WorkdayTickAppearance.highContrast.rawValue)
+
+        let reloaded = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(reloaded.workdayTickAppearance == .highContrast)
+
+        defaults.set("unknown", forKey: "workdayTickAppearance")
+        let invalid = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(invalid.workdayTickAppearance == .subtle)
+    }
+
+    @Test
+    func `preferred currency defaults to USD and persists an explicit selection`() {
+        let suite = "SettingsStoreCoverageTests-preferred-currency-\(UUID().uuidString)"
+        let defaults = InMemoryUserDefaults()
+        let configStore = testConfigStore(suiteName: suite)
+
+        let fresh = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(fresh.preferredCurrencyCode == "USD")
+
+        fresh.preferredCurrencyCode = "GBP"
+        let reloaded = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(reloaded.preferredCurrencyCode == "GBP")
+
+        reloaded.preferredCurrencyCode = "AED"
+        let reloadedAED = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+        #expect(reloadedAED.preferredCurrencyCode == "AED")
+
+        for code in ["NZD", "SEK", "NOK", "DKK", "PLN", "BRL", "MXN", "ZAR", "THB", "IDR", "VND", "UAH", "ILS"] {
+            reloadedAED.preferredCurrencyCode = code
+            let reloadedCurrency = Self.makeSettingsStore(userDefaults: defaults, configStore: configStore)
+            #expect(reloadedCurrency.preferredCurrencyCode == code)
+        }
+    }
+
+    @Test
+    func `preferred currency picker matches every supported exchange currency`() {
+        let codes = PreferredCurrencyOption.codes
+        #expect(codes.first == "auto")
+        #expect(Array(codes.dropFirst()) == CurrencyExchange.supportedCurrencies)
+        #expect(Set(codes).count == codes.count)
+        #expect(codes.dropFirst().map { PreferredCurrencyOption.label(for: $0) } == [
+            "USD ($)", "GBP (£)", "EUR (€)", "CZK (Kč)", "CNY (¥)", "JPY (¥)", "KRW (₩)", "CAD ($)",
+            "AUD ($)", "HKD ($)", "TWD (NT$)", "SGD ($)", "INR (₹)", "CHF (Fr.)", "AED (د.إ)", "TRY (₺)",
+            "NZD ($)", "SEK (kr)", "NOK (kr)", "DKK (kr)", "PLN (zł)", "BRL (R$)", "MXN ($)", "ZAR (R)",
+            "THB (฿)", "IDR (Rp)", "VND (₫)", "UAH (₴)", "ILS (₪)",
+        ])
+        #expect(PreferredCurrencyOption.label(for: "auto") == L("currency_auto"))
+        #expect(PreferredCurrencyOption.label(for: "XYZ") == "XYZ")
+    }
+
     private static func makeSettingsStore(
         suiteName: String = "SettingsStoreCoverageTests",
         antigravityOAuthCredentialsStore: AntigravityOAuthCredentialsStore = AntigravityOAuthCredentialsStore())
         -> SettingsStore
     {
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defaults.removePersistentDomain(forName: suiteName)
+        let defaults = InMemoryUserDefaults()
         defaults.set(false, forKey: "debugDisableKeychainAccess")
-        let configStore = testConfigStore(suiteName: suiteName)
+        let configStore = testConfigStore(suiteName: "\(suiteName)-\(UUID().uuidString)")
         return Self.makeSettingsStore(
             userDefaults: defaults,
             configStore: configStore,
@@ -826,7 +956,6 @@ struct SettingsStoreCoverageTests {
             minimaxCookieStore: InMemoryMiniMaxCookieStore(),
             minimaxAPITokenStore: InMemoryMiniMaxAPITokenStore(),
             kimiTokenStore: InMemoryKimiTokenStore(),
-            kimiK2TokenStore: InMemoryKimiK2TokenStore(),
             augmentCookieStore: InMemoryCookieHeaderStore(),
             ampCookieStore: InMemoryCookieHeaderStore(),
             copilotTokenStore: InMemoryCopilotTokenStore(),

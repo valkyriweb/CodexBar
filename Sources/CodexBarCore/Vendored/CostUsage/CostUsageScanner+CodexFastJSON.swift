@@ -5,11 +5,34 @@ extension CostUsageScanner {
         _ field: [UInt8],
         from bytes: UnsafeBufferPointer<UInt8>,
         in range: Range<Int>,
+        atDepth targetDepth: Int,
+        allowingEscapedKeys: Bool = false) -> String?
+    {
+        self.extractJSONByteField(
+            field,
+            from: bytes,
+            in: range,
+            atDepth: targetDepth,
+            allowingEscapedKeys: allowingEscapedKeys)
+        { valueIndex in
+            guard let parsed = parseJSONByteStringRange(in: bytes, index: &valueIndex, limit: range.upperBound),
+                  parsed.range.lowerBound < parsed.range.upperBound
+            else { return nil }
+            if parsed.hasEscapes {
+                return self.decodeEscapedJSONByteString(from: bytes, in: parsed.range)
+            }
+            return String(bytes: bytes[parsed.range], encoding: .utf8)
+        }
+    }
+
+    static func extractJSONByteStringFieldAllowingEmpty(
+        _ field: [UInt8],
+        from bytes: UnsafeBufferPointer<UInt8>,
+        in range: Range<Int>,
         atDepth targetDepth: Int) -> String?
     {
         self.extractJSONByteField(field, from: bytes, in: range, atDepth: targetDepth) { valueIndex in
-            guard let parsed = parseJSONByteStringRange(in: bytes, index: &valueIndex, limit: range.upperBound),
-                  parsed.range.lowerBound < parsed.range.upperBound
+            guard let parsed = parseJSONByteStringRange(in: bytes, index: &valueIndex, limit: range.upperBound)
             else { return nil }
             if parsed.hasEscapes {
                 return self.decodeEscapedJSONByteString(from: bytes, in: parsed.range)
@@ -40,11 +63,23 @@ extension CostUsageScanner {
         }
     }
 
+    static func extractJSONByteBoolField(
+        _ field: [UInt8],
+        from bytes: UnsafeBufferPointer<UInt8>,
+        in range: Range<Int>,
+        atDepth targetDepth: Int) -> Bool?
+    {
+        self.extractJSONByteField(field, from: bytes, in: range, atDepth: targetDepth) { valueIndex in
+            self.parseJSONByteBool(in: bytes, index: &valueIndex, limit: range.upperBound)
+        }
+    }
+
     private static func extractJSONByteField<T>(
         _ field: [UInt8],
         from bytes: UnsafeBufferPointer<UInt8>,
         in range: Range<Int>,
         atDepth targetDepth: Int,
+        allowingEscapedKeys: Bool = false,
         parseValue: (inout Int) -> T?) -> T?
     {
         var index = range.lowerBound
@@ -63,10 +98,12 @@ extension CostUsageScanner {
                 guard let key = parseJSONByteStringRange(in: bytes, index: &valueIndex, limit: range.upperBound)
                 else { return nil }
                 index = valueIndex
-                guard depth == targetDepth,
-                      !key.hasEscapes,
-                      self.byteRange(bytes, key.range, equals: field)
-                else { continue }
+                guard depth == targetDepth else { continue }
+                let matches = key.hasEscapes
+                    ? allowingEscapedKeys && self.decodeEscapedJSONByteString(from: bytes, in: key.range)
+                    == String(bytes: field, encoding: .utf8)
+                    : self.byteRange(bytes, key.range, equals: field)
+                guard matches else { continue }
 
                 self.skipJSONByteWhitespace(in: bytes, index: &valueIndex, limit: range.upperBound)
                 guard valueIndex < range.upperBound, bytes[valueIndex] == 0x3A else { continue } // :
@@ -171,6 +208,33 @@ extension CostUsageScanner {
         return sawDigit ? (sign == -1 ? -value : value) : nil
     }
 
+    private static func parseJSONByteBool(
+        in bytes: UnsafeBufferPointer<UInt8>,
+        index: inout Int,
+        limit: Int) -> Bool?
+    {
+        if index + 4 <= limit,
+           bytes[index] == 0x74,
+           bytes[index + 1] == 0x72,
+           bytes[index + 2] == 0x75,
+           bytes[index + 3] == 0x65
+        {
+            index += 4
+            return true
+        }
+        if index + 5 <= limit,
+           bytes[index] == 0x66,
+           bytes[index + 1] == 0x61,
+           bytes[index + 2] == 0x6C,
+           bytes[index + 3] == 0x73,
+           bytes[index + 4] == 0x65
+        {
+            index += 5
+            return false
+        }
+        return nil
+    }
+
     private static func skipJSONByteWhitespace(
         in bytes: UnsafeBufferPointer<UInt8>,
         index: inout Int,
@@ -234,7 +298,7 @@ extension CostUsageScanner {
         var data = Data([0x22])
         data.append(UnsafeBufferPointer(rebasing: bytes[range]))
         data.append(0x22)
-        return (try? JSONSerialization.jsonObject(with: data)) as? String
+        return (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) as? String
     }
 
     private static func byteRange(

@@ -2,6 +2,20 @@ import CodexBarCore
 import Foundation
 
 extension SettingsStore {
+    var codexAccountNames: [String: String] {
+        self.providerConfig(for: .codex)?.codexAccountNames ?? [:]
+    }
+
+    func renameCodexAccount(_ account: CodexVisibleAccount, to name: String) {
+        let normalized = account.withCustomName(name).customName
+        self.updateProviderConfig(provider: .codex, affectsBackgroundWork: false) { entry in
+            var names = entry.codexAccountNames ?? [:]
+            names[account.customNameRecoveryKey] = nil
+            names[account.customNameKey] = normalized
+            entry.codexAccountNames = names.isEmpty ? nil : names
+        }
+    }
+
     private var codexPersistedActiveSource: CodexActiveSource {
         self.providerConfig(for: .codex)?.codexActiveSource ?? .liveSystem
     }
@@ -152,6 +166,7 @@ extension SettingsStore {
         set {
             let source: ProviderSourceMode? = switch newValue {
             case .auto: .auto
+            case .pat: .api
             case .oauth: .oauth
             case .cli: .cli
             }
@@ -216,15 +231,10 @@ extension SettingsStore {
             return self.openAIWebAccessEnabled ? resolved : .off
         }
         set {
-            self.updateProviderConfig(provider: .codex) { entry in
-                entry.cookieSource = newValue
-            }
-            self.logProviderModeChange(provider: .codex, field: "cookieSource", value: newValue.rawValue)
+            self.setCookieSource(newValue, provider: .codex)
             self.openAIWebAccessEnabled = newValue.isEnabled
         }
     }
-
-    func ensureCodexCookieLoaded() {}
 }
 
 extension SettingsStore {
@@ -285,7 +295,7 @@ extension SettingsStore {
         else {
             return nil
         }
-        return cached.projection
+        return cached.projection.applyingCustomNames(self.codexAccountNames)
     }
 
     var codexAccountMenuProjectionNeedsRevalidation: Bool {
@@ -340,6 +350,7 @@ extension SettingsStore {
 
     var codexVisibleAccountProjection: CodexVisibleAccountProjection {
         CodexVisibleAccountProjection.make(from: self.codexAccountReconciliationSnapshot)
+            .applyingCustomNames(self.codexAccountNames)
     }
 
     var codexVisibleAccounts: [CodexVisibleAccount] {
@@ -467,7 +478,7 @@ private enum CodexManagedRemoteHomeTestingOverride {
         var unreadableStore: Bool = false
         var managedStoreURL: URL?
         var liveSystemAccount: ObservedSystemCodexAccount?
-        var reconciliationEnvironment: [String: String]?
+        @ProcessEnvironment var reconciliationEnvironment: [String: String]?
 
         var isEmpty: Bool {
             self.account == nil && self.homePath == nil && self.unreadableStore == false && self
@@ -696,14 +707,17 @@ extension SettingsStore {
             cookieSource: self.codexSnapshotCookieSource(tokenOverride: tokenOverride),
             manualCookieHeader: self.codexSnapshotCookieHeader(tokenOverride: tokenOverride),
             reconciliationSnapshot: reconciliationSnapshot,
-            resolvedActiveSource: resolvedActiveSource))
+            resolvedActiveSource: resolvedActiveSource,
+            allowExternalOAuthSources: self.codexExternalOAuthSourcesAllowed))
     }
 
     private static func codexUsageDataSource(from source: ProviderSourceMode?) -> CodexUsageDataSource {
         guard let source else { return .auto }
         switch source {
-        case .auto, .web, .api:
+        case .auto, .web:
             return .auto
+        case .api:
+            return .pat
         case .cli:
             return .cli
         case .oauth:

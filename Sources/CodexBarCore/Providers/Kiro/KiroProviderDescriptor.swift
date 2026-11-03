@@ -18,18 +18,34 @@ public enum KiroProviderDescriptor {
                 toggleTitle: "Show Kiro usage",
                 cliName: "kiro",
                 defaultEnabled: false,
+                widgetSelectable: false,
                 isPrimaryProvider: false,
                 usesAccountFallback: false,
+                debugLogUnavailableMessage: "Kiro debug log not yet implemented",
                 dashboardURL: "https://app.kiro.dev/account/usage",
                 statusPageURL: nil,
                 statusLinkURL: "https://health.aws.amazon.com/health/status"),
             branding: ProviderBranding(
-                iconStyle: .kiro,
+                iconStyle: .init(provider: .kiro),
                 iconResourceName: "ProviderIcon-kiro",
-                color: ProviderColor(red: 255 / 255, green: 153 / 255, blue: 0 / 255)),
+                color: ProviderColor(hex: 0x9046FF),
+                confettiPalette: [
+                    ProviderColor(hex: 0x9046FF),
+                    ProviderColor(hex: 0xCAA9FF),
+                    ProviderColor(hex: 0x2B2B2B),
+                ]),
             tokenCost: ProviderTokenCostConfig(
                 supportsTokenCost: false,
                 noDataMessage: { "Kiro cost summary is not supported." }),
+            pace: .calendarMonthResetWindow,
+            presentation: ProviderUsagePresentation(
+                menuBarWindowResolver: { context in
+                    guard context.metric == .automatic else { return .unhandled }
+                    return .resolved(
+                        ProviderUsagePresentation.exhausted(context.snapshot.primary, context.snapshot.secondary)
+                            ?? context.snapshot.primary ?? context.snapshot.secondary)
+                },
+                menuCard: ProviderMenuCardPresentation(primaryDetailKind: .kiroCredits)),
             fetchPlan: ProviderFetchPlan(
                 sourceModes: [.auto, .cli],
                 pipeline: ProviderFetchPipeline(resolveStrategies: { _ in [KiroCLIFetchStrategy()] })),
@@ -44,13 +60,28 @@ struct KiroCLIFetchStrategy: ProviderFetchStrategy {
     let id: String = "kiro.cli"
     let kind: ProviderFetchKind = .cli
 
+    private let checkConnectivity: @Sendable () async throws -> Void
+    private let makeProbe: @Sendable () -> KiroStatusProbe
+
+    init(
+        checkConnectivity: @escaping @Sendable () async throws -> Void = {
+            try await KiroUsageLimitsAPI.ensureReachable()
+        },
+        makeProbe: @escaping @Sendable () -> KiroStatusProbe = { KiroStatusProbe() })
+    {
+        self.checkConnectivity = checkConnectivity
+        self.makeProbe = makeProbe
+    }
+
     func isAvailable(_: ProviderFetchContext) async -> Bool {
         TTYCommandRunner.which("kiro-cli") != nil
     }
 
     func fetch(_: ProviderFetchContext) async throws -> ProviderFetchResult {
-        let probe = KiroStatusProbe()
-        let snap = try await probe.fetch()
+        if ProviderInteractionContext.current == .background {
+            try await self.checkConnectivity()
+        }
+        let snap = try await self.makeProbe().fetch()
         return self.makeResult(
             usage: snap.toUsageSnapshot(),
             sourceLabel: "cli")

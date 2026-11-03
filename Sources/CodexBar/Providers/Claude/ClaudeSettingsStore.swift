@@ -26,35 +26,30 @@ extension SettingsStore {
     }
 
     var claudeCookieHeader: String {
-        get { self.configSnapshot.providerConfig(for: .claude)?.sanitizedCookieHeader ?? "" }
-        set {
-            self.updateProviderConfig(provider: .claude) { entry in
-                entry.cookieHeader = self.normalizedConfigValue(newValue)
-            }
-            self.logSecretUpdate(provider: .claude, field: "cookieHeader", value: newValue)
-        }
+        get { self[providerConfig: .claude, field: .cookieHeader] }
+        set { self[providerConfig: .claude, field: .cookieHeader] = newValue }
     }
 
     var claudeCookieSource: ProviderCookieSource {
         get { self.resolvedCookieSource(provider: .claude, fallback: .auto) }
+        set { self.setCookieSource(newValue, provider: .claude) }
+    }
+
+    var claudeDesktopCookiesEnabled: Bool {
+        get { self.configSnapshot.providerConfig(for: .claude)?.claudeDesktopCookiesEnabled ?? false }
+        set { self.updateProviderConfig(provider: .claude) { $0.claudeDesktopCookiesEnabled = newValue } }
+    }
+
+    var claudeWorkspaceSpendEnabled: Bool {
+        get { self.configSnapshot.providerConfig(for: .claude)?.claudeWorkspaceSpendEnabled ?? false }
         set {
-            self.updateProviderConfig(provider: .claude) { entry in
-                entry.cookieSource = newValue
-            }
-            self.logProviderModeChange(provider: .claude, field: "cookieSource", value: newValue.rawValue)
+            self.updateProviderConfig(provider: .claude) { $0.claudeWorkspaceSpendEnabled = newValue }
         }
     }
 
-    func ensureClaudeCookieLoaded() {}
-
     var claudeAdminAPIKey: String {
-        get { self.configSnapshot.providerConfig(for: .claude)?.sanitizedAPIKey ?? "" }
-        set {
-            self.updateProviderConfig(provider: .claude) { entry in
-                entry.apiKey = self.normalizedConfigValue(newValue)
-            }
-            self.logSecretUpdate(provider: .claude, field: "apiKey", value: newValue)
-        }
+        get { self[providerConfig: .claude, field: .apiKey] }
+        set { self[providerConfig: .claude, field: .apiKey] = newValue }
     }
 
     var claudeSwapEnabled: Bool {
@@ -64,6 +59,19 @@ extension SettingsStore {
                 entry.claudeSwapEnabled = newValue
             }
             self.logProviderModeChange(provider: .claude, field: "claudeSwapEnabled", value: String(newValue))
+        }
+    }
+
+    var claudeSwapShowSingleAccount: Bool {
+        get { self.configSnapshot.providerConfig(for: .claude)?.claudeSwapShowSingleAccount ?? false }
+        set {
+            self.updateProviderConfig(provider: .claude) { entry in
+                entry.claudeSwapShowSingleAccount = newValue
+            }
+            self.logProviderModeChange(
+                provider: .claude,
+                field: "claudeSwapShowSingleAccount",
+                value: String(newValue))
         }
     }
 
@@ -79,6 +87,16 @@ extension SettingsStore {
                 value: newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "cleared" : "set")
         }
     }
+
+    var claudeSwapSource: ClaudeSwapAccountSource {
+        get { self.configSnapshot.providerConfig(for: .claude)?.resolvedClaudeSwapSource ?? .claudeSwap }
+        set {
+            self.updateProviderConfig(provider: .claude) { entry in
+                entry.claudeSwapSource = newValue == .claudeSwap ? nil : newValue.rawValue
+            }
+            self.logProviderModeChange(provider: .claude, field: "claudeSwapSource", value: newValue.rawValue)
+        }
+    }
 }
 
 extension SettingsStore {
@@ -87,13 +105,16 @@ extension SettingsStore {
         let account = self.selectedClaudeTokenAccount(tokenOverride: tokenOverride)
         let routing = self.claudeCredentialRouting(account: account)
         return ProviderSettingsSnapshot.ClaudeProviderSettings(
-            usageDataSource: self.claudeUsageDataSource,
+            usageDataSource: self.claudeSnapshotUsageDataSource(
+                routing: routing,
+                hasSelectedAccount: account != nil),
             webExtrasEnabled: self.claudeWebExtrasEnabled,
             cookieSource: self.claudeSnapshotCookieSource(tokenOverride: tokenOverride, routing: routing),
             manualCookieHeader: self.claudeSnapshotCookieHeader(
                 routing: routing,
                 hasSelectedAccount: account != nil),
-            organizationID: account?.sanitizedOrganizationID)
+            organizationID: account?.sanitizedOrganizationID,
+            desktopCookiesEnabled: self.claudeDesktopCookiesEnabled)
     }
 
     private static func claudeUsageDataSource(from source: ProviderSourceMode?) -> ClaudeUsageDataSource {
@@ -123,6 +144,23 @@ extension SettingsStore {
             ""
         case let .webCookie(header):
             header
+        }
+    }
+
+    private func claudeSnapshotUsageDataSource(
+        routing: ClaudeCredentialRouting,
+        hasSelectedAccount: Bool) -> ClaudeUsageDataSource
+    {
+        guard hasSelectedAccount else { return self.claudeUsageDataSource }
+        return switch routing {
+        case .oauth:
+            .oauth
+        case .adminAPIKey:
+            .api
+        case .webCookie:
+            .web
+        case .none:
+            .auto
         }
     }
 
@@ -158,5 +196,17 @@ extension SettingsStore {
             provider: .claude,
             settings: self,
             override: tokenOverride)
+    }
+}
+
+extension UsageStore {
+    var claudeTokenCostConfigDirectory: String? {
+        guard !self.settings.claudeSwapEnabled || !ClaudeSwapMenuPrecedence.prefersClaudeSwap(
+            provider: .claude,
+            accountCount: self.claudeSwapAccountSnapshots.count,
+            showSingleAccount: self.settings.claudeSwapShowSingleAccount)
+        else { return nil }
+        return self.settings.effectiveSelectedTokenAccount(for: .claude)?.claudeConfigDirectory
+            .flatMap { $0.isEmpty ? nil : $0 }
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import Testing
 @testable import CodexBarCore
 
+@Suite(CodexCredentialFixtures())
 struct CodexOAuthTests {
     private func makeContext(
         runtime: ProviderRuntime = .app,
@@ -81,11 +82,13 @@ struct CodexOAuthTests {
         #expect(creds.refreshToken.isEmpty)
         #expect(creds.idToken == nil)
         #expect(creds.accountId == nil)
+        #expect(creds.isAPIKey)
+        #expect(!creds.needsRefresh)
     }
 
     @Test
     func `reset-credit token load ignores an API key beside O auth tokens`() throws {
-        let home = FileManager.default.temporaryDirectory
+        let home = CodexCredentialFixtures.root
             .appendingPathComponent("codexbar-reset-credit-oauth-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -485,8 +488,7 @@ struct CodexOAuthTests {
 
         let result = try CodexOAuthFetchStrategy._mapResultForTesting(
             Data(json.utf8),
-            credentials: creds,
-            sourceMode: .auto)
+            credentials: creds)
 
         #expect(result.usage.primary == nil)
         #expect(result.usage.secondary?.usedPercent == 43)
@@ -520,8 +522,7 @@ struct CodexOAuthTests {
 
         let result = try CodexOAuthFetchStrategy._mapResultForTesting(
             Data(json.utf8),
-            credentials: creds,
-            sourceMode: .oauth)
+            credentials: creds)
 
         #expect(result.usage.primary == nil)
         #expect(result.usage.secondary?.usedPercent == 43)
@@ -555,8 +556,7 @@ struct CodexOAuthTests {
 
         let result = try CodexOAuthFetchStrategy._mapResultForTesting(
             Data(json.utf8),
-            credentials: creds,
-            sourceMode: .auto)
+            credentials: creds)
 
         #expect(result.usage.primary?.usedPercent == 18)
         #expect(result.usage.primary?.windowMinutes == 300)
@@ -590,8 +590,7 @@ struct CodexOAuthTests {
 
         let result = try CodexOAuthFetchStrategy._mapResultForTesting(
             Data(json.utf8),
-            credentials: creds,
-            sourceMode: .auto)
+            credentials: creds)
 
         #expect(result.usage.primary == nil)
         #expect(result.usage.secondary?.usedPercent == 43)
@@ -625,8 +624,7 @@ struct CodexOAuthTests {
 
         let result = try CodexOAuthFetchStrategy._mapResultForTesting(
             Data(json.utf8),
-            credentials: creds,
-            sourceMode: .oauth)
+            credentials: creds)
 
         #expect(result.usage.primary == nil)
         #expect(result.usage.secondary?.usedPercent == 43)
@@ -720,8 +718,7 @@ struct CodexOAuthTests {
 
         let result = try CodexOAuthFetchStrategy._mapResultForTesting(
             Data(json.utf8),
-            credentials: creds,
-            sourceMode: .auto)
+            credentials: creds)
 
         #expect(result.usage.primary == nil)
         #expect(result.usage.secondary == nil)
@@ -736,7 +733,9 @@ struct CodexOAuthTests {
 
         #expect(strategy.shouldFallback(on: CodexOAuthFetchError.unauthorized, context: context))
         #expect(strategy.shouldFallback(on: CodexOAuthCredentialsError.notFound, context: context))
+        #expect(strategy.shouldFallback(on: CodexOAuthCredentialsError.unreadable, context: context))
         #expect(strategy.shouldFallback(on: CodexOAuthCredentialsError.missingTokens, context: context))
+        #expect(!strategy.shouldFallback(on: CodexOAuthCredentialsError.readOnlySource, context: context))
         #expect(strategy.shouldFallback(on: CodexTokenRefresher.RefreshError.expired, context: context))
         #expect(strategy.shouldFallback(on: CodexTokenRefresher.RefreshError.revoked, context: context))
         #expect(strategy.shouldFallback(on: CodexTokenRefresher.RefreshError.reused, context: context))
@@ -780,12 +779,64 @@ struct CodexOAuthTests {
     }
 
     @Test
-    func `explicit O auth mode never falls back to CLI`() {
+    func `explicit O auth mode only falls back to CLI for native refresh recovery`() {
         let strategy = CodexOAuthFetchStrategy()
         let context = self.makeContext(sourceMode: .oauth)
 
         #expect(!strategy.shouldFallback(on: CodexOAuthFetchError.unauthorized, context: context))
+        #expect(strategy.shouldFallback(on: CodexOAuthCredentialsError.nativeRefreshRequired, context: context))
+        #expect(!strategy.shouldFallback(on: CodexOAuthCredentialsError.readOnlySource, context: context))
         #expect(!strategy.shouldFallback(on: CodexTokenRefresher.RefreshError.expired, context: context))
+    }
+
+    @Test
+    func `credential recovery errors direct users to codex login`() {
+        #expect(CodexOAuthCredentialsError.nativeRefreshRequired.localizedDescription.contains("codex login"))
+        #expect(CodexOAuthCredentialsError.readOnlySource.localizedDescription.contains("codex login"))
+        #expect(CodexOAuthFetchError.unauthorized.localizedDescription.contains("codex login"))
+    }
+
+    @Test
+    func `explicit O auth mode includes CLI recovery after native credentials expire`() async {
+        let context = self.makeContext(sourceMode: .oauth)
+        let strategies = await CodexProviderDescriptor.descriptor.fetchPlan.pipeline.resolveStrategies(context)
+
+        #expect(strategies.map(\.id) == ["codex.oauth", "codex.oauth-native-refresh-cli"])
+    }
+
+    @Test
+    func `native refresh recovery is unavailable when Codex CLI is missing`() async throws {
+        let home = CodexCredentialFixtures.root
+            .appendingPathComponent("codexbar-native-refresh-no-cli-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try CodexOAuthCredentialsStore.save(
+            CodexOAuthCredentials(
+                accessToken: "access-token",
+                refreshToken: "refresh-token",
+                idToken: nil,
+                accountId: "account-id",
+                lastRefresh: Date(timeIntervalSinceNow: -(9 * 24 * 60 * 60))),
+            env: ["CODEX_HOME": home.path])
+
+        var context = self.makeContext(sourceMode: .oauth)
+        context = ProviderFetchContext(
+            runtime: context.runtime,
+            sourceMode: context.sourceMode,
+            includeCredits: context.includeCredits,
+            includeOptionalUsage: context.includeOptionalUsage,
+            webTimeout: context.webTimeout,
+            webDebugDumpHTML: context.webDebugDumpHTML,
+            verbose: context.verbose,
+            env: ["CODEX_HOME": home.path, "CODEX_CLI_PATH": "/missing/codex"],
+            settings: context.settings,
+            fetcher: context.fetcher,
+            claudeFetcher: context.claudeFetcher,
+            browserDetection: context.browserDetection)
+
+        let isAvailable = await CodexOAuthNativeRefreshCLIStrategy(binaryResolver: { _ in nil })
+            .isAvailable(context)
+        #expect(!isAvailable)
     }
 
     @Test
@@ -807,5 +858,112 @@ struct CodexOAuthTests {
         let config = "chatgpt_base_url = \"https://chat.openai.com\"\n"
         let url = CodexOAuthUsageFetcher._resolveUsageURLForTesting(configContents: config)
         #expect(url.absoluteString == "https://chat.openai.com/backend-api/wham/usage")
+    }
+}
+
+extension CodexOAuthTests {
+    @Test
+    func `O auth usage response plan wins provenance over token claims`() throws {
+        let json = """
+        {
+          "plan_type": "pro",
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 12,
+              "reset_at": 1766948068,
+              "limit_window_seconds": 18000
+            }
+          }
+        }
+        """
+        let credentials = CodexOAuthCredentials(
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: Self.fixtureJWT(claims: [
+                "https://api.openai.com/auth": ["chatgpt_plan_type": "plus"],
+            ]),
+            accountId: nil,
+            lastRefresh: nil)
+
+        let snapshot = try #require(try CodexOAuthFetchStrategy._mapUsageForTesting(
+            Data(json.utf8),
+            credentials: credentials))
+        let observation = try #require(snapshot.planObservation)
+
+        #expect(observation.rawPlan == "pro")
+        #expect(observation.source == .usageResponse)
+        // Only the provider's raw identifier is exposed; the "Pro 20x" display mapping is not.
+        #expect(observation.rawPlan != "Pro 20x")
+        #expect(snapshot.loginMethod(for: .codex) == "pro")
+    }
+
+    @Test
+    func `O auth token claims supply provenance when the usage response omits a plan`() throws {
+        let json = """
+        {
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 12,
+              "reset_at": 1766948068,
+              "limit_window_seconds": 18000
+            }
+          }
+        }
+        """
+        let credentials = CodexOAuthCredentials(
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: Self.fixtureJWT(claims: ["chatgpt_plan_type": "plus"]),
+            accountId: nil,
+            lastRefresh: nil)
+
+        let snapshot = try #require(try CodexOAuthFetchStrategy._mapUsageForTesting(
+            Data(json.utf8),
+            credentials: credentials))
+        let observation = try #require(snapshot.planObservation)
+
+        #expect(observation.rawPlan == "plus")
+        #expect(observation.source == .oauthClaims)
+        #expect(snapshot.loginMethod(for: .codex) == "plus")
+    }
+
+    @Test
+    func `O auth snapshot omits plan provenance when no source reports a plan`() throws {
+        let json = """
+        {
+          "rate_limit": {
+            "primary_window": {
+              "used_percent": 12,
+              "reset_at": 1766948068,
+              "limit_window_seconds": 18000
+            }
+          }
+        }
+        """
+        let credentials = CodexOAuthCredentials(
+            accessToken: "access",
+            refreshToken: "refresh",
+            idToken: nil,
+            accountId: nil,
+            lastRefresh: nil)
+
+        let snapshot = try #require(try CodexOAuthFetchStrategy._mapUsageForTesting(
+            Data(json.utf8),
+            credentials: credentials))
+
+        #expect(snapshot.planObservation == nil)
+    }
+
+    private static func fixtureJWT(claims: [String: Any]) -> String {
+        func base64URL(_ data: Data) -> String {
+            data.base64EncodedString()
+                .replacingOccurrences(of: "=", with: "")
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+        }
+
+        let header = (try? JSONSerialization.data(withJSONObject: ["alg": "none"])) ?? Data()
+        let payload = (try? JSONSerialization.data(withJSONObject: claims)) ?? Data()
+        return "\(base64URL(header)).\(base64URL(payload))."
     }
 }

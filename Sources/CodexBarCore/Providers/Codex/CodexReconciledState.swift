@@ -5,20 +5,30 @@ public struct CodexReconciledState: Sendable {
     public let weekly: RateWindow?
     /// Named model-specific limits (e.g. Codex Spark) surfaced through `UsageSnapshot.extraRateWindows`.
     public let extraRateWindows: [NamedRateWindow]
+    public let subscriptionExpiresAt: Date?
+    public let subscriptionRenewsAt: Date?
     public let identity: ProviderIdentitySnapshot?
+    /// Raw plan provenance observed by the fetch, when the winning source reported one.
+    public let planObservation: ProviderPlanObservation?
     public let updatedAt: Date
 
     public init(
         session: RateWindow?,
         weekly: RateWindow?,
         extraRateWindows: [NamedRateWindow] = [],
+        subscriptionExpiresAt: Date? = nil,
+        subscriptionRenewsAt: Date? = nil,
         identity: ProviderIdentitySnapshot?,
+        planObservation: ProviderPlanObservation? = nil,
         updatedAt: Date)
     {
         self.session = session
         self.weekly = weekly
         self.extraRateWindows = extraRateWindows
+        self.subscriptionExpiresAt = subscriptionExpiresAt
+        self.subscriptionRenewsAt = subscriptionRenewsAt
         self.identity = identity
+        self.planObservation = planObservation
         self.updatedAt = updatedAt
     }
 
@@ -26,9 +36,15 @@ public struct CodexReconciledState: Sendable {
         primary: RateWindow?,
         secondary: RateWindow?,
         identity: ProviderIdentitySnapshot?,
+        planObservation: ProviderPlanObservation? = nil,
         updatedAt: Date = Date()) -> CodexReconciledState?
     {
-        self.make(primary: primary, secondary: secondary, identity: identity, updatedAt: updatedAt)
+        self.make(
+            primary: primary,
+            secondary: secondary,
+            identity: identity,
+            planObservation: planObservation,
+            updatedAt: updatedAt)
     }
 
     public static func fromOAuth(
@@ -43,6 +59,29 @@ public struct CodexReconciledState: Sendable {
                 from: response.additionalRateLimits,
                 now: updatedAt),
             identity: self.oauthIdentity(response: response, credentials: credentials),
+            planObservation: self.oauthPlanObservation(
+                response: response,
+                credentials: credentials,
+                observedAt: updatedAt),
+            updatedAt: updatedAt)
+    }
+
+    public static func fromPAT(
+        response: CodexUsageResponse,
+        whoami: CodexPATWhoami?,
+        updatedAt: Date = Date()) -> CodexReconciledState?
+    {
+        self.make(
+            primary: self.makeWindow(response.rateLimit?.primaryWindow),
+            secondary: self.makeWindow(response.rateLimit?.secondaryWindow),
+            extraRateWindows: CodexAdditionalRateLimitMapper.extraRateWindows(
+                from: response.additionalRateLimits,
+                now: updatedAt),
+            identity: self.patIdentity(response: response, whoami: whoami),
+            planObservation: self.patPlanObservation(
+                response: response,
+                whoami: whoami,
+                observedAt: updatedAt),
             updatedAt: updatedAt)
     }
 
@@ -55,15 +94,19 @@ public struct CodexReconciledState: Sendable {
         let resolvedEmail = accountEmail ?? snapshot.signedInEmail
         let resolvedPlan = accountPlan ?? snapshot.accountPlan
         let identity = ProviderIdentitySnapshot(
-            providerID: provider,
+            providerID: provider.instanceID,
             accountEmail: resolvedEmail,
             accountOrganization: nil,
             loginMethod: resolvedPlan)
 
+        // The web dashboard plan mixes usage-API and page-scrape provenance, so it stays a display
+        // value: leave planObservation nil instead of claiming an unverified source.
         return self.make(
             primary: snapshot.primaryLimit,
             secondary: snapshot.secondaryLimit,
             extraRateWindows: snapshot.extraRateWindows ?? [],
+            subscriptionExpiresAt: snapshot.subscriptionExpiresAt,
+            subscriptionRenewsAt: snapshot.subscriptionRenewsAt,
             identity: identity,
             updatedAt: snapshot.updatedAt)
     }
@@ -74,8 +117,11 @@ public struct CodexReconciledState: Sendable {
             secondary: self.weekly,
             tertiary: nil,
             extraRateWindows: self.extraRateWindows.isEmpty ? nil : self.extraRateWindows,
+            subscriptionExpiresAt: self.subscriptionExpiresAt,
+            subscriptionRenewsAt: self.subscriptionRenewsAt,
             updatedAt: self.updatedAt,
-            identity: self.identity)
+            identity: self.identity,
+            planObservation: self.planObservation)
     }
 
     public static func oauthIdentity(
@@ -89,11 +135,51 @@ public struct CodexReconciledState: Sendable {
             loginMethod: self.resolvePlan(response: response, credentials: credentials))
     }
 
+    public static func patIdentity(
+        response: CodexUsageResponse,
+        whoami: CodexPATWhoami?) -> ProviderIdentitySnapshot
+    {
+        ProviderIdentitySnapshot(
+            providerID: .codex,
+            accountEmail: whoami?.email,
+            accountOrganization: nil,
+            loginMethod: self.resolvePATPlan(response: response, whoami: whoami))
+    }
+
+    /// The raw plan source chosen by OAuth resolution: the usage response first, then ID-token claims.
+    public static func oauthPlanObservation(
+        response: CodexUsageResponse,
+        credentials: CodexOAuthCredentials,
+        observedAt: Date) -> ProviderPlanObservation?
+    {
+        if let plan = self.usageResponsePlan(response) {
+            return ProviderPlanObservation(rawPlan: plan, source: .usageResponse, observedAt: observedAt)
+        }
+        guard let plan = self.oauthClaimPlan(credentials) else { return nil }
+        return ProviderPlanObservation(rawPlan: plan, source: .oauthClaims, observedAt: observedAt)
+    }
+
+    /// The raw plan source chosen by PAT resolution: the usage response first, then the whoami response.
+    public static func patPlanObservation(
+        response: CodexUsageResponse,
+        whoami: CodexPATWhoami?,
+        observedAt: Date) -> ProviderPlanObservation?
+    {
+        if let plan = self.usageResponsePlan(response) {
+            return ProviderPlanObservation(rawPlan: plan, source: .usageResponse, observedAt: observedAt)
+        }
+        guard let plan = whoami?.planType else { return nil }
+        return ProviderPlanObservation(rawPlan: plan, source: .patWhoami, observedAt: observedAt)
+    }
+
     private static func make(
         primary: RateWindow?,
         secondary: RateWindow?,
         extraRateWindows: [NamedRateWindow] = [],
+        subscriptionExpiresAt: Date? = nil,
+        subscriptionRenewsAt: Date? = nil,
         identity: ProviderIdentitySnapshot?,
+        planObservation: ProviderPlanObservation? = nil,
         updatedAt: Date) -> CodexReconciledState?
     {
         let normalized = CodexRateWindowNormalizer.normalize(primary: primary, secondary: secondary)
@@ -107,7 +193,10 @@ public struct CodexReconciledState: Sendable {
             session: normalized.primary,
             weekly: normalized.secondary,
             extraRateWindows: extraRateWindows,
+            subscriptionExpiresAt: subscriptionExpiresAt,
+            subscriptionRenewsAt: subscriptionRenewsAt,
             identity: identity,
+            planObservation: planObservation,
             updatedAt: updatedAt)
     }
 
@@ -134,8 +223,12 @@ public struct CodexReconciledState: Sendable {
         return email?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func resolvePlan(response: CodexUsageResponse, credentials: CodexOAuthCredentials) -> String? {
-        if let plan = response.planType?.rawValue, !plan.isEmpty { return plan }
+    private static func usageResponsePlan(_ response: CodexUsageResponse) -> String? {
+        guard let plan = response.planType?.rawValue, !plan.isEmpty else { return nil }
+        return plan
+    }
+
+    private static func oauthClaimPlan(_ credentials: CodexOAuthCredentials) -> String? {
         guard let idToken = credentials.idToken,
               let payload = UsageFetcher.parseJWT(idToken)
         else {
@@ -145,5 +238,13 @@ public struct CodexReconciledState: Sendable {
         let authDict = payload["https://api.openai.com/auth"] as? [String: Any]
         let plan = (authDict?["chatgpt_plan_type"] as? String) ?? (payload["chatgpt_plan_type"] as? String)
         return plan?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func resolvePATPlan(response: CodexUsageResponse, whoami: CodexPATWhoami?) -> String? {
+        self.usageResponsePlan(response) ?? whoami?.planType
+    }
+
+    private static func resolvePlan(response: CodexUsageResponse, credentials: CodexOAuthCredentials) -> String? {
+        self.usageResponsePlan(response) ?? self.oauthClaimPlan(credentials)
     }
 }

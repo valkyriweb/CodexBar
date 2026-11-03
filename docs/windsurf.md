@@ -85,6 +85,10 @@ Preferences → Providers → Windsurf → Cookie source:
 5. Copy the JSON output.
 6. In CodexBar: Providers → Windsurf → Cookie source → Manual → paste the JSON bundle.
 
+For the CLI, pass the same bundle as compact, single-line JSON to
+`codexbar config set-cookie --provider windsurf --stdin`. It is stored in the existing `cookieHeader` field
+with `cookieSource` set to `manual`, and the CLI passes it to the same session-bundle parser.
+
 ## Authentication flow (Automatic mode)
 
 ```text
@@ -98,7 +102,9 @@ UsageSnapshot (daily/weekly quota %)
 
 ## Browser session extraction
 
-- **Browsers scanned**: Chrome, Edge, Brave, Arc, Vivaldi, Chromium, and compatible Chromium forks.
+- **Browsers scanned**: Chrome first, then the shared Chromium browser catalog, including Edge, Brave, Arc, Vivaldi,
+  Dia, ChatGPT Atlas, Chromium, Helium, Yandex, Comet, and supported preview channels. Browsers without profile data
+  are skipped; Safari and Firefox localStorage are not supported.
 - **Local storage path**: `~/Library/Application Support/<Browser>/<Profile>/Local Storage/leveldb/`
 - **Origins**: `https://app.devin.ai`, then legacy `https://windsurf.com`
 - Values from different structured origins are never combined. A partial app-origin bundle cannot contaminate a

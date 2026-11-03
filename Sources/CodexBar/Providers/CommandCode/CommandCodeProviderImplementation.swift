@@ -1,52 +1,63 @@
-import AppKit
 import CodexBarCore
 import Foundation
-import SwiftUI
 
 struct CommandCodeProviderImplementation: ProviderImplementation {
     let id: UsageProvider = .commandcode
 
     @MainActor
+    func tokenAccountsVisibility(context: ProviderSettingsContext, support: TokenAccountSupport) -> Bool {
+        guard support.requiresManualCookieSource else { return true }
+        if !context.settings.tokenAccounts(for: context.provider).isEmpty { return true }
+        return context.settings.commandcodeCookieSource == .manual
+    }
+
+    @MainActor
+    func applyTokenAccountCookieSource(settings: SettingsStore) {
+        if settings.commandcodeCookieSource != .manual {
+            settings.commandcodeCookieSource = .manual
+        }
+    }
+
+    @MainActor
     func observeSettings(_ settings: SettingsStore) {
+        _ = settings.commandcodeUsageDataSource
+        _ = settings.commandcodeAPIKey
         _ = settings.commandcodeCookieSource
         _ = settings.commandcodeCookieHeader
     }
 
     @MainActor
-    func settingsSnapshot(context: ProviderSettingsSnapshotContext) -> ProviderSettingsSnapshotContribution? {
-        .commandcode(context.settings.commandcodeSettingsSnapshot(tokenOverride: context.tokenOverride))
+    func sourceMode(context: ProviderSourceModeContext) -> ProviderSourceMode {
+        context.settings.commandcodeUsageDataSource
     }
 
     @MainActor
     func settingsPickers(context: ProviderSettingsContext) -> [ProviderSettingsPickerDescriptor] {
-        let cookieBinding = Binding(
-            get: { context.settings.commandcodeCookieSource.rawValue },
-            set: { raw in
-                context.settings.commandcodeCookieSource = ProviderCookieSource(rawValue: raw) ?? .auto
-            })
-        let cookieOptions = ProviderCookieSourceUI.options(
-            allowsOff: false,
-            keychainDisabled: context.settings.debugDisableKeychainAccess)
-
-        let cookieSubtitle: () -> String? = {
-            ProviderCookieSourceUI.subtitle(
-                source: context.settings.commandcodeCookieSource,
-                keychainDisabled: context.settings.debugDisableKeychainAccess,
-                auto: "Automatic imports browser cookies.",
-                manual: "Paste a Cookie header or cURL capture from Command Code.",
-                off: "Command Code cookies are disabled.")
-        }
-
-        return [
+        [
             ProviderSettingsPickerDescriptor(
-                id: "commandcode-cookie-source",
-                title: "Cookie source",
-                subtitle: "Automatic imports browser cookies.",
-                dynamicSubtitle: cookieSubtitle,
-                binding: cookieBinding,
-                options: cookieOptions,
+                id: "commandcode-usage-source",
+                title: "Usage source",
+                subtitle: "Auto uses the active saved session, otherwise an API key or browser cookies.",
+                binding: context.rawValueBinding(\.commandcodeUsageDataSource, fallback: .auto),
+                options: [
+                    ProviderSettingsPickerOption(id: ProviderSourceMode.auto.rawValue, title: "Auto"),
+                    ProviderSettingsPickerOption(id: ProviderSourceMode.api.rawValue, title: "API key"),
+                    ProviderSettingsPickerOption(id: ProviderSourceMode.web.rawValue, title: "Browser cookies"),
+                ],
                 isVisible: nil,
                 onChange: nil),
+            ProviderCookieSourceUI.picker(
+                id: "commandcode-cookie-source",
+                context: context,
+                source: \.commandcodeCookieSource,
+                allowsOff: false,
+                subtitles: {
+                    .init(
+                        auto: L("Automatic imports browser cookies."),
+                        manual: L("Paste a Cookie header or cURL capture from %@.", "Command Code"),
+                        off: L("%@ cookies are disabled.", "Command Code"))
+                },
+                isVisible: { context.settings.commandcodeUsageDataSource != .api }),
         ]
     }
 
@@ -54,26 +65,31 @@ struct CommandCodeProviderImplementation: ProviderImplementation {
     func settingsFields(context: ProviderSettingsContext) -> [ProviderSettingsFieldDescriptor] {
         [
             ProviderSettingsFieldDescriptor(
+                id: "commandcode-api-key",
+                title: "API key",
+                subtitle: "Stored in the CodexBar config file. You can also set COMMAND_CODE_API_KEY.",
+                kind: .secure,
+                placeholder: "API key",
+                binding: context.binding(\.commandcodeAPIKey),
+                actions: [],
+                isVisible: { context.settings.commandcodeUsageDataSource != .web }),
+            ProviderSettingsFieldDescriptor(
                 id: "commandcode-cookie",
                 title: "",
                 subtitle: "",
                 kind: .secure,
                 placeholder: "Cookie: …",
-                binding: context.stringBinding(\.commandcodeCookieHeader),
+                binding: context.binding(\.commandcodeCookieHeader),
                 actions: [
-                    ProviderSettingsActionDescriptor(
+                    ProviderSettingsActionDescriptor.openURL(
                         id: "commandcode-open-settings",
                         title: "Open Command Code Settings",
-                        style: .link,
-                        isVisible: nil,
-                        perform: {
-                            if let url = URL(string: "https://commandcode.ai/studio") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }),
+                        url: URL(string: "https://commandcode.ai/studio")),
                 ],
-                isVisible: { context.settings.commandcodeCookieSource == .manual },
-                onActivate: { context.settings.ensureCommandCodeCookieLoaded() }),
+                isVisible: {
+                    context.settings.commandcodeUsageDataSource != .api &&
+                        context.settings.commandcodeCookieSource == .manual
+                }),
         ]
     }
 }
