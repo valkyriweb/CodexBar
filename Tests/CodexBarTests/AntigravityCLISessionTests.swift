@@ -418,7 +418,9 @@ private final class AntigravityManualSleeper: @unchecked Sendable {
 
     func waitForSleeps(_ expectedCount: Int) async {
         for _ in 0..<200 {
-            if self.pendingSleepCount >= expectedCount { return }
+            if self.pendingSleepCount >= expectedCount {
+                return
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         Issue.record("Timed out waiting for \(expectedCount) sleep continuation(s)")
@@ -680,6 +682,7 @@ struct AntigravityCLISessionTests {
         let outputURL = tempDirectory.appendingPathComponent("result.txt")
         let script = """
         pwd > \(outputURL.path)
+        echo "${AGY_CLI_DISABLE_AUTO_UPDATE:-missing}" >> \(outputURL.path)
         if [ -e /dev/fd/\(inheritedFD) ] || [ -e /proc/self/fd/\(inheritedFD) ]; then
           echo inherited >> \(outputURL.path)
         else
@@ -703,14 +706,16 @@ struct AntigravityCLISessionTests {
                 let lines = output
                     .split(separator: "\n")
                     .map(String.init)
-                if lines.count >= 2, output.hasSuffix("\n") { break }
+                if lines.count >= 3, output.hasSuffix("\n") {
+                    break
+                }
             }
             Thread.sleep(forTimeInterval: 0.01)
         }
         let lines = try String(contentsOf: outputURL, encoding: .utf8)
             .split(separator: "\n")
             .map(String.init)
-        #expect(lines == [NSHomeDirectory(), "closed"])
+        #expect(lines == [NSHomeDirectory(), "true", "closed"])
     }
 
     @Test
@@ -759,7 +764,7 @@ struct AntigravityCLISessionTests {
         let third = await fixture.session.drainOutput()
 
         #expect(first == Data([0xE2, 0x96]))
-        #expect(AntigravityCLIHTTPSFetchStrategy.containsAuthenticationPrompt(second))
+        #expect(AntigravityCLIAuthenticationPrompt.contains(second))
         #expect(third == second)
 
         await fixture.session.finishProbe(success: false, resetAfterFetch: true, forceTerminate: true)
@@ -768,12 +773,24 @@ struct AntigravityCLISessionTests {
 
     @Test
     func `authentication prompt matcher tolerates prompt casing and spacing`() {
-        #expect(AntigravityCLIHTTPSFetchStrategy.containsAuthenticationPrompt(
+        #expect(AntigravityCLIAuthenticationPrompt.contains(
             Data("select  LOGIN\nmethod :".utf8)))
-        #expect(AntigravityCLIHTTPSFetchStrategy.containsAuthenticationPrompt(
+        #expect(AntigravityCLIAuthenticationPrompt.contains(
             Data("Select login method:".utf8)))
-        #expect(!AntigravityCLIHTTPSFetchStrategy.containsAuthenticationPrompt(
+        #expect(!AntigravityCLIAuthenticationPrompt.contains(
             Data("You are currently not signed in".utf8)))
+    }
+
+    @Test
+    func `authentication prompt matcher recognizes logged out and exhausted keyring states`() {
+        #expect(AntigravityCLIAuthenticationPrompt.contains(
+            Data("You are not logged into Antigravity.".utf8)))
+        #expect(AntigravityCLIAuthenticationPrompt.contains(
+            Data("keyringAuth: timed out after 10s, skipping keyring auth".utf8)))
+        #expect(AntigravityCLIAuthenticationPrompt.contains(
+            Data("KEYRING auth : timed out after 10s".utf8)))
+        #expect(!AntigravityCLIAuthenticationPrompt.contains(
+            Data("Welcome. You are currently not signed in.\nSigning in...".utf8)))
     }
 
     @Test
@@ -791,8 +808,8 @@ struct AntigravityCLISessionTests {
         let retainedTail = await fixture.session.drainOutput()
 
         #expect(searchableOutput == oversizedRedraw)
-        #expect(AntigravityCLIHTTPSFetchStrategy.containsAuthenticationPrompt(searchableOutput))
-        #expect(AntigravityCLIHTTPSFetchStrategy.containsAuthenticationPrompt(retainedTail))
+        #expect(AntigravityCLIAuthenticationPrompt.contains(searchableOutput))
+        #expect(AntigravityCLIAuthenticationPrompt.contains(retainedTail))
 
         await fixture.session.finishProbe(success: false, resetAfterFetch: true, forceTerminate: true)
     }
@@ -1454,7 +1471,9 @@ extension AntigravityCLISessionTests {
 
     private func waitForLaunches(_ launcher: FakeAntigravityProcessLauncher, count: Int) async -> Bool {
         for _ in 0..<200 {
-            if launcher.launchedBinarySnapshot().count >= count { return true }
+            if launcher.launchedBinarySnapshot().count >= count {
+                return true
+            }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         return false
@@ -1463,7 +1482,9 @@ extension AntigravityCLISessionTests {
     private func waitUntilStopped(_ session: AntigravityCLISession) async {
         for _ in 0..<200 {
             let running = await session.isRunning
-            if !running { return }
+            if !running {
+                return
+            }
             await Task.yield()
         }
         Issue.record("Timed out waiting for Antigravity CLI session to stop")

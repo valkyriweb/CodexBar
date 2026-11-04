@@ -18,7 +18,22 @@ public enum ClaudeDesktopProjectsLocator {
 
     public static func roots(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
-        fileManager: FileManager = .default) -> [URL]
+        fileManager: FileManager = .default,
+        includeAuditFiles: Bool = false) -> [URL]
+    {
+        var budget = DirectoryMetadataScanBudget(maxEntryCount: .max, maxDepth: 4, timeLimit: .infinity)
+        return self.roots(
+            homeDirectory: homeDirectory,
+            fileManager: fileManager,
+            budget: &budget,
+            includeAuditFiles: includeAuditFiles)
+    }
+
+    static func roots(
+        homeDirectory: URL,
+        fileManager: FileManager,
+        budget: inout DirectoryMetadataScanBudget,
+        includeAuditFiles: Bool = false) -> [URL]
     {
         let claudeApplicationSupport = homeDirectory
             .appendingPathComponent("Library", isDirectory: true)
@@ -32,21 +47,27 @@ public enum ClaudeDesktopProjectsLocator {
         var queue = sessionRoots.map { (url: $0, depth: 0) }
         var visited = Set(sessionRoots.map(\.standardizedFileURL.path))
         var nextIndex = 0
-        // Current Desktop entries under claude-code-sessions are metadata whose cliSessionId maps to the
-        // shared ~/.claude/projects logs. Seed that root anyway so embedded project stores are found when present.
-        // Covers observed Desktop layouts through account/workspace, session, agent, and local_agent
-        // without descending into arbitrary checked-out workspaces.
-        let maxDepth = 4
-
-        while nextIndex < queue.count {
+        while nextIndex < queue.count, budget.hasTimeRemaining() {
             let current = queue[nextIndex]
             nextIndex += 1
             if let projects = self.projectsRoot(under: current.url, fileManager: fileManager) {
                 roots.append(projects)
             }
 
-            guard current.depth < maxDepth else { continue }
-            for child in self.childDirectories(at: current.url, fileManager: fileManager) {
+            // Audit files are cost inputs, not project roots for live-session correlation.
+            let audit = current.url.appendingPathComponent("audit.jsonl")
+            if includeAuditFiles,
+               let values = try? audit.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+               values.isRegularFile == true, values.isSymbolicLink != true
+            {
+                roots.append(audit.standardizedFileURL)
+            }
+
+            guard current.depth < budget.maxDepth else { continue }
+            for child in budget.childDirectories(in: current.url, fileManager: fileManager) {
+                guard !self.skippedDirectoryNames.contains(child.lastPathComponent),
+                      (try? child.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == false
+                else { continue }
                 let standardized = child.standardizedFileURL
                 guard visited.insert(standardized.path).inserted else { continue }
                 queue.append((standardized, current.depth + 1))
@@ -64,26 +85,5 @@ public enum ClaudeDesktopProjectsLocator {
               isDirectory.boolValue
         else { return nil }
         return projects.standardizedFileURL
-    }
-
-    private static func childDirectories(at url: URL, fileManager: FileManager) -> [URL] {
-        guard let children = try? fileManager.contentsOfDirectory(
-            at: url,
-            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants])
-        else {
-            return []
-        }
-
-        return children.compactMap { child in
-            guard !self.skippedDirectoryNames.contains(child.lastPathComponent) else { return nil }
-            guard let values = try? child.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
-                  values.isSymbolicLink != true,
-                  values.isDirectory == true
-            else {
-                return nil
-            }
-            return child
-        }
     }
 }

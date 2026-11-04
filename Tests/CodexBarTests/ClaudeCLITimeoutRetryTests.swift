@@ -72,7 +72,7 @@ struct ClaudeCLITimeoutRetryTests {
         let recorded = await attempts.snapshot()
         #expect(recorded.count == 2)
         #expect(recorded.timeouts == [24, 60])
-        #expect(snapshot.primary.usedPercent == 9)
+        #expect(snapshot.primary?.usedPercent == 9)
         #expect(snapshot.secondary?.usedPercent == 12)
         #expect(snapshot.accountEmail == "cli@example.com")
     }
@@ -92,7 +92,7 @@ struct ClaudeCLITimeoutRetryTests {
         }
 
         await #expect(throws: ClaudeStatusProbeError.self) {
-            try await self.withNoOAuthCredentials {
+            try await self.withLoggedInCLIWithoutOAuth {
                 try await ClaudeCLIResolver.withResolvedBinaryPathOverrideForTesting("/usr/bin/true") {
                     try await ClaudeStatusProbe.withFetchOverrideForTesting(fetchOverride) {
                         try await fetcher.loadLatestUsage(model: "sonnet")
@@ -134,7 +134,7 @@ struct ClaudeCLITimeoutRetryTests {
                 rawText: "probe raw")
         }
 
-        let snapshot = try await self.withNoOAuthCredentials {
+        let snapshot = try await self.withLoggedInCLIWithoutOAuth {
             try await self.withClaudeWebStub(handler: { request in
                 webRequests.record(request.url?.path ?? "<missing>")
                 throw URLError(.userAuthenticationRequired)
@@ -151,7 +151,7 @@ struct ClaudeCLITimeoutRetryTests {
         #expect(recorded.count == 2)
         #expect(recorded.timeouts == [12, 60])
         #expect(webRequests.snapshot().isEmpty)
-        #expect(snapshot.primary.usedPercent == 5)
+        #expect(snapshot.primary?.usedPercent == 5)
         #expect(snapshot.secondary?.usedPercent == 7)
         #expect(snapshot.accountEmail == "loading-cli@example.com")
     }
@@ -183,7 +183,7 @@ struct ClaudeCLITimeoutRetryTests {
                 rawText: "probe raw")
         }
 
-        let snapshot = try await self.withNoOAuthCredentials {
+        let snapshot = try await self.withLoggedInCLIWithoutOAuth {
             try await ClaudeCLIResolver.withResolvedBinaryPathOverrideForTesting("/usr/bin/true") {
                 try await ClaudeStatusProbe.withFetchOverrideForTesting(fetchOverride) {
                     try await fetcher.loadLatestUsage(model: "sonnet")
@@ -194,7 +194,7 @@ struct ClaudeCLITimeoutRetryTests {
         let recorded = await attempts.snapshot()
         #expect(recorded.count == 2)
         #expect(recorded.timeouts == [12, 60])
-        #expect(snapshot.primary.usedPercent == 28)
+        #expect(snapshot.primary?.usedPercent == 28)
         #expect(snapshot.secondary?.usedPercent == 36)
         #expect(snapshot.accountEmail == "auto-cli@example.com")
     }
@@ -321,13 +321,13 @@ struct ClaudeCLITimeoutRetryTests {
         let recorded = await attempts.snapshot()
         #expect(recorded.count == 1)
         #expect(recorded.timeouts == [24])
-        #expect(snapshot.primary.usedPercent == 11)
+        #expect(snapshot.primary?.usedPercent == 11)
         #expect(snapshot.secondary?.usedPercent == 17)
         #expect(snapshot.accountEmail == "manual-cli@example.com")
         #expect(ClaudeCLIRateLimitGate.currentBlockedUntil() == nil)
     }
 
-    private func withNoOAuthCredentials<T>(operation: () async throws -> T) async rethrows -> T {
+    private func withLoggedInCLIWithoutOAuth<T>(operation: () async throws -> T) async rethrows -> T {
         let missingCredentialsURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("missing-claude-creds-\(UUID().uuidString).json")
         return try await KeychainCacheStore.withServiceOverrideForTesting("rat-107-\(UUID().uuidString)") {
@@ -341,7 +341,9 @@ struct ClaudeCLITimeoutRetryTests {
                                 data: nil,
                                 fingerprint: nil)
                             {
-                                try await operation()
+                                try await ClaudeCLIAuthStatusProbe.withResultOverrideForTesting(true) {
+                                    try await operation()
+                                }
                             }
                         }
                     }

@@ -4,7 +4,7 @@ import Testing
 @testable import CodexBarCLI
 @testable import CodexBarCore
 
-@Suite(.serialized)
+@Suite(.serialized, CodexCredentialFixtures())
 @MainActor
 struct CodexDashboardWorkedExampleParityTests {
     @Test
@@ -424,12 +424,14 @@ struct CodexDashboardWorkedExampleParityTests {
             .appendingPathComponent("usage-history.jsonl")
         let planStore = testPlanUtilizationHistoryStore(
             suiteName: "CodexDashboardWorkedExampleParityTests-\(UUID().uuidString)")
-        return UsageStore(
+        let store = UsageStore(
             fetcher: UsageFetcher(environment: [:]),
             browserDetection: BrowserDetection(cacheTTL: 0),
             settings: settings,
             historicalUsageHistoryStore: HistoricalUsageHistoryStore(fileURL: historyURL),
             planUtilizationHistoryStore: planStore)
+        store._cancelPlanUtilizationHistoryLoadForTesting()
+        return store
     }
 
     private func makeCLIContext(
@@ -458,7 +460,7 @@ struct CodexDashboardWorkedExampleParityTests {
     }
 
     private func makeAuthHome(email: String?, accountId: String? = nil) throws -> URL {
-        let homeURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+        let homeURL = CodexCredentialFixtures.root.appendingPathComponent(
             UUID().uuidString,
             isDirectory: true)
         try self.writeCodexAuthFile(homeURL: homeURL, email: email, accountId: accountId)
@@ -466,7 +468,7 @@ struct CodexDashboardWorkedExampleParityTests {
     }
 
     private func makeEmptyHome() -> URL {
-        let homeURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+        let homeURL = CodexCredentialFixtures.root.appendingPathComponent(
             UUID().uuidString,
             isDirectory: true)
         try? FileManager.default.createDirectory(at: homeURL, withIntermediateDirectories: true)

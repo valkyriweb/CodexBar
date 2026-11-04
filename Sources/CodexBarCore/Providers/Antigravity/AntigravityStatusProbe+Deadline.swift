@@ -1,7 +1,9 @@
 import Foundation
 
 extension AntigravityStatusProbe {
-    private static let processProbeLog = CodexBarLog.logger(LogCategories.antigravity)
+    @TaskLocal static var deadlineNow: @Sendable () -> Date = { Date() }
+
+    private static let processProbeLog = CodexBarLog.logger(LogCategories.provider(.antigravity))
 
     private enum ProcessSnapshotFetchFailure {
         case antigravity(AntigravityStatusProbeError)
@@ -121,7 +123,7 @@ extension AntigravityStatusProbe {
 
     static func timeoutForNextAttempt(timeout: TimeInterval, deadline: Date?) -> TimeInterval? {
         guard let deadline else { return timeout }
-        let remaining = deadline.timeIntervalSinceNow
+        let remaining = deadline.timeIntervalSince(Self.deadlineNow())
         guard remaining > 0 else { return nil }
         return min(timeout, remaining)
     }

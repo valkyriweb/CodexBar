@@ -7,6 +7,15 @@ import Musl
 #endif
 import Foundation
 
+#if DEBUG
+private enum SpawnedProcessGroupTestingOverrides {
+    @TaskLocal static var outputHolderDiscoveryHook: (@Sendable () -> Void)?
+    @TaskLocal static var outputHolderPreKillSnapshotHook: (@Sendable () -> Void)?
+    @TaskLocal static var outputHolderCleanupMaxLifetime: TimeInterval?
+    @TaskLocal static var forcePTYPrimaryDescriptorReservationFailure = false
+}
+#endif
+
 package final class SpawnedProcessGroup: @unchecked Sendable {
     package enum LaunchError: LocalizedError {
         case setupFailed(String)
@@ -25,6 +34,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
     private final class TerminationState: @unchecked Sendable {
         private let condition = NSCondition()
         private var exitObserved = false
+        private var exitObservedAt: Date?
         private var reapRequested = false
         private var status: Int32?
 
@@ -36,9 +46,14 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
             self.condition.withLock { self.status }
         }
 
+        var observationDate: Date? {
+            self.condition.withLock { self.exitObservedAt }
+        }
+
         func observeExit() {
             self.condition.withLock {
                 self.exitObserved = true
+                self.exitObservedAt = Date()
                 self.condition.broadcast()
             }
         }
@@ -81,7 +96,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         }
     }
 
-    private struct OutputPipeIdentity: Hashable {
+    private struct OutputPipeIdentity: Hashable, Sendable {
         #if canImport(Darwin)
         let firstHandle: UInt64
         let secondHandle: UInt64
@@ -133,23 +148,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
         #if canImport(Darwin)
         private static func process(pid: pid_t, holdsAny pipes: Set<OutputPipeIdentity>) -> Bool {
-            let requiredBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-            guard requiredBytes > 0 else { return false }
-            let stride = MemoryLayout<proc_fdinfo>.stride
-            var descriptors = [proc_fdinfo](
-                repeating: proc_fdinfo(),
-                count: Int(requiredBytes) / stride + 8)
-            let actualBytes = descriptors.withUnsafeMutableBytes { buffer in
-                proc_pidinfo(
-                    pid,
-                    PROC_PIDLISTFDS,
-                    0,
-                    buffer.baseAddress,
-                    Int32(buffer.count))
-            }
-            guard actualBytes > 0 else { return false }
-
-            for descriptor in descriptors.prefix(Int(actualBytes) / stride)
+            for descriptor in DarwinProcessEnumerator.fileDescriptors(pid: pid)
                 where descriptor.proc_fdtype == PROX_FDTYPE_PIPE
             {
                 var info = pipe_fdinfo()
@@ -171,7 +170,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         #endif
     }
 
-    private struct OutputTTYIdentity: Hashable {
+    private struct OutputTTYIdentity: Hashable, Sendable {
         let device: UInt64
         let inode: UInt64
         let rawDevice: UInt64
@@ -218,23 +217,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
         #if canImport(Darwin)
         private static func process(pid: pid_t, holdsAny terminals: Set<OutputTTYIdentity>) -> Bool {
-            let requiredBytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
-            guard requiredBytes > 0 else { return false }
-            let stride = MemoryLayout<proc_fdinfo>.stride
-            var descriptors = [proc_fdinfo](
-                repeating: proc_fdinfo(),
-                count: Int(requiredBytes) / stride + 8)
-            let actualBytes = descriptors.withUnsafeMutableBytes { buffer in
-                proc_pidinfo(
-                    pid,
-                    PROC_PIDLISTFDS,
-                    0,
-                    buffer.baseAddress,
-                    Int32(buffer.count))
-            }
-            guard actualBytes > 0 else { return false }
-
-            for descriptor in descriptors.prefix(Int(actualBytes) / stride)
+            for descriptor in DarwinProcessEnumerator.fileDescriptors(pid: pid)
                 where descriptor.proc_fdtype == PROX_FDTYPE_VNODE
             {
                 var info = vnode_fdinfo()
@@ -261,7 +244,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
     private static func allProcessIDs() -> [pid_t] {
         #if canImport(Darwin)
-        return self.processIDs(type: UInt32(PROC_ALL_PIDS), typeInfo: 0)
+        return DarwinProcessEnumerator.allPIDs()
         #else
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else { return [] }
         return entries.compactMap(pid_t.init)
@@ -277,29 +260,11 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
     private static func processIDs(inProcessGroup processGroup: pid_t) -> [pid_t] {
         #if canImport(Darwin)
-        return self.processIDs(type: UInt32(PROC_PGRP_ONLY), typeInfo: UInt32(bitPattern: processGroup))
+        return DarwinProcessEnumerator.allPIDs(type: UInt32(PROC_PGRP_ONLY), typeInfo: UInt32(bitPattern: processGroup))
         #else
         return self.allProcessIDs().filter { getpgid($0) == processGroup }
         #endif
     }
-
-    #if canImport(Darwin)
-    private static func processIDs(type: UInt32, typeInfo: UInt32) -> [pid_t] {
-        let requiredBytes = proc_listpids(type, typeInfo, nil, 0)
-        guard requiredBytes > 0 else { return [] }
-        let stride = MemoryLayout<pid_t>.stride
-        var pids = [pid_t](repeating: 0, count: Int(requiredBytes) / stride + 32)
-        let actualBytes = pids.withUnsafeMutableBytes { buffer in
-            proc_listpids(
-                type,
-                typeInfo,
-                buffer.baseAddress,
-                Int32(buffer.count))
-        }
-        guard actualBytes > 0 else { return [] }
-        return Array(pids.prefix(Int(actualBytes) / stride)).filter { $0 > 0 }
-    }
-    #endif
 
     package let pid: pid_t
     package let processGroup: pid_t
@@ -308,18 +273,29 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
     private let outputPipes: Set<OutputPipeIdentity>
     private let outputTTYs: Set<OutputTTYIdentity>
     private let rootIdentity: TTYProcessTreeTerminator.ProcessIdentity?
+    private let reservedPTYPrimaryDescriptor: OwnedFileDescriptorState?
 
     private init(
         pid: pid_t,
         outputPipes: Set<OutputPipeIdentity>,
-        outputTTYs: Set<OutputTTYIdentity> = [])
+        outputTTYs: Set<OutputTTYIdentity> = [],
+        reservedPTYPrimaryDescriptor: OwnedFileDescriptorState? = nil)
     {
         self.pid = pid
         self.processGroup = pid
         self.outputPipes = outputPipes
         self.outputTTYs = outputTTYs
+        self.reservedPTYPrimaryDescriptor = reservedPTYPrimaryDescriptor
         self.rootIdentity = TTYProcessTreeTerminator.processIdentity(for: pid)
         self.startWaiter()
+    }
+
+    package static func adopt(
+        pid: pid_t,
+        outputFileDescriptors: [Int32]) -> SpawnedProcessGroup
+    {
+        let outputPipes = Set(outputFileDescriptors.compactMap(OutputPipeIdentity.resolve(fileDescriptor:)))
+        return SpawnedProcessGroup(pid: pid, outputPipes: outputPipes)
     }
 
     package static func launch(
@@ -376,10 +352,16 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         }
         defer { posix_spawnattr_destroy(&attributes) }
 
+        var emptySignalMask = sigset_t()
+        guard sigemptyset(&emptySignalMask) == 0,
+              posix_spawnattr_setsigmask(&attributes, &emptySignalMask) == 0
+        else {
+            throw LaunchError.setupFailed("posix_spawn signal mask")
+        }
         #if canImport(Darwin)
-        let flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT
+        let flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT
         #else
-        let flags = POSIX_SPAWN_SETPGROUP
+        let flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK
         #endif
         guard posix_spawnattr_setflags(&attributes, Int16(flags)) == 0,
               posix_spawnattr_setpgroup(&attributes, 0) == 0
@@ -429,6 +411,9 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         guard let outputTTY = OutputTTYIdentity.resolve(fileDescriptor: secondaryFD) else {
             throw LaunchError.setupFailed("resolve PTY identity")
         }
+        guard let reservedPTYPrimaryDescriptor = Self.reservePTYPrimaryDescriptor(primaryFD) else {
+            throw LaunchError.setupFailed("reserve PTY primary descriptor")
+        }
         #if canImport(Darwin)
         var fileActions: posix_spawn_file_actions_t?
         #else
@@ -449,7 +434,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         }
         if let workingDirectory {
             fileActionResults.append(workingDirectory.path.withCString { path in
-                posix_spawn_file_actions_addchdir_np(&fileActions, path)
+                PosixSpawnFileActionsCompatibility.addChangeDirectory(&fileActions, path: path)
             })
         }
         #if canImport(Glibc) || canImport(Musl)
@@ -475,10 +460,16 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         }
         defer { posix_spawnattr_destroy(&attributes) }
 
+        var emptySignalMask = sigset_t()
+        guard sigemptyset(&emptySignalMask) == 0,
+              posix_spawnattr_setsigmask(&attributes, &emptySignalMask) == 0
+        else {
+            throw LaunchError.setupFailed("posix_spawn PTY signal mask")
+        }
         #if canImport(Darwin)
-        let flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT
+        let flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_CLOEXEC_DEFAULT
         #else
-        let flags = POSIX_SPAWN_SETPGROUP
+        let flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK
         #endif
         guard posix_spawnattr_setflags(&attributes, Int16(flags)) == 0,
               posix_spawnattr_setpgroup(&attributes, 0) == 0
@@ -511,7 +502,11 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         guard spawnResult == 0 else {
             throw LaunchError.spawnFailed(String(cString: strerror(spawnResult)))
         }
-        return SpawnedProcessGroup(pid: pid, outputPipes: [], outputTTYs: [outputTTY])
+        return SpawnedProcessGroup(
+            pid: pid,
+            outputPipes: [],
+            outputTTYs: [outputTTY],
+            reservedPTYPrimaryDescriptor: reservedPTYPrimaryDescriptor)
     }
 
     package var isRunning: Bool {
@@ -520,6 +515,10 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
 
     package var terminationStatus: Int32? {
         self.termination.value
+    }
+
+    package var exitObservationDate: Date? {
+        self.termination.observationDate
     }
 
     package var hasResidualProcessGroup: Bool {
@@ -531,7 +530,7 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(max(0, grace))
         var processIdentities = self.currentResidualProcessIdentities(includeDescendants: true)
         processIdentities.formUnion(self.currentProcessGroupMemberIdentities())
-        if let rootIdentity = self.rootIdentity {
+        if self.isRunning, let rootIdentity = self.rootIdentity {
             processIdentities.insert(rootIdentity)
         }
         Self.signal(processIdentities: processIdentities, signal: SIGTERM)
@@ -546,6 +545,8 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         processIdentities.formUnion(self.currentProcessGroupMemberIdentities())
         if self.isRunning, let rootIdentity = self.rootIdentity {
             processIdentities.insert(rootIdentity)
+        } else if let rootIdentity = self.rootIdentity {
+            processIdentities.remove(rootIdentity)
         }
         Self.signal(processIdentities: processIdentities, signal: SIGKILL)
 
@@ -553,6 +554,35 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         while processIdentities.contains(where: TTYProcessTreeTerminator.isCurrent(_:)),
               Date() < killDeadline
         {
+            usleep(20000)
+        }
+        return self.finishSynchronously()
+    }
+
+    /// Abort a process whose output channel is no longer safe to inspect.
+    ///
+    /// Unlike normal cleanup, this deliberately avoids the system-wide output-holder scan. The caller closes
+    /// the output descriptor first, then this method targets only the launch process tree and dedicated process
+    /// group so TERM-to-KILL escalation remains bounded even when process enumeration is slow under load.
+    @discardableResult
+    package func abortSynchronously(grace: TimeInterval = 0.4) -> Int32? {
+        let grace = max(0, grace)
+        let termDeadline = Date().addingTimeInterval(grace)
+        var processIdentities = self.currentAbortProcessIdentities()
+
+        self.signalOwnedProcessGroup(SIGTERM)
+        Self.signal(processIdentities: processIdentities, signal: SIGTERM)
+
+        while self.abortTargetsRemain(processIdentities), Date() < termDeadline {
+            usleep(20000)
+        }
+
+        processIdentities.formUnion(self.currentAbortProcessIdentities())
+        self.signalOwnedProcessGroup(SIGKILL)
+        Self.signal(processIdentities: processIdentities, signal: SIGKILL)
+
+        let killDeadline = Date().addingTimeInterval(grace)
+        while self.abortTargetsRemain(processIdentities), Date() < killDeadline {
             usleep(20000)
         }
         return self.finishSynchronously()
@@ -569,20 +599,23 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
     }
 
     @discardableResult
-    package func terminate(grace: TimeInterval = 0.4) async -> Int32? {
+    package func terminate(
+        grace: TimeInterval = 0.4,
+        now: @Sendable () -> Date = Date.init,
+        sleep: @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }) async -> Int32?
+    {
         if self.isRunning {
-            let killDeadline = Date().addingTimeInterval(max(0, grace))
+            let killDeadline = now().addingTimeInterval(max(0, grace))
             var processIdentities = self.currentResidualProcessIdentities(includeDescendants: true)
             processIdentities.formUnion(self.currentProcessGroupMemberIdentities())
             if let rootIdentity = TTYProcessTreeTerminator.processIdentity(for: self.pid) {
                 processIdentities.insert(rootIdentity)
             }
             Self.signal(processIdentities: processIdentities, signal: SIGTERM)
-            _ = await self.waitForExit(timeout: max(0, killDeadline.timeIntervalSinceNow))
-            while processIdentities.contains(where: TTYProcessTreeTerminator.isCurrent(_:)),
-                  Date() < killDeadline
+            while self.isRunning || processIdentities.contains(where: TTYProcessTreeTerminator.isCurrent(_:)),
+                  now() < killDeadline
             {
-                try? await Task.sleep(for: .milliseconds(20))
+                await sleep(.milliseconds(20))
             }
 
             processIdentities.formUnion(self.currentResidualProcessIdentities(includeDescendants: false))
@@ -592,11 +625,9 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
                 if let rootIdentity = TTYProcessTreeTerminator.processIdentity(for: self.pid) {
                     processIdentities.insert(rootIdentity)
                 }
-                Self.signal(processIdentities: processIdentities, signal: SIGKILL)
-                _ = await self.waitForExit(timeout: grace)
-            } else {
-                Self.signal(processIdentities: processIdentities, signal: SIGKILL)
             }
+            Self.signal(processIdentities: processIdentities, signal: SIGKILL)
+            _ = await self.waitForExit(timeout: grace)
             _ = await self.waitForResidualProcessesExit(processIdentities, timeout: grace)
             await self.finish()
             return self.terminationStatus
@@ -721,11 +752,33 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         return identities
     }
 
-    private func currentOutputHolderIdentities() -> Set<TTYProcessTreeTerminator.ProcessIdentity> {
-        let excludedPIDs: Set<pid_t> = [getpid(), self.pid]
-        var holderPIDs = OutputPipeIdentity.holderPIDs(for: self.outputPipes)
-        holderPIDs.formUnion(OutputTTYIdentity.holderPIDs(for: self.outputTTYs))
-        return Set(holderPIDs.subtracting(excludedPIDs).compactMap(TTYProcessTreeTerminator.processIdentity(for:)))
+    private func currentAbortProcessIdentities() -> Set<TTYProcessTreeTerminator.ProcessIdentity> {
+        var identities = self.observedProcessGroupMembers.snapshot
+        identities.formUnion(self.currentProcessGroupMemberIdentities())
+        guard let rootIdentity = self.rootIdentity,
+              TTYProcessTreeTerminator.isCurrent(rootIdentity)
+        else {
+            return identities
+        }
+
+        identities.insert(rootIdentity)
+        identities.formUnion(
+            TTYProcessTreeTerminator.descendantPIDs(of: self.pid)
+                .compactMap(TTYProcessTreeTerminator.processIdentity(for:)))
+        return identities
+    }
+
+    private func signalOwnedProcessGroup(_ signal: Int32) {
+        guard let rootIdentity = self.rootIdentity,
+              TTYProcessTreeTerminator.isCurrent(rootIdentity)
+        else { return }
+        _ = kill(-self.processGroup, signal)
+    }
+
+    private func abortTargetsRemain(
+        _ processIdentities: Set<TTYProcessTreeTerminator.ProcessIdentity>) -> Bool
+    {
+        processIdentities.contains(where: TTYProcessTreeTerminator.isCurrent(_:)) || self.hasResidualProcessGroup
     }
 
     private func currentProcessGroupMemberIdentities() -> Set<TTYProcessTreeTerminator.ProcessIdentity> {
@@ -806,4 +859,317 @@ package final class SpawnedProcessGroup: @unchecked Sendable {
         let signal = rawStatus & 0x7F
         return signal == 0 ? (rawStatus >> 8) & 0xFF : signal
     }
+}
+
+extension SpawnedProcessGroup {
+    private func currentOutputHolderIdentities() -> Set<TTYProcessTreeTerminator.ProcessIdentity> {
+        let excludedPIDs: Set<pid_t> = [getpid(), self.pid]
+        return Self.outputHolderIdentities(
+            outputPipes: self.outputPipes,
+            outputTTYs: self.outputTTYs,
+            excludedPIDs: excludedPIDs)
+    }
+
+    /// Serializes transfer and closure of a descriptor owned by the process group.
+    private final class OwnedFileDescriptorState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fileDescriptor: Int32?
+
+        init(fileDescriptor: Int32) {
+            self.fileDescriptor = fileDescriptor
+        }
+
+        deinit {
+            self.discard()
+        }
+
+        func take() -> Int32? {
+            self.lock.withLock {
+                defer { self.fileDescriptor = nil }
+                return self.fileDescriptor
+            }
+        }
+
+        @discardableResult
+        func discard() -> Bool {
+            guard let fileDescriptor = self.take() else { return false }
+            _ = close(fileDescriptor)
+            return true
+        }
+    }
+
+    /// The lock makes the descriptor/completion transition one-shot across worker and expiry queues.
+    private final class OutputHolderCleanupLease: @unchecked Sendable {
+        let outputPipes: Set<OutputPipeIdentity>
+        let outputTTYs: Set<OutputTTYIdentity>
+        let excludedPIDs: Set<pid_t>
+        let grace: TimeInterval
+        let preKillSnapshotHook: (@Sendable () -> Void)?
+
+        private let deadline: DispatchTime
+        private let completion = DispatchGroup()
+        private let lock = NSLock()
+        private var duplicatedPrimaryFileDescriptor: Int32?
+        private var finished = false
+
+        init(
+            duplicatedPrimaryFileDescriptor: Int32,
+            outputPipes: Set<OutputPipeIdentity>,
+            outputTTYs: Set<OutputTTYIdentity>,
+            excludedPIDs: Set<pid_t>,
+            grace: TimeInterval,
+            preKillSnapshotHook: (@Sendable () -> Void)?,
+            maxLifetime: TimeInterval,
+            now: DispatchTime = .now())
+        {
+            self.duplicatedPrimaryFileDescriptor = duplicatedPrimaryFileDescriptor
+            self.outputPipes = outputPipes
+            self.outputTTYs = outputTTYs
+            self.excludedPIDs = excludedPIDs
+            self.grace = max(0, grace)
+            self.preKillSnapshotHook = preKillSnapshotHook
+            self.deadline = now + max(0, maxLifetime)
+            self.completion.enter()
+        }
+
+        var isActive: Bool {
+            self.withActiveState { true } == true
+        }
+
+        func scheduleExpiry(
+            schedule: (DispatchTime, @escaping @Sendable () -> Void) -> Void = {
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: $0, execute: $1)
+            })
+        {
+            schedule(self.deadline) { self.finish() }
+        }
+
+        func withActiveState<T>(_ operation: () -> T) -> T? {
+            var descriptorToClose: Int32?
+            self.lock.lock()
+            if !self.finished, DispatchTime.now().uptimeNanoseconds >= self.deadline.uptimeNanoseconds {
+                self.finished = true
+                descriptorToClose = self.duplicatedPrimaryFileDescriptor
+                self.duplicatedPrimaryFileDescriptor = nil
+            }
+            guard !self.finished else {
+                self.lock.unlock()
+                self.closeAndComplete(descriptorToClose)
+                return nil
+            }
+            let result = operation()
+            self.lock.unlock()
+            return result
+        }
+
+        func finish() {
+            let descriptorToClose = self.lock.withLock { () -> Int32? in
+                guard !self.finished else { return nil }
+                self.finished = true
+                defer { self.duplicatedPrimaryFileDescriptor = nil }
+                return self.duplicatedPrimaryFileDescriptor
+            }
+            self.closeAndComplete(descriptorToClose)
+        }
+
+        func waitForCompletion(timeout: TimeInterval) -> Bool {
+            self.completion.wait(timeout: .now() + max(0, timeout)) == .success
+        }
+
+        private func closeAndComplete(_ descriptor: Int32?) {
+            guard let descriptor else { return }
+            _ = close(descriptor)
+            self.completion.leave()
+        }
+    }
+
+    /// Hard-stop a live PTY root without making the caller wait on system-wide holder discovery.
+    @discardableResult
+    package func hardStopLivePTYRootSynchronously(grace: TimeInterval = 0.4) -> Int32? {
+        #if DEBUG
+        // Task-local values do not cross a GCD boundary, so capture the test hooks before dispatching.
+        let discoveryHook = SpawnedProcessGroupTestingOverrides.outputHolderDiscoveryHook
+        let preKillSnapshotHook = SpawnedProcessGroupTestingOverrides.outputHolderPreKillSnapshotHook
+        let cleanupMaxLifetime = max(0, SpawnedProcessGroupTestingOverrides.outputHolderCleanupMaxLifetime ?? 15)
+        #else
+        let discoveryHook: (@Sendable () -> Void)? = nil
+        let preKillSnapshotHook: (@Sendable () -> Void)? = nil
+        let cleanupMaxLifetime: TimeInterval = 15
+        #endif
+        guard let reservedPrimaryFileDescriptor = self.reservedPTYPrimaryDescriptor?.take() else {
+            return self.abortSynchronously(grace: grace)
+        }
+        // Production caps the lease at 15 seconds; DEBUG fixtures may hold discovery behind a readiness gate.
+        let lease = OutputHolderCleanupLease(
+            duplicatedPrimaryFileDescriptor: reservedPrimaryFileDescriptor,
+            outputPipes: self.outputPipes,
+            outputTTYs: self.outputTTYs,
+            excludedPIDs: [getpid(), self.pid],
+            grace: grace,
+            preKillSnapshotHook: preKillSnapshotHook,
+            maxLifetime: cleanupMaxLifetime)
+        lease.scheduleExpiry()
+        let status = self.abortSynchronously(grace: grace)
+        DispatchQueue.global(qos: .utility).async {
+            defer { lease.finish() }
+            discoveryHook?()
+            SpawnedProcessGroup.terminateOutputHoldersSynchronously(lease: lease)
+        }
+        _ = lease.waitForCompletion(timeout: 0.2)
+        return status
+    }
+
+    private static func reservePTYPrimaryDescriptor(_ fileDescriptor: Int32) -> OwnedFileDescriptorState? {
+        #if DEBUG
+        guard !SpawnedProcessGroupTestingOverrides.forcePTYPrimaryDescriptorReservationFailure else { return nil }
+        #endif
+        let duplicate = fcntl(fileDescriptor, F_DUPFD_CLOEXEC, STDERR_FILENO + 1)
+        guard duplicate >= 0 else { return nil }
+        return OwnedFileDescriptorState(fileDescriptor: duplicate)
+    }
+
+    package func discardReservedPTYPrimaryDescriptor() {
+        self.reservedPTYPrimaryDescriptor?.discard()
+    }
+
+    private static func outputHolderIdentities(
+        outputPipes: Set<OutputPipeIdentity>,
+        outputTTYs: Set<OutputTTYIdentity>,
+        excludedPIDs: Set<pid_t>) -> Set<TTYProcessTreeTerminator.ProcessIdentity>
+    {
+        var holderPIDs = OutputPipeIdentity.holderPIDs(for: outputPipes)
+        holderPIDs.formUnion(OutputTTYIdentity.holderPIDs(for: outputTTYs))
+        return Set(holderPIDs.subtracting(excludedPIDs).compactMap(TTYProcessTreeTerminator.processIdentity(for:)))
+    }
+
+    private static func terminateOutputHoldersSynchronously(lease: OutputHolderCleanupLease) {
+        guard lease.isActive else { return }
+        let processIdentities = Self.outputHolderIdentities(
+            outputPipes: lease.outputPipes,
+            outputTTYs: lease.outputTTYs,
+            excludedPIDs: lease.excludedPIDs)
+        guard lease.isActive,
+              Self.signal(processIdentities: processIdentities, signal: SIGTERM, lease: lease)
+        else { return }
+
+        Self.waitWhileCurrent(processIdentities, until: Date().addingTimeInterval(lease.grace), lease: lease)
+
+        while lease.isActive {
+            let currentIdentities = Self.outputHolderIdentities(
+                outputPipes: lease.outputPipes,
+                outputTTYs: lease.outputTTYs,
+                excludedPIDs: lease.excludedPIDs)
+            guard lease.isActive else { return }
+            guard !currentIdentities.isEmpty else { return }
+            lease.preKillSnapshotHook?()
+            guard lease.isActive,
+                  Self.signal(processIdentities: currentIdentities, signal: SIGKILL, lease: lease)
+            else { return }
+            Self.waitWhileCurrent(currentIdentities, until: Date().addingTimeInterval(lease.grace), lease: lease)
+        }
+    }
+
+    private static func signal(
+        processIdentities: Set<TTYProcessTreeTerminator.ProcessIdentity>,
+        signal: Int32,
+        lease: OutputHolderCleanupLease) -> Bool
+    {
+        for identity in processIdentities {
+            guard lease.withActiveState({
+                guard TTYProcessTreeTerminator.isCurrent(identity) else { return }
+                _ = kill(identity.pid, signal)
+            }) != nil else {
+                return false
+            }
+        }
+        return lease.isActive
+    }
+
+    private static func waitWhileCurrent(
+        _ processIdentities: Set<TTYProcessTreeTerminator.ProcessIdentity>,
+        until deadline: Date,
+        lease: OutputHolderCleanupLease)
+    {
+        while Date() < deadline {
+            guard let targetsRemain = lease.withActiveState({
+                processIdentities.contains(where: TTYProcessTreeTerminator.isCurrent(_:))
+            }), targetsRemain else { return }
+            usleep(20000)
+        }
+    }
+
+    #if DEBUG
+    package static func withOutputHolderDiscoveryHookForTesting<T>(
+        _ hook: @escaping @Sendable () -> Void,
+        operation: () throws -> T) rethrows -> T
+    {
+        try SpawnedProcessGroupTestingOverrides.$outputHolderDiscoveryHook.withValue(hook, operation: operation)
+    }
+
+    package static func withOutputHolderPreKillSnapshotHookForTesting<T>(
+        _ hook: @escaping @Sendable () -> Void,
+        operation: () throws -> T) rethrows -> T
+    {
+        try SpawnedProcessGroupTestingOverrides.$outputHolderPreKillSnapshotHook.withValue(
+            hook,
+            operation: operation)
+    }
+
+    package static func withOutputHolderCleanupMaxLifetimeForTesting<T>(
+        _ maxLifetime: TimeInterval,
+        operation: () throws -> T) rethrows -> T
+    {
+        try SpawnedProcessGroupTestingOverrides.$outputHolderCleanupMaxLifetime.withValue(
+            maxLifetime,
+            operation: operation)
+    }
+
+    package static func withPTYPrimaryDescriptorReservationFailureForTesting<T>(
+        _ operation: () throws -> T) rethrows -> T
+    {
+        try SpawnedProcessGroupTestingOverrides.$forcePTYPrimaryDescriptorReservationFailure.withValue(
+            true,
+            operation: operation)
+    }
+
+    package static func _test_ownedDescriptorTakeOnce(
+        ownedFileDescriptor: Int32) -> (first: Int32?, second: Int32?, discardAfterTake: Bool)
+    {
+        let state = OwnedFileDescriptorState(fileDescriptor: ownedFileDescriptor)
+        let first = state.take()
+        return (first, state.take(), state.discard())
+    }
+
+    package static func _test_ownedDescriptorDiscardTwice(
+        ownedFileDescriptor: Int32) -> (first: Bool, second: Bool)
+    {
+        let state = OwnedFileDescriptorState(fileDescriptor: ownedFileDescriptor)
+        return (state.discard(), state.discard())
+    }
+
+    package static func _test_ownedDescriptorDeinit(ownedFileDescriptor: Int32) {
+        _ = OwnedFileDescriptorState(fileDescriptor: ownedFileDescriptor)
+    }
+
+    package static func _test_outputHolderCleanupLeaseExpiry(
+        ownedFileDescriptor: Int32,
+        maxLifetime: TimeInterval,
+        waitTimeout: TimeInterval,
+        now: DispatchTime,
+        schedule: (DispatchTime, @escaping @Sendable () -> Void) -> Void) -> (completed: Bool, active: Bool)
+    {
+        let lease = OutputHolderCleanupLease(
+            duplicatedPrimaryFileDescriptor: ownedFileDescriptor,
+            outputPipes: [],
+            outputTTYs: [],
+            excludedPIDs: [],
+            grace: 0,
+            preKillSnapshotHook: nil,
+            maxLifetime: maxLifetime,
+            now: now)
+        lease.scheduleExpiry(schedule: schedule)
+        let completed = lease.waitForCompletion(timeout: waitTimeout)
+        return (completed, lease.isActive)
+    }
+    #endif
 }

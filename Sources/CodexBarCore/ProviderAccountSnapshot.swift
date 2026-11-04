@@ -25,10 +25,19 @@ public struct ProviderAccountUsageSnapshot: Identifiable, Sendable {
     /// Display-only label (may contain personal data such as an email); UI is
     /// responsible for privacy redaction. Never logged or persisted.
     public let displayLabel: String
+    /// Display-only source email, kept separate from `displayLabel` so aliases and
+    /// `email · org` disambiguation cannot leak into identity.
+    public let accountEmail: String?
+    /// Opaque, source-owned history scope; independent of the activation slot and sync identity.
+    public let historyAccountKey: String?
     public let isActive: Bool
-    /// Whether the source can make this inactive account the provider's active account.
+    /// Whether the source can activate this slot or explicitly repair its selected credential state.
     /// Activation remains source-owned; CodexBar never handles credential material.
     public let canActivate: Bool
+    /// Whether `snapshot` is a last-known measurement the source served because
+    /// live usage was unavailable, rather than a current one. Such a snapshot is
+    /// fine on a card that shows its age, but must not drive age-less surfaces.
+    public let usesLastKnownUsage: Bool
     public let snapshot: UsageSnapshot?
     public let error: String?
     public let sourceLabel: String?
@@ -37,8 +46,11 @@ public struct ProviderAccountUsageSnapshot: Identifiable, Sendable {
         id: ProviderAccountIdentity,
         provider: UsageProvider,
         displayLabel: String,
+        accountEmail: String? = nil,
+        historyAccountKey: String? = nil,
         isActive: Bool,
         canActivate: Bool = false,
+        usesLastKnownUsage: Bool = false,
         snapshot: UsageSnapshot?,
         error: String?,
         sourceLabel: String?)
@@ -46,8 +58,11 @@ public struct ProviderAccountUsageSnapshot: Identifiable, Sendable {
         self.id = id
         self.provider = provider
         self.displayLabel = displayLabel
+        self.accountEmail = accountEmail
+        self.historyAccountKey = historyAccountKey
         self.isActive = isActive
         self.canActivate = canActivate
+        self.usesLastKnownUsage = usesLastKnownUsage
         self.snapshot = snapshot
         self.error = error
         self.sourceLabel = sourceLabel

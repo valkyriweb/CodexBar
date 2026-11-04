@@ -1,9 +1,16 @@
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
 
 public struct CodexVisibleAccount: Equatable, Identifiable, Sendable {
     public let id: String
     public let email: String
+    public private(set) var customName: String?
     public let workspaceLabel: String?
+    public private(set) var displayDiscriminator: String?
     public let workspaceAccountID: String?
     public let authFingerprint: String?
     public let storedAccountID: UUID?
@@ -40,20 +47,107 @@ public struct CodexVisibleAccount: Equatable, Identifiable, Sendable {
     }
 
     public var displayName: String {
-        guard let workspaceLabel else { return self.email }
-        return "\(self.email) — \(workspaceLabel)"
+        if let customName { return self.disambiguatedCustomName(customName) }
+        guard let label = self.disambiguatedWorkspaceLabel ?? self.workspaceLabel else { return self.email }
+        return "\(self.email) — \(label)"
     }
 
     public var menuDisplayName: String {
+        if let customName { return self.disambiguatedCustomName(customName) }
         guard let menuWorkspaceLabel else { return self.email }
         return "\(self.email) — \(menuWorkspaceLabel)"
     }
 
+    /// A presentation preference follows the login and workspace, never the active source or auth token.
+    public var customNameKey: String {
+        guard let workspace = ManagedCodexAccount.normalizeWorkspaceAccountID(self.workspaceAccountID) else {
+            return self.customNameRecoveryKey
+        }
+        return self.customNameHash(scope: workspace)
+    }
+
+    /// Missing-auth accounts can be named before their workspace is known. Recover that name only
+    /// for the same saved account or profile, never for another workspace sharing its email.
+    public var customNameRecoveryKey: String {
+        let source = if let storedAccountID {
+            "stored:\(storedAccountID.uuidString.lowercased())"
+        } else {
+            switch self.selectionSource {
+            case let .managedAccount(id): "stored:\(id.uuidString.lowercased())"
+            case let .profileHome(path): "profile:\(CodexHomeScope.normalizedHomePath(path) ?? path)"
+            case .liveSystem: "system"
+            }
+        }
+        return self.customNameHash(scope: "unresolved:\(source)")
+    }
+
+    private func customNameHash(scope: String) -> String {
+        let email = self.email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return SHA256.hash(data: Data("\(email)\0\(scope)".utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
+    public func withCustomName(_ name: String?) -> Self {
+        var result = self
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        result.customName = trimmed.flatMap { $0.isEmpty ? nil : $0 }
+        return result
+    }
+
+    private func disambiguatedCustomName(_ name: String) -> String {
+        guard let displayDiscriminator else { return name }
+        return "\(name) · \(displayDiscriminator)"
+    }
+
     public var menuWorkspaceLabel: String? {
+        if let disambiguatedWorkspaceLabel {
+            return disambiguatedWorkspaceLabel
+        }
         guard let workspaceLabel, workspaceLabel.compare("Personal", options: [.caseInsensitive]) != .orderedSame else {
             return nil
         }
         return workspaceLabel
+    }
+
+    private var disambiguatedWorkspaceLabel: String? {
+        guard let displayDiscriminator else { return nil }
+        return "\(self.workspaceLabel ?? "Workspace") · \(displayDiscriminator)"
+    }
+
+    static func disambiguating(_ accounts: [Self]) -> [Self] {
+        let unlabeled = accounts.map { account in
+            var result = account
+            result.displayDiscriminator = nil
+            return result
+        }
+        let groups = Dictionary(grouping: unlabeled, by: { $0.menuDisplayName.lowercased() })
+        return unlabeled.map { account in
+            var result = account
+            let group = groups[account.menuDisplayName.lowercased()] ?? []
+            guard group.count > 1 else { return result }
+            // Workspace identity survives active-account changes and promotion to the system account.
+            // Hash it rather than exposing any part of the provider ID or a profile's filesystem path.
+            var identity = account.displayIdentity
+            if group.count(where: { $0.displayIdentity == identity }) > 1 {
+                identity += "\0\(account.displaySourceIdentity)"
+            }
+            result.displayDiscriminator = SHA256.hash(data: Data(identity.utf8))
+                .prefix(4).map { String(format: "%02x", $0) }.joined()
+            return result
+        }
+    }
+
+    private var displayIdentity: String {
+        ManagedCodexAccount.normalizeWorkspaceAccountID(self.workspaceAccountID)
+            ?? self.storedAccountID?.uuidString.lowercased() ?? self.id
+    }
+
+    private var displaySourceIdentity: String {
+        // Profile homes remain separate even when they contain the same workspace credentials.
+        if case let .profileHome(path) = self.selectionSource {
+            return "profile:\(CodexHomeScope.normalizedHomePath(path) ?? path)"
+        }
+        return self.storedAccountID.map { "stored:\($0.uuidString.lowercased())" } ?? "system"
     }
 
     public var authenticationHealthLabel: String? {
@@ -81,10 +175,20 @@ public struct CodexVisibleAccountProjection: Equatable, Sendable {
         liveVisibleAccountID: String?,
         hasUnreadableAddedAccountStore: Bool)
     {
-        self.visibleAccounts = visibleAccounts
+        self.visibleAccounts = CodexVisibleAccount.disambiguating(visibleAccounts)
         self.activeVisibleAccountID = activeVisibleAccountID
         self.liveVisibleAccountID = liveVisibleAccountID
         self.hasUnreadableAddedAccountStore = hasUnreadableAddedAccountStore
+    }
+
+    public func applyingCustomNames(_ names: [String: String]) -> Self {
+        Self(
+            visibleAccounts: self.visibleAccounts.map {
+                $0.withCustomName(names[$0.customNameKey] ?? names[$0.customNameRecoveryKey])
+            },
+            activeVisibleAccountID: self.activeVisibleAccountID,
+            liveVisibleAccountID: self.liveVisibleAccountID,
+            hasUnreadableAddedAccountStore: self.hasUnreadableAddedAccountStore)
     }
 
     public func source(forVisibleAccountID id: String) -> CodexActiveSource? {
@@ -105,17 +209,24 @@ extension CodexVisibleAccountProjection {
 
         for storedAccount in snapshot.storedAccounts {
             let normalizedEmail = snapshot.runtimeEmail(for: storedAccount)
+            let remoteIdentity = snapshot.managedRemoteIdentity(for: storedAccount)
+            let remoteWorkspaceAccountID: String? = switch remoteIdentity {
+            case let .providerAccount(id):
+                ManagedCodexAccount.normalizeWorkspaceAccountID(id)
+            case .emailOnly, .unresolved:
+                nil
+            }
             drafts.append(VisibleAccountDraft(
                 email: normalizedEmail,
                 workspaceLabel: Self.normalizeWorkspaceLabel(storedAccount.workspaceLabel),
-                workspaceAccountID: storedAccount.workspaceAccountID,
+                workspaceAccountID: remoteWorkspaceAccountID,
                 authFingerprint: storedAccount.authFingerprint,
                 storedAccountID: storedAccount.id,
                 selectionSource: .managedAccount(id: storedAccount.id),
                 isLive: false,
                 canReauthenticate: true,
                 canRemove: true,
-                identity: snapshot.runtimeIdentity(for: storedAccount)))
+                identity: remoteIdentity))
         }
 
         if let liveSystemAccount = snapshot.liveSystemAccount {

@@ -18,14 +18,13 @@ enum MiniMaxLocalStorageImporter {
         let log: (String) -> Void = { msg in logger?("[minimax-storage] \(msg)") }
         var tokens: [TokenInfo] = []
 
-        let chromeCandidates = self.chromeLocalStorageCandidates(browserDetection: browserDetection)
+        let chromeCandidates = self.storageCandidates(browserDetection: browserDetection, storage: .localStorage)
         if !chromeCandidates.isEmpty {
             log("Chrome local storage candidates: \(chromeCandidates.count)")
         }
 
         for candidate in chromeCandidates {
-            guard case let .chromeLevelDB(levelDBURL) = candidate.kind else { continue }
-            let snapshot = self.readLocalStorage(from: levelDBURL, logger: log)
+            let snapshot = self.readLocalStorage(from: candidate.url, logger: log)
             if !snapshot.tokens.isEmpty {
                 let groupID = snapshot.groupID ?? self.groupID(fromJWT: snapshot.tokens.first ?? "")
                 if groupID != nil {
@@ -40,7 +39,7 @@ enum MiniMaxLocalStorageImporter {
         }
 
         if tokens.isEmpty {
-            let sessionCandidates = self.chromeSessionStorageCandidates(browserDetection: browserDetection)
+            let sessionCandidates = self.storageCandidates(browserDetection: browserDetection, storage: .sessionStorage)
             if !sessionCandidates.isEmpty {
                 log("Chrome session storage candidates: \(sessionCandidates.count)")
             }
@@ -57,7 +56,9 @@ enum MiniMaxLocalStorageImporter {
         }
 
         if tokens.isEmpty {
-            let indexedCandidates = self.chromeIndexedDBCandidates(browserDetection: browserDetection)
+            let indexedCandidates = self.storageCandidates(
+                browserDetection: browserDetection,
+                storage: self.indexedDBStorage)
             if !indexedCandidates.isEmpty {
                 log("Chrome IndexedDB candidates: \(indexedCandidates.count)")
             }
@@ -87,14 +88,13 @@ enum MiniMaxLocalStorageImporter {
         let log: (String) -> Void = { msg in logger?("[minimax-storage] \(msg)") }
         var results: [String: String] = [:]
 
-        let chromeCandidates = self.chromeLocalStorageCandidates(browserDetection: browserDetection)
+        let chromeCandidates = self.storageCandidates(browserDetection: browserDetection, storage: .localStorage)
         if !chromeCandidates.isEmpty {
             log("Chrome local storage candidates: \(chromeCandidates.count)")
         }
 
         for candidate in chromeCandidates {
-            guard case let .chromeLevelDB(levelDBURL) = candidate.kind else { continue }
-            let snapshot = self.readLocalStorage(from: levelDBURL, logger: log)
+            let snapshot = self.readLocalStorage(from: candidate.url, logger: log)
             if let groupID = snapshot.groupID, results[candidate.label] == nil {
                 log("Found MiniMax group id in \(candidate.label)")
                 results[candidate.label] = groupID
@@ -104,233 +104,32 @@ enum MiniMaxLocalStorageImporter {
         return results
     }
 
-    // MARK: - Chrome local storage discovery
+    // MARK: - Chromium storage discovery
 
-    private enum LocalStorageSourceKind {
-        case chromeLevelDB(URL)
-    }
+    private static let origins = [
+        "https://platform.minimax.io",
+        "https://www.minimax.io",
+        "https://minimax.io",
+        "https://platform.minimax.cn",
+        "https://www.minimax.cn",
+        "https://minimax.cn",
+        "https://platform.minimaxi.com",
+        "https://www.minimaxi.com",
+        "https://minimaxi.com",
+    ]
+    static let indexedDBStorage = ChromiumLocalStorageDiscovery.Storage.indexedDB(
+        originPrefixes: Self.origins.map { $0.replacingOccurrences(of: "://", with: "_") + "_" })
 
-    private struct LocalStorageCandidate {
-        let label: String
-        let kind: LocalStorageSourceKind
-    }
-
-    private struct SessionStorageCandidate {
-        let label: String
-        let url: URL
-    }
-
-    private struct IndexedDBCandidate {
-        let label: String
-        let url: URL
-    }
-
-    private static func chromeLocalStorageCandidates(browserDetection: BrowserDetection) -> [LocalStorageCandidate] {
-        let browsers: [Browser] = [
-            .chrome,
-            .chromeBeta,
-            .chromeCanary,
-            .edge,
-            .edgeBeta,
-            .edgeCanary,
-            .brave,
-            .braveBeta,
-            .braveNightly,
-            .vivaldi,
-            .arc,
-            .arcBeta,
-            .arcCanary,
-            .dia,
-            .chatgptAtlas,
-            .chromium,
-            .helium,
-        ]
-
-        // Filter to browsers with profile data to avoid unnecessary filesystem access
-        let installedBrowsers = browsers.browsersWithProfileData(using: browserDetection)
-
-        let roots = ChromiumProfileLocator
-            .roots(for: installedBrowsers, homeDirectories: BrowserCookieClient.defaultHomeDirectories())
-            .map { (url: $0.url, labelPrefix: $0.labelPrefix) }
-
-        var candidates: [LocalStorageCandidate] = []
-        for root in roots {
-            candidates.append(contentsOf: self.chromeProfileLocalStorageDirs(
-                root: root.url,
-                labelPrefix: root.labelPrefix))
-        }
-        return candidates
-    }
-
-    private static func chromeProfileLocalStorageDirs(root: URL, labelPrefix: String) -> [LocalStorageCandidate] {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles])
-        else { return [] }
-
-        let profileDirs = entries.filter { url in
-            guard let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory), isDir else {
-                return false
-            }
-            let name = url.lastPathComponent
-            return name == "Default" || name.hasPrefix("Profile ") || name.hasPrefix("user-")
-        }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-
-        return profileDirs.compactMap { dir in
-            let levelDBURL = dir.appendingPathComponent("Local Storage").appendingPathComponent("leveldb")
-            guard FileManager.default.fileExists(atPath: levelDBURL.path) else { return nil }
-            let label = "\(labelPrefix) \(dir.lastPathComponent)"
-            return LocalStorageCandidate(label: label, kind: .chromeLevelDB(levelDBURL))
-        }
-    }
-
-    private static func chromeSessionStorageCandidates(browserDetection: BrowserDetection)
-    -> [SessionStorageCandidate] {
-        let browsers: [Browser] = [
-            .chrome,
-            .chromeBeta,
-            .chromeCanary,
-            .edge,
-            .edgeBeta,
-            .edgeCanary,
-            .brave,
-            .braveBeta,
-            .braveNightly,
-            .vivaldi,
-            .arc,
-            .arcBeta,
-            .arcCanary,
-            .dia,
-            .chatgptAtlas,
-            .chromium,
-            .helium,
-        ]
-
-        // Filter to browsers with profile data to avoid unnecessary filesystem access
-        let installedBrowsers = browsers.browsersWithProfileData(using: browserDetection)
-
-        let roots = ChromiumProfileLocator
-            .roots(for: installedBrowsers, homeDirectories: BrowserCookieClient.defaultHomeDirectories())
-            .map { (url: $0.url, labelPrefix: $0.labelPrefix) }
-
-        var candidates: [SessionStorageCandidate] = []
-        for root in roots {
-            candidates.append(contentsOf: self.chromeProfileSessionStorageDirs(
-                root: root.url,
-                labelPrefix: root.labelPrefix))
-        }
-        return candidates
-    }
-
-    private static func chromeProfileSessionStorageDirs(root: URL, labelPrefix: String) -> [SessionStorageCandidate] {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles])
-        else { return [] }
-
-        let profileDirs = entries.filter { url in
-            guard let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory), isDir else {
-                return false
-            }
-            let name = url.lastPathComponent
-            return name == "Default" || name.hasPrefix("Profile ") || name.hasPrefix("user-")
-        }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-
-        return profileDirs.compactMap { dir in
-            let sessionURL = dir.appendingPathComponent("Session Storage")
-            guard FileManager.default.fileExists(atPath: sessionURL.path) else { return nil }
-            let label = "\(labelPrefix) \(dir.lastPathComponent) (Session Storage)"
-            return SessionStorageCandidate(label: label, url: sessionURL)
-        }
-    }
-
-    private static func chromeIndexedDBCandidates(browserDetection: BrowserDetection) -> [IndexedDBCandidate] {
-        let browsers: [Browser] = [
-            .chrome,
-            .chromeBeta,
-            .chromeCanary,
-            .edge,
-            .edgeBeta,
-            .edgeCanary,
-            .brave,
-            .braveBeta,
-            .braveNightly,
-            .vivaldi,
-            .arc,
-            .arcBeta,
-            .arcCanary,
-            .dia,
-            .chatgptAtlas,
-            .chromium,
-            .helium,
-        ]
-
-        // Filter to browsers with profile data to avoid unnecessary filesystem access
-        let installedBrowsers = browsers.browsersWithProfileData(using: browserDetection)
-
-        let roots = ChromiumProfileLocator
-            .roots(for: installedBrowsers, homeDirectories: BrowserCookieClient.defaultHomeDirectories())
-            .map { (url: $0.url, labelPrefix: $0.labelPrefix) }
-
-        var candidates: [IndexedDBCandidate] = []
-        for root in roots {
-            candidates.append(contentsOf: self.chromeProfileIndexedDBDirs(
-                root: root.url,
-                labelPrefix: root.labelPrefix))
-        }
-        return candidates
-    }
-
-    private static func chromeProfileIndexedDBDirs(root: URL, labelPrefix: String) -> [IndexedDBCandidate] {
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles])
-        else { return [] }
-
-        let profileDirs = entries.filter { url in
-            guard let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory), isDir else {
-                return false
-            }
-            let name = url.lastPathComponent
-            return name == "Default" || name.hasPrefix("Profile ") || name.hasPrefix("user-")
-        }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-
-        let targetPrefixes = [
-            "https_platform.minimax.io_",
-            "https_www.minimax.io_",
-            "https_minimax.io_",
-            "https_platform.minimaxi.com_",
-            "https_minimaxi.com_",
-            "https_www.minimaxi.com_",
-        ]
-
-        var candidates: [IndexedDBCandidate] = []
-        for dir in profileDirs {
-            let indexedDBRoot = dir.appendingPathComponent("IndexedDB")
-            guard let dbEntries = try? FileManager.default.contentsOfDirectory(
-                at: indexedDBRoot,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles])
-            else { continue }
-            for entry in dbEntries {
-                guard let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory), isDir else {
-                    continue
-                }
-                let name = entry.lastPathComponent
-                guard targetPrefixes.contains(where: { name.hasPrefix($0) }),
-                      name.hasSuffix(".indexeddb.leveldb")
-                else { continue }
-                let label = "\(labelPrefix) \(dir.lastPathComponent) (IndexedDB)"
-                candidates.append(IndexedDBCandidate(label: label, url: entry))
-            }
-        }
-        return candidates
+    static func storageCandidates(
+        browserDetection: BrowserDetection,
+        storage: ChromiumLocalStorageDiscovery.Storage,
+        homeDirectories: [URL]? = nil) -> [ChromiumLocalStorageDiscovery.Candidate]
+    {
+        ChromiumLocalStorageDiscovery.candidates(
+            browserDetection: browserDetection,
+            browsers: ChromiumLocalStorageDiscovery.defaultBrowsers,
+            storage: storage,
+            homeDirectories: homeDirectories)
     }
 
     // MARK: - Token extraction
@@ -344,16 +143,8 @@ enum MiniMaxLocalStorageImporter {
         from levelDBURL: URL,
         logger: ((String) -> Void)? = nil) -> LocalStorageSnapshot
     {
-        let origins = [
-            "https://platform.minimax.io",
-            "https://www.minimax.io",
-            "https://minimax.io",
-            "https://platform.minimaxi.com",
-            "https://www.minimaxi.com",
-            "https://minimaxi.com",
-        ]
         var entries: [SweetCookieKit.ChromiumLocalStorageEntry] = []
-        for origin in origins {
+        for origin in self.origins {
             entries.append(contentsOf: SweetCookieKit.ChromiumLocalStorageReader.readEntries(
                 for: origin,
                 in: levelDBURL,
@@ -384,7 +175,8 @@ enum MiniMaxLocalStorageImporter {
                 let key = entry.key.lowercased()
                 let value = entry.value.lowercased()
                 return key.contains("minimax.io") || value.contains("minimax.io") ||
-                    key.contains("minimaxi.com") || value.contains("minimaxi.com")
+                    key.contains("minimaxi.com") || value.contains("minimaxi.com") ||
+                    key.contains("minimax.cn") || value.contains("minimax.cn")
             }
             if !candidateEntries.isEmpty {
                 logger?("[minimax-storage] Local storage text entries: \(candidateEntries.count)")
@@ -424,24 +216,6 @@ enum MiniMaxLocalStorageImporter {
             }
         }
 
-        if tokens.isEmpty, !entries.isEmpty {
-            let sample = entries.prefix(6).map { "\($0.key) (\($0.value.count) chars)" }
-            logger?("[minimax-storage] Local storage key sample: \(sample.joined(separator: ", "))")
-            for entry in entries
-                where entry.key == "user_detail" || entry.key == "persist:root" || entry.key == "access_token"
-            {
-                let preview = entry.value.prefix(200)
-                if entry.key == "access_token" {
-                    logger?("[minimax-storage] \(entry.key) preview: \(preview) (raw \(entry.rawValueLength) bytes)")
-                } else {
-                    logger?("[minimax-storage] \(entry.key) preview: \(preview)")
-                }
-                if entry.key == "persist:root" {
-                    self.logPersistRootKeys(entry.value, logger: logger)
-                }
-            }
-        }
-
         return LocalStorageSnapshot(tokens: tokens, groupID: groupID)
     }
 
@@ -454,15 +228,7 @@ enum MiniMaxLocalStorageImporter {
             logger: logger)
         guard !entries.isEmpty else { return [] }
 
-        let origins = [
-            "https://platform.minimax.io",
-            "https://www.minimax.io",
-            "https://minimax.io",
-            "https://platform.minimaxi.com",
-            "https://www.minimaxi.com",
-            "https://minimaxi.com",
-        ]
-        let mapIDs = self.sessionStorageMapIDs(in: entries, origins: origins, logger: logger)
+        let mapIDs = self.sessionStorageMapIDs(in: entries, logger: logger)
         if mapIDs.isEmpty {
             logger?("[minimax-storage] No MiniMax session storage namespaces found")
             return []
@@ -477,17 +243,6 @@ enum MiniMaxLocalStorageImporter {
             return []
         }
 
-        let tokenKeySample = mapEntries
-            .filter { entry in
-                entry.key.localizedCaseInsensitiveContains("token") ||
-                    entry.key.localizedCaseInsensitiveContains("auth")
-            }
-            .prefix(8)
-            .map(\.key)
-        if !tokenKeySample.isEmpty {
-            logger?("[minimax-storage] MiniMax session storage token keys: \(tokenKeySample.joined(separator: ", "))")
-        }
-
         var tokens: [String] = []
         var seen = Set<String>()
         for entry in mapEntries {
@@ -496,13 +251,6 @@ enum MiniMaxLocalStorageImporter {
                 seen.insert(token)
                 tokens.append(token)
             }
-        }
-
-        if tokens.isEmpty {
-            let sample = mapEntries.prefix(8).map { entry in
-                "\(entry.key) (\(entry.value.count) chars)"
-            }
-            logger?("[minimax-storage] MiniMax session storage sample: \(sample.joined(separator: ", "))")
         }
 
         return tokens
@@ -541,26 +289,17 @@ enum MiniMaxLocalStorageImporter {
             }
         }
 
-        if tokens.isEmpty {
-            let sample = entries.prefix(8).map { entry in
-                "\(entry.key) (\(entry.value.count) chars)"
-            }
-            if !sample.isEmpty {
-                logger?("[minimax-storage] IndexedDB sample: \(sample.joined(separator: ", "))")
-            }
-        }
         return tokens
     }
 
     private static func sessionStorageMapIDs(
         in entries: [SweetCookieKit.ChromiumLevelDBTextEntry],
-        origins: [String],
         logger: ((String) -> Void)? = nil) -> Set<Int>
     {
         var mapIDs = Set<Int>()
         for entry in entries where entry.key.hasPrefix("namespace-") {
-            for origin in origins where entry.key.localizedCaseInsensitiveContains(origin) {
-                if let mapID = self.sessionStorageMapID(fromValue: entry.value) {
+            for origin in self.origins where entry.key.localizedCaseInsensitiveContains(origin) {
+                if let mapID = Int(entry.value.trimmingCharacters(in: .whitespacesAndNewlines)) {
                     mapIDs.insert(mapID)
                 }
             }
@@ -570,11 +309,6 @@ enum MiniMaxLocalStorageImporter {
             logger?("[minimax-storage] Session storage map ids for MiniMax: \(values)")
         }
         return mapIDs
-    }
-
-    private static func sessionStorageMapID(fromValue value: String) -> Int? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return Int(trimmed)
     }
 
     private static func sessionStorageMapID(fromKey key: String) -> Int? {
@@ -671,31 +405,6 @@ enum MiniMaxLocalStorageImporter {
         return trimmed.count >= 60 && trimmed.range(of: #"^[A-Za-z0-9._\-+=/]+$"#, options: .regularExpression) != nil
     }
 
-    private static func logPersistRootKeys(_ value: String, logger: ((String) -> Void)?) {
-        guard let data = value.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data, options: []),
-              let root = json as? [String: Any]
-        else { return }
-
-        let rootKeys = root.keys.sorted()
-        if !rootKeys.isEmpty {
-            let sample = rootKeys.prefix(10).joined(separator: ", ")
-            logger?("[minimax-storage] persist:root keys: \(sample)")
-        }
-
-        if let authString = root["auth"] as? String,
-           let authData = authString.data(using: .utf8),
-           let authJSON = try? JSONSerialization.jsonObject(with: authData, options: []),
-           let auth = authJSON as? [String: Any]
-        {
-            let authKeys = auth.keys.sorted()
-            if !authKeys.isEmpty {
-                let sample = authKeys.prefix(10).joined(separator: ", ")
-                logger?("[minimax-storage] persist:root auth keys: \(sample)")
-            }
-        }
-    }
-
     private static func matchJWTs(in value: String) -> [String]? {
         let pattern = #"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
@@ -776,8 +485,7 @@ enum MiniMaxLocalStorageImporter {
     }
 
     private static func groupID(fromJWT token: String) -> String? {
-        guard token.contains(".") else { return nil }
-        guard let claims = self.decodeJWTClaims(token) else { return nil }
+        guard token.contains("."), let claims = self.decodeJWTClaims(token) else { return nil }
 
         let directKeys = [
             "group_id",
@@ -808,8 +516,8 @@ enum MiniMaxLocalStorageImporter {
         let parts = token.split(separator: ".")
         guard parts.count >= 2 else { return nil }
         let payload = String(parts[1])
-        guard let data = self.base64URLDecode(payload) else { return nil }
-        guard let object = try? JSONSerialization.jsonObject(with: data, options: []),
+        guard let data = self.base64URLDecode(payload),
+              let object = try? JSONSerialization.jsonObject(with: data, options: []),
               let dict = object as? [String: Any]
         else { return nil }
         return dict

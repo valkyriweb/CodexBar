@@ -1,10 +1,299 @@
-import CodexBarCore
 import Foundation
 import Testing
 @testable import CodexBar
+@testable import CodexBarCore
 
 @Suite(.serialized)
 struct CodexBarConfigMigratorTests {
+    @Test
+    func `shared legacy migration preserves provider fields and configured values`() throws {
+        let defaults = InMemoryUserDefaults(values: [
+            "minimaxAPIRegion": "cn",
+            "opencodeWorkspaceID": "legacy-workspace",
+        ])
+        let store = testConfigStore(suiteName: "shared-legacy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: store.fileURL.deletingLastPathComponent()) }
+        var config = CodexBarConfig.makeDefault()
+        config.setProviderConfig(ProviderConfig(id: .minimax, apiKey: "configured-token"))
+        config.setProviderConfig(ProviderConfig(id: .opencode, workspaceID: "configured-workspace"))
+        try store.save(config)
+        let secrets = CountingLegacySecretStore(token: "  fixture-legacy-token  ")
+        let migrated = try Self.migrate(
+            configStore: store,
+            defaults: defaults,
+            stores: Self.legacyStores(secrets: secrets, accountStore: CountingTokenAccountStore()))
+
+        #expect(migrated.providerConfig(for: .minimax)?.apiKey == "configured-token")
+        #expect(migrated.providerConfig(for: .minimax)?.region == "cn")
+        #expect(migrated.providerConfig(for: .minimax)?.cookieHeader == "fixture-legacy-token")
+        #expect(migrated.providerConfig(for: .opencode)?.workspaceID == "configured-workspace")
+        #expect(migrated.providerConfig(for: .opencode)?.cookieHeader == "fixture-legacy-token")
+        #expect(migrated.providerConfig(for: .kimi)?.cookieHeader == "fixture-legacy-token")
+    }
+
+    @Test
+    @MainActor
+    func `queued writes cannot replace a repair after a failed reload`() async throws {
+        let configStore = testConfigStore(suiteName: "queued-repair-\(UUID().uuidString)")
+        let directory = configStore.fileURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try configStore.save(CodexBarConfig.makeDefault())
+        let secrets = CountingLegacySecretStore()
+        let settings = SettingsStore(
+            userDefaults: InMemoryUserDefaults(),
+            configStore: configStore,
+            zaiTokenStore: secrets,
+            syntheticTokenStore: secrets,
+            codexCookieStore: secrets,
+            claudeCookieStore: secrets,
+            cursorCookieStore: secrets,
+            opencodeCookieStore: secrets,
+            factoryCookieStore: secrets,
+            minimaxCookieStore: secrets,
+            minimaxAPITokenStore: secrets,
+            kimiTokenStore: secrets,
+            augmentCookieStore: secrets,
+            ampCookieStore: secrets,
+            copilotTokenStore: secrets,
+            tokenAccountStore: CountingTokenAccountStore(),
+            performInitialProviderDetection: false)
+        let barrier = AsyncStream<Void>.makeStream()
+        defer { barrier.continuation.finish() }
+        settings.configPersistWriteTask = Task.detached { for await _ in barrier.stream {} }
+        settings._test_configPersistenceUsesDebounce = true
+        settings.updateProviderConfig(provider: .claude) { $0.apiKey = "fixture-queued-old-token" }
+        let queued = try #require(settings.persistPendingConfigForTermination())
+
+        try Data(#"{"version":1,"providers":["#.utf8).write(to: configStore.fileURL)
+        settings.reloadConfig(reason: "fixture-corruption", origin: .localFile)
+        var repaired = CodexBarConfig.makeDefault()
+        repaired.setProviderConfig(ProviderConfig(id: .claude, apiKey: "fixture-queued-repaired-token"))
+        try configStore.save(repaired)
+        settings.reloadConfig(reason: "fixture-repair", origin: .localFile)
+
+        barrier.continuation.finish()
+        await queued.value
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.apiKey == "fixture-queued-repaired-token")
+        settings.updateProviderConfig(provider: .claude) { $0.enabled = false }
+        await settings.configPersistTask?.value
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.apiKey == "fixture-queued-repaired-token")
+    }
+
+    @Test
+    @MainActor
+    func `failed runtime reload preserves repaired config until a successful reload`() async throws {
+        let configStore = testConfigStore(suiteName: "corrupt-reload-\(UUID().uuidString)")
+        let directory = configStore.fileURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try configStore.save(CodexBarConfig.makeDefault())
+        let secrets = CountingLegacySecretStore()
+        let settings = SettingsStore(
+            userDefaults: InMemoryUserDefaults(),
+            configStore: configStore,
+            zaiTokenStore: secrets,
+            syntheticTokenStore: secrets,
+            codexCookieStore: secrets,
+            claudeCookieStore: secrets,
+            cursorCookieStore: secrets,
+            opencodeCookieStore: secrets,
+            factoryCookieStore: secrets,
+            minimaxCookieStore: secrets,
+            minimaxAPITokenStore: secrets,
+            kimiTokenStore: secrets,
+            augmentCookieStore: secrets,
+            ampCookieStore: secrets,
+            copilotTokenStore: secrets,
+            tokenAccountStore: CountingTokenAccountStore(),
+            performInitialProviderDetection: false)
+        settings._test_configPersistenceUsesDebounce = true
+        settings.updateProviderConfig(provider: .claude) { $0.enabled = false }
+        try Data(#"{"version":1,"providers":["#.utf8).write(to: configStore.fileURL)
+        settings.reloadConfig(reason: "fixture-corruption", origin: .localFile)
+
+        var repaired = CodexBarConfig.makeDefault()
+        repaired.setProviderConfig(ProviderConfig(id: .claude, apiKey: "fixture-runtime-repaired-token"))
+        try configStore.save(repaired)
+        settings.updateProviderConfig(provider: .claude) { $0.enabled = true }
+        #expect(settings.persistPendingConfigForTermination() == nil)
+        await settings.configPersistTask?.value
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.apiKey == "fixture-runtime-repaired-token")
+
+        settings.reloadConfig(reason: "fixture-repair", origin: .localFile)
+        settings.updateProviderConfig(provider: .claude) { $0.enabled = false }
+        await settings.configPersistTask?.value
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.apiKey == "fixture-runtime-repaired-token")
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.enabled == false)
+    }
+
+    @Test
+    func `persistence preserves a config that became unreadable after loading`() throws {
+        let configStore = testConfigStore(suiteName: "corrupt-save-\(UUID().uuidString)")
+        let directory = configStore.fileURL.deletingLastPathComponent()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try configStore.save(CodexBarConfig.makeDefault())
+        let loaded = try #require(try configStore.load())
+        let corrupt = Data(#"{"version":1,"providers":["#.utf8)
+        try corrupt.write(to: configStore.fileURL)
+
+        #expect(throws: (any Error).self) {
+            try SettingsStore.writeConfig(
+                loaded,
+                to: configStore,
+                watcher: nil,
+                permit: SettingsConfigPersistenceCoordinator().makeWritePermit())
+        }
+        #expect(try Data(contentsOf: configStore.fileURL) == corrupt)
+    }
+
+    @Test
+    @MainActor
+    func `settings startup and edits cannot overwrite a corrupt config`() throws {
+        let defaults = InMemoryUserDefaults()
+        let configStore = testConfigStore(suiteName: "corrupt-startup-\(UUID().uuidString)")
+        let directory = configStore.fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let corrupt = Data(#"{"version":1,"providers":["#.utf8)
+        try corrupt.write(to: configStore.fileURL)
+        let secrets = CountingLegacySecretStore()
+        let settings = SettingsStore(
+            userDefaults: defaults,
+            configStore: configStore,
+            zaiTokenStore: secrets,
+            syntheticTokenStore: secrets,
+            codexCookieStore: secrets,
+            claudeCookieStore: secrets,
+            cursorCookieStore: secrets,
+            opencodeCookieStore: secrets,
+            factoryCookieStore: secrets,
+            minimaxCookieStore: secrets,
+            minimaxAPITokenStore: secrets,
+            kimiTokenStore: secrets,
+            augmentCookieStore: secrets,
+            ampCookieStore: secrets,
+            copilotTokenStore: secrets,
+            tokenAccountStore: CountingTokenAccountStore(),
+            performInitialProviderDetection: false)
+        #expect(!settings.openAIWebAccessEnabled)
+        #expect(try Data(contentsOf: configStore.fileURL) == corrupt)
+        settings.updateProviderConfig(provider: .claude) { $0.enabled = true }
+        #expect(try Data(contentsOf: configStore.fileURL) == corrupt)
+
+        try Data().write(to: configStore.fileURL)
+        settings.reloadConfig(reason: "incomplete-repair", origin: .localFile)
+        var repaired = CodexBarConfig.makeDefault()
+        repaired.setProviderConfig(ProviderConfig(id: .claude, apiKey: "fixture-repaired-token"))
+        try configStore.save(repaired)
+        settings.updateProviderConfig(provider: .claude) { $0.enabled = false }
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.apiKey == "fixture-repaired-token")
+
+        settings.reloadConfig(reason: "fixture-repair", origin: .localFile)
+        settings.updateProviderConfig(provider: .claude) { $0.enabled = true }
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.apiKey == "fixture-repaired-token")
+        #expect(try configStore.load()?.providerConfig(for: .claude)?.enabled == true)
+    }
+
+    @Test
+    func `corrupt config is preserved without reading or clearing legacy stores`() throws {
+        let defaults = InMemoryUserDefaults(values: ["showOptionalCreditsAndExtraUsage": false])
+        let configStore = testConfigStore(suiteName: "corrupt-config-\(UUID().uuidString)")
+        let directory = configStore.fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let corrupt = Data(#"{"providers":[{"id":"claude","apiKey":"fixture-secret"}],"version":1"#.utf8)
+        try corrupt.write(to: configStore.fileURL)
+        let secrets = CountingLegacySecretStore(token: "fixture-legacy-token")
+        let accounts = CountingTokenAccountStore()
+        let stores = Self.legacyStores(secrets: secrets, accountStore: accounts)
+
+        #expect(throws: (any Error).self) {
+            try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
+        }
+
+        #expect(try Data(contentsOf: configStore.fileURL) == corrupt)
+        #expect(secrets.loadCount == 0)
+        #expect(secrets.clearAttempts == 0)
+        #expect(accounts.loadCount == 0)
+        #expect(!defaults.bool(forKey: Self.legacyMigrationCompletedKey))
+
+        var repaired = CodexBarConfig.makeDefault()
+        repaired.setProviderConfig(ProviderConfig(id: .claude, apiKey: "fixture-repaired-token"))
+        try configStore.save(repaired)
+        let migrated = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
+        #expect(migrated.providerConfig(for: .claude)?.apiKey == "fixture-repaired-token")
+        #expect(migrated.providerConfig(for: .zai)?.apiKey == "fixture-legacy-token")
+        #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey))
+    }
+
+    @Test(arguments: [false, true])
+    @MainActor
+    func `settings applies stored keychain policy before legacy migration`(disabled: Bool) throws {
+        let suite = "CodexBarConfigMigratorTests-keychain-startup-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(disabled, forKey: "debugDisableKeychainAccess")
+
+        let previousOverride = KeychainAccessGate.currentOverrideForTesting
+        defer {
+            if let previousOverride {
+                KeychainAccessGate.isDisabled = previousOverride
+            } else {
+                KeychainAccessGate.resetOverrideForTesting()
+            }
+        }
+        KeychainAccessGate.isDisabled = !disabled
+        let secrets = CountingLegacySecretStore()
+        let store = SettingsStore(
+            userDefaults: defaults,
+            configStore: testConfigStore(suiteName: suite),
+            zaiTokenStore: secrets,
+            syntheticTokenStore: secrets,
+            codexCookieStore: secrets,
+            claudeCookieStore: secrets,
+            cursorCookieStore: secrets,
+            opencodeCookieStore: secrets,
+            factoryCookieStore: secrets,
+            minimaxCookieStore: secrets,
+            minimaxAPITokenStore: secrets,
+            kimiTokenStore: secrets,
+            augmentCookieStore: secrets,
+            ampCookieStore: secrets,
+            copilotTokenStore: secrets,
+            tokenAccountStore: CountingTokenAccountStore(),
+            keychainAccessPolicy: .live,
+            performInitialProviderDetection: false)
+
+        #expect(store.debugDisableKeychainAccess == disabled)
+        #expect(!secrets.keychainAccessOverridesAtLoad.isEmpty)
+        #expect(secrets.keychainAccessOverridesAtLoad.allSatisfy { $0 == disabled })
+    }
+
+    @Test
+    func `legacy Moonshot key is bound to its selected region`() throws {
+        let suite = "CodexBarConfigMigratorTests-moonshot-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let configStore = testConfigStore(suiteName: suite)
+        var config = CodexBarConfig.makeDefault()
+        config.setProviderConfig(ProviderConfig(
+            id: .moonshot,
+            apiKey: "legacy-china-token",
+            region: MoonshotRegion.china.rawValue))
+        try configStore.save(config)
+
+        let migrated = try CodexBarConfigMigrator.loadOrMigrate(
+            configStore: configStore,
+            userDefaults: defaults,
+            keychainAccessDisabled: false,
+            stores: Self.legacyStores(
+                secrets: CountingLegacySecretStore(),
+                accountStore: CountingTokenAccountStore()))
+
+        #expect(migrated.providerConfig(for: .moonshot)?.apiKeyRegion == MoonshotRegion.china.rawValue)
+        #expect(try configStore.load()?.providerConfig(for: .moonshot)?.apiKeyRegion == MoonshotRegion.china.rawValue)
+    }
+
     @Test
     func `legacy secret migration completion flag skips repeated scans`() throws {
         let suite = "CodexBarConfigMigratorTests-skip-\(UUID().uuidString)"
@@ -17,7 +306,7 @@ struct CodexBarConfigMigratorTests {
         let stores = Self.legacyStores(secrets: secrets, accountStore: accountStore)
         let configStore = testConfigStore(suiteName: suite)
 
-        _ = CodexBarConfigMigrator.loadOrMigrate(configStore: configStore, userDefaults: defaults, stores: stores)
+        _ = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
 
         let firstSecretLoads = secrets.loadCount
         let firstAccountLoads = accountStore.loadCount
@@ -25,7 +314,7 @@ struct CodexBarConfigMigratorTests {
         #expect(firstAccountLoads == 1)
         #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey) == true)
 
-        _ = CodexBarConfigMigrator.loadOrMigrate(configStore: configStore, userDefaults: defaults, stores: stores)
+        _ = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
 
         #expect(secrets.loadCount == firstSecretLoads)
         #expect(accountStore.loadCount == firstAccountLoads)
@@ -43,7 +332,7 @@ struct CodexBarConfigMigratorTests {
         let stores = Self.legacyStores(secrets: secrets, accountStore: accountStore)
         let configStore = testConfigStore(suiteName: suite)
 
-        _ = CodexBarConfigMigrator.loadOrMigrate(configStore: configStore, userDefaults: defaults, stores: stores)
+        _ = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
 
         let firstSecretLoads = secrets.loadCount
         #expect(firstSecretLoads > 0)
@@ -51,7 +340,7 @@ struct CodexBarConfigMigratorTests {
         #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey) == false)
 
         secrets.throwOnStore = false
-        _ = CodexBarConfigMigrator.loadOrMigrate(configStore: configStore, userDefaults: defaults, stores: stores)
+        _ = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
 
         #expect(secrets.loadCount > firstSecretLoads)
         #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey) == true)
@@ -79,29 +368,156 @@ struct CodexBarConfigMigratorTests {
         let configStore = CodexBarConfigStore(
             fileURL: blockedDirectory.appendingPathComponent("config.json"))
 
-        _ = CodexBarConfigMigrator.loadOrMigrate(configStore: configStore, userDefaults: defaults, stores: stores)
+        _ = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
 
         #expect(secrets.clearAttempts == 0)
         #expect(try secrets.loadToken() == "legacy-token")
         #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey) == false)
 
         try FileManager.default.removeItem(at: blockedDirectory)
-        _ = CodexBarConfigMigrator.loadOrMigrate(configStore: configStore, userDefaults: defaults, stores: stores)
+        _ = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
 
         #expect(secrets.clearAttempts > 0)
         #expect(try secrets.loadToken() == nil)
         #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey) == true)
     }
 
+    @Test
+    func `all legacy load failures defer cleanup and retry on the next launch`() throws {
+        let suite = "CodexBarConfigMigratorTests-load-failure-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let secrets = CountingLegacySecretStore(throwOnLoad: true)
+        let accountStore = CountingTokenAccountStore(throwOnLoad: true)
+        let stores = Self.legacyStores(secrets: secrets, accountStore: accountStore)
+        let configStore = testConfigStore(suiteName: suite)
+
+        _ = try CodexBarConfigMigrator.loadOrMigrate(
+            configStore: configStore,
+            userDefaults: defaults,
+            keychainAccessDisabled: false,
+            stores: stores)
+
+        let failedSecretLoads = secrets.loadCount
+        let failedAccountLoads = accountStore.loadCount
+        #expect(failedSecretLoads > 0)
+        #expect(failedAccountLoads == 1)
+        #expect(secrets.clearAttempts == 0)
+        #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey) == false)
+
+        secrets.throwOnLoad = false
+        accountStore.throwOnLoad = false
+        _ = try CodexBarConfigMigrator.loadOrMigrate(
+            configStore: configStore,
+            userDefaults: defaults,
+            keychainAccessDisabled: false,
+            stores: stores)
+
+        #expect(secrets.loadCount > failedSecretLoads)
+        #expect(accountStore.loadCount > failedAccountLoads)
+        #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey))
+    }
+
+    @Test
+    func `mixed legacy load results persist successes without clearing until retry succeeds`() throws {
+        let suite = "CodexBarConfigMigratorTests-mixed-load-failure-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let readableSecrets = CountingLegacySecretStore(token: "legacy-token")
+        let unreadableSecrets = CountingLegacySecretStore(throwOnLoad: true)
+        let accountStore = CountingTokenAccountStore()
+        let stores = Self.legacyStores(
+            secrets: readableSecrets,
+            accountStore: accountStore,
+            syntheticTokenStore: unreadableSecrets)
+        let configStore = testConfigStore(suiteName: suite)
+
+        let first = try CodexBarConfigMigrator.loadOrMigrate(
+            configStore: configStore,
+            userDefaults: defaults,
+            keychainAccessDisabled: false,
+            stores: stores)
+
+        #expect(first.providerConfig(for: .zai)?.apiKey == "legacy-token")
+        #expect(try configStore.load()?.providerConfig(for: .zai)?.apiKey == "legacy-token")
+        #expect(readableSecrets.clearAttempts == 0)
+        #expect(unreadableSecrets.clearAttempts == 0)
+        #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey) == false)
+
+        let firstUnreadableLoadCount = unreadableSecrets.loadCount
+        unreadableSecrets.throwOnLoad = false
+        _ = try CodexBarConfigMigrator.loadOrMigrate(
+            configStore: configStore,
+            userDefaults: defaults,
+            keychainAccessDisabled: false,
+            stores: stores)
+
+        #expect(unreadableSecrets.loadCount > firstUnreadableLoadCount)
+        #expect(readableSecrets.clearAttempts > 0)
+        #expect(unreadableSecrets.clearAttempts > 0)
+        #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey))
+    }
+
     private static let legacyMigrationCompletedKey = "codexbar.legacySecretsMigrationCompleted"
+
+    @Test(arguments: [false, true])
+    func `disabled keychain migration preserves sources and retries after access returns`(
+        hidesToken: Bool) throws
+    {
+        let suite = "CodexBarConfigMigratorTests-deferred-keychain-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set("fixture-cookie=manual", forKey: "kimiManualCookieHeader")
+        let configStore = testConfigStore(suiteName: suite)
+        let secrets = CountingLegacySecretStore(token: "legacy-fixture-token")
+        secrets.hideTokenOnLoad = hidesToken
+        let stores = Self.legacyStores(secrets: secrets, accountStore: CountingTokenAccountStore())
+
+        let deferred = try CodexBarConfigMigrator.loadOrMigrate(
+            configStore: configStore,
+            userDefaults: defaults,
+            keychainAccessDisabled: true,
+            stores: stores)
+
+        #expect(deferred.providerConfig(for: .kimi)?.cookieHeader != nil)
+        #expect(try configStore.load()?.providerConfig(for: .kimi)?.cookieHeader != nil)
+        #expect(!defaults.bool(forKey: Self.legacyMigrationCompletedKey))
+        #expect(secrets.clearAttempts == 0)
+
+        secrets.hideTokenOnLoad = false
+        let recovered = try Self.migrate(configStore: configStore, defaults: defaults, stores: stores)
+
+        #expect(recovered.providerConfig(for: .zai)?.apiKey == "legacy-fixture-token")
+        #expect(try configStore.load()?.providerConfig(for: .zai)?.apiKey == "legacy-fixture-token")
+        #expect(secrets.clearAttempts > 0)
+        #expect(try secrets.loadToken() == nil)
+        #expect(defaults.bool(forKey: Self.legacyMigrationCompletedKey))
+    }
+
+    private static func migrate(
+        configStore: CodexBarConfigStore,
+        defaults: UserDefaults,
+        stores: CodexBarConfigMigrator.LegacyStores) throws -> CodexBarConfig
+    {
+        try CodexBarConfigMigrator.loadOrMigrate(
+            configStore: configStore,
+            userDefaults: defaults,
+            keychainAccessDisabled: false,
+            stores: stores)
+    }
 
     private static func legacyStores(
         secrets: CountingLegacySecretStore,
-        accountStore: CountingTokenAccountStore) -> CodexBarConfigMigrator.LegacyStores
+        accountStore: CountingTokenAccountStore,
+        syntheticTokenStore: CountingLegacySecretStore? = nil) -> CodexBarConfigMigrator.LegacyStores
     {
         CodexBarConfigMigrator.LegacyStores(
             zaiTokenStore: secrets,
-            syntheticTokenStore: secrets,
+            syntheticTokenStore: syntheticTokenStore ?? secrets,
             codexCookieStore: secrets,
             claudeCookieStore: secrets,
             cursorCookieStore: secrets,
@@ -110,7 +526,6 @@ struct CodexBarConfigMigratorTests {
             minimaxCookieStore: secrets,
             minimaxAPITokenStore: secrets,
             kimiTokenStore: secrets,
-            kimiK2TokenStore: secrets,
             augmentCookieStore: secrets,
             ampCookieStore: secrets,
             copilotTokenStore: secrets,
@@ -119,17 +534,21 @@ struct CodexBarConfigMigratorTests {
 }
 
 private final class CountingLegacySecretStore: ZaiTokenStoring, SyntheticTokenStoring, CookieHeaderStoring,
-    MiniMaxCookieStoring, MiniMaxAPITokenStoring, KimiTokenStoring, KimiK2TokenStoring, CopilotTokenStoring,
+    MiniMaxCookieStoring, MiniMaxAPITokenStoring, KimiTokenStoring, CopilotTokenStoring,
     @unchecked Sendable
 {
     private let lock = NSLock()
     private var token: String?
+    var throwOnLoad: Bool
     var throwOnStore: Bool
+    var hideTokenOnLoad = false
     private(set) var loadCount = 0
     private(set) var clearAttempts = 0
+    private(set) var keychainAccessOverridesAtLoad: [Bool?] = []
 
-    init(token: String? = nil, throwOnStore: Bool = false) {
+    init(token: String? = nil, throwOnLoad: Bool = false, throwOnStore: Bool = false) {
         self.token = token
+        self.throwOnLoad = throwOnLoad
         self.throwOnStore = throwOnStore
     }
 
@@ -137,7 +556,11 @@ private final class CountingLegacySecretStore: ZaiTokenStoring, SyntheticTokenSt
         self.lock.lock()
         defer { self.lock.unlock() }
         self.loadCount += 1
-        return self.token
+        self.keychainAccessOverridesAtLoad.append(KeychainAccessGate.currentOverrideForTesting)
+        if self.throwOnLoad {
+            throw TestStoreError.loadFailed
+        }
+        return self.hideTokenOnLoad ? nil : self.token
     }
 
     func storeToken(_ token: String?) throws {
@@ -148,7 +571,11 @@ private final class CountingLegacySecretStore: ZaiTokenStoring, SyntheticTokenSt
         self.lock.lock()
         defer { self.lock.unlock() }
         self.loadCount += 1
-        return self.token
+        self.keychainAccessOverridesAtLoad.append(KeychainAccessGate.currentOverrideForTesting)
+        if self.throwOnLoad {
+            throw TestStoreError.loadFailed
+        }
+        return self.hideTokenOnLoad ? nil : self.token
     }
 
     func storeCookieHeader(_ header: String?) throws {
@@ -168,12 +595,20 @@ private final class CountingLegacySecretStore: ZaiTokenStoring, SyntheticTokenSt
 
 private final class CountingTokenAccountStore: ProviderTokenAccountStoring, @unchecked Sendable {
     private let lock = NSLock()
+    var throwOnLoad: Bool
     private(set) var loadCount = 0
+
+    init(throwOnLoad: Bool = false) {
+        self.throwOnLoad = throwOnLoad
+    }
 
     func loadAccounts() throws -> [UsageProvider: ProviderTokenAccountData] {
         self.lock.lock()
         defer { self.lock.unlock() }
         self.loadCount += 1
+        if self.throwOnLoad {
+            throw TestStoreError.loadFailed
+        }
         return [:]
     }
 
@@ -185,5 +620,6 @@ private final class CountingTokenAccountStore: ProviderTokenAccountStoring, @unc
 }
 
 private enum TestStoreError: Error {
+    case loadFailed
     case storeFailed
 }

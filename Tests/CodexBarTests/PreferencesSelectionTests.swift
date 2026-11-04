@@ -7,7 +7,18 @@ import Testing
 struct PreferencesSelectionTests {
     @Test
     func `pane persistence tokens round-trip`() {
-        let panes: [SettingsPane] = [.general, .display, .advanced, .about, .debug, .provider(.claude)]
+        let panes: [SettingsPane] = [
+            .general,
+            .iCloudSync,
+            .usageSpend,
+            .notifications,
+            .menuBar,
+            .menu,
+            .advanced,
+            .about,
+            .debug,
+            .provider(.claude),
+        ]
         for pane in panes {
             #expect(SettingsPane(persistenceToken: pane.persistenceToken) == pane)
         }
@@ -16,16 +27,22 @@ struct PreferencesSelectionTests {
     }
 
     @Test
-    func `selection restores persisted pane and saves changes`() throws {
-        let suite = "PreferencesSelectionTests-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
+    func `legacy display token restores the menu bar pane`() {
+        #expect(SettingsPane(persistenceToken: "display") == .menuBar)
+    }
+
+    @Test
+    func `selection restores persisted pane and saves changes`() {
+        let defaults = InMemoryUserDefaults()
 
         #expect(PreferencesSelection(userDefaults: defaults).pane == .general)
 
         let selection = PreferencesSelection(userDefaults: defaults)
         selection.pane = .provider(.codex)
         #expect(defaults.string(forKey: PreferencesSelection.paneDefaultsKey) == "provider:codex")
-        #expect(PreferencesSelection(userDefaults: defaults).pane == .provider(.codex))
+        let restored = PreferencesSelection(userDefaults: defaults)
+        #expect(restored.pane == .provider(.codex))
+        #expect(!restored.canGoBack)
+        #expect(!restored.canGoForward)
     }
 }

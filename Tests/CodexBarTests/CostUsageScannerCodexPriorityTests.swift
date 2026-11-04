@@ -21,6 +21,22 @@ struct CostUsageScannerCodexPriorityTests {
     }
 
     @Test
+    func `parses current priority submission metadata without exposing prompt`() {
+        let body = "session_loop{thread_id=thread}: Submission sub=Submission { "
+            + "id: \"turn\", op: UserInput { text: \"private\" }, "
+            + #"thread_settings: ThreadSettingsOverrides { service_tier: Some(Some("priority")) }"#
+
+        let parsed = CostUsageScanner.parseCodexPriorityTraceRow(
+            timestamp: "1785434553",
+            body: body)
+
+        #expect(parsed?.threadID == "thread")
+        #expect(parsed?.turnID == "turn")
+        #expect(parsed?.model == nil)
+        #expect(parsed?.timestamp == "1785434553")
+    }
+
+    @Test
     func `ignores non priority malformed and non response request rows`() {
         let prefix = "thread_id=thread turn.id=turn websocket request: "
 
@@ -75,6 +91,26 @@ struct CostUsageScannerCodexPriorityTests {
     }
 
     @Test
+    func `reads current priority submission rows from sqlite logs table`() throws {
+        let env = try CostUsageTestEnvironment()
+        defer { env.cleanup() }
+        let dbURL = env.root.appendingPathComponent("logs_2.sqlite")
+        try Self.createTestLogsDatabase(at: dbURL)
+        try Self.insertTestLog(
+            dbURL: dbURL,
+            timestamp: "2026-05-10T12:00:00Z",
+            body: "session_loop{thread_id=thread}: Submission sub=Submission { "
+                + "id: \"turn\", op: UserInput { text: \"private\" }, "
+                + #"thread_settings: ThreadSettingsOverrides { service_tier: Some(Some("priority")) }"#)
+
+        let turns = CostUsageScanner.codexPriorityTurns(databaseURL: dbURL)
+
+        #expect(turns.keys.sorted() == ["turn"])
+        #expect(turns["turn"]?.threadID == "thread")
+        #expect(turns["turn"]?.model == nil)
+    }
+
+    @Test
     func `cold scan uses timestamp index and warm scan uses rowid cursor`() throws {
         let env = try CostUsageTestEnvironment()
         defer { env.cleanup() }
@@ -87,17 +123,17 @@ struct CostUsageScannerCodexPriorityTests {
         }
         defer { sqlite3_close(db) }
 
-        let coldQuery = CostUsageScanner._test_codexPriorityAccumulationQuery(
+        let coldQuery = CostUsageScanner.codexPriorityAccumulationPlan(
             db,
             lastRowID: 0,
-            coverageSinceEpoch: 1)
+            coverageSinceEpoch: 1).query
         let coldPlan = try Self.queryPlan(db: db, query: coldQuery, bindings: [1])
         #expect(coldPlan.contains { $0.contains("USING INDEX idx_logs_ts") })
 
-        let unboundedColdQuery = CostUsageScanner._test_codexPriorityAccumulationQuery(
+        let unboundedColdQuery = CostUsageScanner.codexPriorityAccumulationPlan(
             db,
             lastRowID: 0,
-            coverageSinceEpoch: 0)
+            coverageSinceEpoch: 0).query
         let unboundedColdPlan = try Self.queryPlan(
             db: db,
             query: unboundedColdQuery,
@@ -105,12 +141,30 @@ struct CostUsageScannerCodexPriorityTests {
         #expect(unboundedColdPlan.contains { $0.contains("USING INTEGER PRIMARY KEY") })
         #expect(!unboundedColdPlan.contains { $0.contains("USE TEMP B-TREE") })
 
-        let warmQuery = CostUsageScanner._test_codexPriorityAccumulationQuery(
+        let warmQuery = CostUsageScanner.codexPriorityAccumulationPlan(
             db,
             lastRowID: 1,
-            coverageSinceEpoch: 0)
+            coverageSinceEpoch: 0).query
         let warmPlan = try Self.queryPlan(db: db, query: warmQuery, bindings: [1, 0])
         #expect(warmPlan.contains { $0.contains("USING INTEGER PRIMARY KEY") })
+
+        let anchorSelectionPlan = try Self.queryPlan(
+            db: db,
+            query: CostUsageScanner.codexPriorityAnchorSelectionQuery,
+            bindings: [1])
+        #expect(anchorSelectionPlan.contains { $0.contains("USING INTEGER PRIMARY KEY") })
+
+        let anchorMinimumPlan = try Self.queryPlan(
+            db: db,
+            query: CostUsageScanner.codexPriorityAnchorMinimumQuery,
+            bindings: [1])
+        #expect(anchorMinimumPlan.contains { $0.contains("USING INTEGER PRIMARY KEY") })
+
+        let anchorLookupPlan = try Self.queryPlan(
+            db: db,
+            query: CostUsageScanner.codexPriorityAnchorLookupQuery,
+            bindings: [1])
+        #expect(anchorLookupPlan.contains { $0.contains("USING INTEGER PRIMARY KEY") })
     }
 
     @Test
@@ -353,6 +407,10 @@ struct CostUsageScannerCodexPriorityTests {
         #expect(pruned["turn-a"]?.threadID == "thread-old")
         #expect(pruned["turn-a"]?.model == "completed-old")
         #expect(pruned["turn-b"]?.model == "request-model")
+
+        CostUsageScanner._test_resetCodexPriorityTurnsMemo(forPath: dbURL.path)
+        let cold = CostUsageScanner.codexPriorityTurns(databaseURL: dbURL)
+        #expect(pruned == cold)
     }
 
     @Test
@@ -379,6 +437,7 @@ struct CostUsageScannerCodexPriorityTests {
             coverageSinceEpoch: 0,
             lastRowID: 0,
             fileIdentity: nil,
+            anchors: [],
             turns: [:],
             requestSourcesByTurnID: [:],
             priorityCompletedModelsByTurnID: [:],
@@ -386,7 +445,7 @@ struct CostUsageScannerCodexPriorityTests {
             completedTurnIDInsertionOrder: [],
             completedTurnIDInsertionOrderStartIndex: 0)
 
-        #expect(!CostUsageScanner._test_accumulateCodexPriorityTurns(db, into: &state))
+        #expect(!CostUsageScanner.accumulateCodexPriorityTurns(db, into: &state))
     }
 
     @Test
@@ -687,6 +746,19 @@ struct CostUsageScannerCodexPriorityTests {
         case prepare
         case step
         case exec
+    }
+}
+
+extension CostUsageScanner {
+    static func codexPriorityTurns(
+        databaseURL: URL? = nil,
+        sinceDayKey: String? = nil,
+        untilDayKey: String? = nil) -> [String: CodexPriorityTurnMetadata]
+    {
+        self.resolveCodexPriorityTurns(
+            databaseURL: databaseURL,
+            sinceDayKey: sinceDayKey,
+            untilDayKey: untilDayKey).turns
     }
 }
 #endif

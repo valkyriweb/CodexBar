@@ -17,7 +17,7 @@ The Augment provider tracks your Augment Code usage and credits through browser 
 - **Plan Information**: Display your current subscription plan
 - **CLI Integration**: Uses `auggie account status` when the Auggie CLI is installed (falls back to web)
 - **Automatic Session Keepalive**: Prevents cookie expiration with proactive refresh
-- **Multi-Browser Support**: Chrome, Chrome Beta, Chrome Canary, Arc, Safari
+- **Multi-Browser Support**: All browsers in the shared catalog
 
 ## Setup
 
@@ -31,8 +31,7 @@ The Augment provider tracks your Augment Code usage and credits through browser 
 
 **Automatic (Recommended)**
 - Automatically imports cookies from your browser
-- Supports Chrome, Chrome Beta, Chrome Canary, Arc, and Safari
-- Browser priority: Chrome Beta → Chrome → Chrome Canary → Arc → Safari
+- Follows the shared supported-browser order and access gate
 
 **Manual**
 - Paste a cookie header from your browser's developer tools
@@ -51,13 +50,8 @@ The Augment provider tracks your Augment Code usage and credits through browser 
 
 ### Cookie Import
 
-The provider searches for Augment session cookies in this order:
-
-1. **Chrome Beta** (if installed)
-2. **Chrome** (if installed)
-3. **Chrome Canary** (if installed)
-4. **Arc** (if installed)
-5. **Safari** (if installed)
+The provider searches for Augment session cookies in the shared supported-browser order.
+Background Chromium reads require existing prompt-free Keychain access; Safari may require Full Disk Access.
 
 Recognized cookie names:
 - `_session` (legacy)
@@ -85,6 +79,14 @@ The provider includes an automatic session keepalive system:
 - **Session Cookies**: Refreshed every 30 minutes (no expiration date)
 
 This ensures your session stays active without manual intervention.
+
+Disabling Augment stops its timer and cancels in-flight automatic and forced refreshes. Retired work cannot start
+follow-up cookie imports, cache writes, recovery actions, or notifications after it resumes. Re-enabling starts a new
+keepalive lifecycle, and cancelling one manual refresh does not cancel another active refresh.
+
+Login-required events use the shared, off-by-default **Settings → Notifications → Credential expiry**
+option. Repeated keepalive and usage failures share one episode, and network retry exhaustion does not
+send an expiry alert. See [credential notifications](credential-notifications.md).
 
 ### API Endpoints
 
@@ -154,6 +156,7 @@ This displays:
 - Cookies are filtered by domain before sending to API endpoints
 - No cookies are sent to third-party services
 - Session keepalive only runs when Augment is enabled
+- Keepalive diagnostics omit outgoing cookies, Set-Cookie values, and raw response bodies.
 
 ## Technical Details
 

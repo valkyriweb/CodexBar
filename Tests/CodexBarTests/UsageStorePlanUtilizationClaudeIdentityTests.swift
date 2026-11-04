@@ -273,7 +273,8 @@ struct UsageStorePlanUtilizationClaudeIdentityTests {
         let ownerA = self.oauthOwnerIdentifier("a")
         let ownerB = self.oauthOwnerIdentifier("b")
         let keyA = try #require(
-            UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(historyOwnerIdentifier: ownerA))
+            UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(
+                historyOwnerIdentifier: UsageStore._activeClaudeAccountIdentityForTesting("uuid-A")))
         let keyB = try #require(
             UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(historyOwnerIdentifier: ownerB))
         let hourStart = Date(timeIntervalSince1970: 1_700_000_000)
@@ -371,9 +372,11 @@ struct UsageStorePlanUtilizationClaudeIdentityTests {
         let ownerA = self.oauthOwnerIdentifier("a")
         let ownerB = self.oauthOwnerIdentifier("b")
         let keyA = try #require(
-            UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(historyOwnerIdentifier: ownerA))
+            UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(
+                historyOwnerIdentifier: UsageStore._activeClaudeAccountIdentityForTesting("uuid-A")))
         let keyB = try #require(
-            UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(historyOwnerIdentifier: ownerB))
+            UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(
+                historyOwnerIdentifier: UsageStore._activeClaudeAccountIdentityForTesting("uuid-B")))
         let hourStart = Date(timeIntervalSince1970: 1_700_000_000)
 
         // 1) First run after upgrading: the map is empty. A background poll serves owner_A while
@@ -690,11 +693,9 @@ struct UsageStorePlanUtilizationClaudeIdentityTests {
         let originalOwner = self.oauthOwnerIdentifier("c")
         let replacementOwner = self.oauthOwnerIdentifier("d")
         let originalKey = try #require(UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(
-            historyOwnerIdentifier: originalOwner,
-            persistentRefHash: "same-row-ref"))
+            historyOwnerIdentifier: originalOwner))
         let replacementKey = try #require(UsageStore._claudeOAuthPlanUtilizationAccountKeyForTesting(
-            historyOwnerIdentifier: replacementOwner,
-            persistentRefHash: "same-row-ref"))
+            historyOwnerIdentifier: replacementOwner))
 
         await store.recordPlanUtilizationHistorySample(
             provider: .claude,
@@ -889,11 +890,17 @@ struct UsageStorePlanUtilizationClaudeIdentityTests {
             tokenAccountStore: InMemoryTokenAccountStore())
         settings.addTokenAccount(provider: .claude, label: "Unrelated", token: "unrelated-token")
         settings.setActiveTokenAccountIndex(0, for: .claude)
-        return UsageStore(
+        let store = UsageStore(
             fetcher: UsageFetcher(),
             browserDetection: BrowserDetection(cacheTTL: 0),
             settings: settings,
             planUtilizationHistoryStore: historyStore,
             startupBehavior: .testing)
+        // Cancel the background decode and apply the disk-loaded buckets
+        // synchronously so callers can immediately query without racing the
+        // utility-priority load task.
+        store._cancelPlanUtilizationHistoryLoadForTesting()
+        store.planUtilizationHistory = store.planUtilizationHistoryStore.load()
+        return store
     }
 }

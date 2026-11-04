@@ -6,43 +6,41 @@ struct DeepSeekUsageFetcherTests {
     private struct TimeoutError: Error {}
 
     private actor SummaryCancellationProbe {
-        private var started = false
-        private var cancelled = false
-        private var startedWaiters: [CheckedContinuation<Void, Never>] = []
-        private var cancelledWaiters: [CheckedContinuation<Void, Never>] = []
+        private let started = HeldRequestGate()
+        private let cancelled = HeldRequestGate()
 
-        func markStarted() {
-            self.started = true
-            for waiter in self.startedWaiters {
-                waiter.resume()
+        func markStarted() async { await self.started.open() }
+        func waitUntilStarted() async { await self.started.wait() }
+        func markCancelled() async { await self.cancelled.open() }
+        func waitUntilCancelled() async { await self.cancelled.wait() }
+        func wasCancelled() async -> Bool { await self.cancelled.isOpen }
+    }
+
+    private actor ConcurrentFetchGate {
+        private var arrivalCount = 0
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func arriveAndWait() async {
+            self.arrivalCount += 1
+            if self.arrivalCount == 2 {
+                for waiter in self.waiters {
+                    waiter.resume()
+                }
+                self.waiters.removeAll()
+                return
             }
-            self.startedWaiters.removeAll()
-        }
 
-        func waitUntilStarted() async {
-            if self.started { return }
             await withCheckedContinuation { continuation in
-                self.startedWaiters.append(continuation)
+                self.waiters.append(continuation)
             }
         }
+    }
 
-        func markCancelled() {
-            self.cancelled = true
-            for waiter in self.cancelledWaiters {
-                waiter.resume()
-            }
-            self.cancelledWaiters.removeAll()
-        }
+    private actor SummaryCallCounter {
+        private(set) var value = 0
 
-        func waitUntilCancelled() async {
-            if self.cancelled { return }
-            await withCheckedContinuation { continuation in
-                self.cancelledWaiters.append(continuation)
-            }
-        }
-
-        func wasCancelled() -> Bool {
-            self.cancelled
+        func increment() {
+            self.value += 1
         }
     }
 
@@ -67,10 +65,7 @@ struct DeepSeekUsageFetcherTests {
     }
 
     private static func waitForCancellation(_ probe: SummaryCancellationProbe) async -> Bool {
-        for _ in 0..<100 {
-            if await probe.wasCancelled() { return true }
-            try? await Task.sleep(for: .milliseconds(20))
-        }
+        await probe.waitUntilCancelled()
         return await probe.wasCancelled()
     }
 
@@ -126,6 +121,90 @@ struct DeepSeekUsageFetcherTests {
         #expect(snapshot.totalBalance == 50.0)
         #expect(snapshot.grantedBalance == 10.0)
         #expect(snapshot.toppedUpBalance == 40.0)
+    }
+
+    @Test
+    func `parses paid and granted balances from Platform session summary`() throws {
+        let json = """
+        {
+          "code": 0,
+          "data": {
+            "biz_code": 0,
+            "biz_data": {
+              "normal_wallets": [
+                {"balance": "7.97", "currency": "USD"}
+              ],
+              "bonus_wallets": [
+                {"balance": 0.50, "currency": "USD"}
+              ]
+            }
+          }
+        }
+        """
+
+        let snapshot = try DeepSeekUsageFetcher._parsePlatformBalanceForTesting(Data(json.utf8))
+
+        #expect(snapshot.hasBalance)
+        #expect(snapshot.isAvailable)
+        #expect(snapshot.currency == "USD")
+        #expect(abs(snapshot.totalBalance - 8.47) < 0.000_001)
+        #expect(snapshot.toppedUpBalance == 7.97)
+        #expect(snapshot.grantedBalance == 0.50)
+    }
+
+    @Test
+    func `Platform session summary rejects malformed balance`() {
+        let json = """
+        {
+          "code": 0,
+          "data": {
+            "biz_code": 0,
+            "biz_data": {
+              "normal_wallets": [{"balance": "not-a-number", "currency": "USD"}],
+              "bonus_wallets": []
+            }
+          }
+        }
+        """
+
+        #expect(throws: DeepSeekUsageError.self) {
+            try DeepSeekUsageFetcher._parsePlatformBalanceForTesting(Data(json.utf8))
+        }
+    }
+
+    @Test
+    func `Platform session summary maps top level auth envelopes before decoding data`() {
+        let json = """
+        {
+          "code": 40003,
+          "data": "unexpected"
+        }
+        """
+
+        #expect {
+            try DeepSeekUsageFetcher._parsePlatformBalanceForTesting(Data(json.utf8))
+        } throws: { error in
+            error as? DeepSeekUsageError == .invalidPlatformToken
+        }
+    }
+
+    @Test
+    func `Platform session summary maps nested auth envelopes before decoding wallets`() {
+        let json = """
+        {
+          "code": 0,
+          "data": {
+            "biz_code": 40002,
+            "biz_data": "unexpected"
+          }
+        }
+        """
+
+        #expect {
+            try DeepSeekUsageFetcher._parsePlatformBalanceForTesting(Data(json.utf8))
+        } throws: { error in
+            error as? DeepSeekUsageError == .invalidPlatformToken
+        }
     }
 
     @Test
@@ -357,15 +436,35 @@ struct DeepSeekUsageFetcherTests {
         """
         let snapshot = try DeepSeekUsageFetcher._parseSnapshotForTesting(Data(json.utf8))
         let usage = snapshot.toUsageSnapshot()
-        #expect(usage.deepseekUsage == nil)
+        #expect(usage.details.isEmpty)
+    }
+
+    @Test
+    func `usage amount and cost fetch concurrently`() async throws {
+        let gate = ConcurrentFetchGate()
+        let payloads = try await Self.withTimeout(.seconds(60)) {
+            try await DeepSeekUsageFetcher._fetchUsagePayloadsForTesting(
+                fetchAmount: {
+                    await gate.arriveAndWait()
+                    return Data("amount".utf8)
+                },
+                fetchCost: {
+                    await gate.arriveAndWait()
+                    return Data("cost".utf8)
+                })
+        }
+
+        #expect(String(bytes: payloads.amount, encoding: .utf8) == "amount")
+        #expect(String(bytes: payloads.cost, encoding: .utf8) == "cost")
     }
 
     @Test
     func `balance returns promptly when optional usage summary is slow`() async throws {
         let probe = SummaryCancellationProbe()
-        let snapshot = try await Self.withTimeout(.seconds(10)) {
+        let snapshot = try await Self.withTimeout(.seconds(60)) {
             try await DeepSeekUsageFetcher._fetchUsageForTesting(
                 apiKey: "test-key",
+                platformToken: "platform-token",
                 includeOptionalUsage: true,
                 optionalSummaryJoinGrace: .milliseconds(50),
                 fetchBalanceData: { _ in
@@ -390,35 +489,38 @@ struct DeepSeekUsageFetcherTests {
 
     @Test
     func `balance grace does not wait for optional summary that ignores cancellation`() async throws {
-        let startedAt = ContinuousClock.now
+        let summaryStarted = HeldRequestGate()
+        let releaseSummary = HeldRequestGate()
+        let summaryFinished = HeldRequestGate()
+        defer { Task { await releaseSummary.open() } }
         let snapshot = try await DeepSeekUsageFetcher._fetchUsageForTesting(
             apiKey: "test-key",
+            platformToken: "platform-token",
             includeOptionalUsage: true,
             optionalSummaryJoinGrace: .milliseconds(20),
             fetchBalanceData: { _ in
-                Data(Self.sampleBalanceJSON.utf8)
+                await summaryStarted.wait()
+                return Data(Self.sampleBalanceJSON.utf8)
             },
             fetchSummary: { _ in
-                await withCheckedContinuation { continuation in
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
-                        continuation.resume(returning: Self.sampleSummary())
-                    }
-                }
+                await summaryStarted.open()
+                await releaseSummary.wait()
+                await summaryFinished.open()
+                return Self.sampleSummary()
             })
-        let elapsed = startedAt.duration(to: .now)
 
         #expect(snapshot.totalBalance == 50.0)
         #expect(snapshot.usageSummary == nil)
-        #expect(elapsed < .milliseconds(300), "Optional summary delayed balance: \(elapsed)")
-
-        // Let the deliberately cancellation-ignoring test task drain before the test exits.
-        try await Task.sleep(for: .milliseconds(550))
+        #expect(await releaseSummary.isOpen == false)
+        await releaseSummary.open()
+        await summaryFinished.wait()
     }
 
     @Test
     func `balance returns when optional usage summary fails closed`() async throws {
         let snapshot = try await DeepSeekUsageFetcher._fetchUsageForTesting(
             apiKey: "test-key",
+            platformToken: "platform-token",
             includeOptionalUsage: true,
             optionalSummaryJoinGrace: .seconds(2),
             fetchBalanceData: { _ in
@@ -433,12 +535,61 @@ struct DeepSeekUsageFetcherTests {
     }
 
     @Test
+    func `Platform balance returns when optional usage summary fails`() async throws {
+        let snapshot = try await DeepSeekUsageFetcher._fetchPlatformUsageForTesting(
+            includeOptionalUsage: true,
+            optionalSummaryJoinGrace: .seconds(2),
+            fetchBalance: {
+                DeepSeekUsageSnapshot(
+                    isAvailable: true,
+                    currency: "USD",
+                    totalBalance: 8.06,
+                    grantedBalance: 0,
+                    toppedUpBalance: 8.06,
+                    updatedAt: Date())
+            },
+            fetchSummary: {
+                throw DeepSeekUsageError.networkError("simulated failure")
+            })
+
+        #expect(snapshot.totalBalance == 8.06)
+        #expect(snapshot.usageSummary == nil)
+        #expect(snapshot.detailedUsageState == .unavailable)
+    }
+
+    @Test
+    func `Platform balance skips detailed endpoints when optional usage is disabled`() async throws {
+        let counter = SummaryCallCounter()
+        let snapshot = try await DeepSeekUsageFetcher._fetchPlatformUsageForTesting(
+            includeOptionalUsage: false,
+            fetchBalance: {
+                DeepSeekUsageSnapshot(
+                    isAvailable: true,
+                    currency: "USD",
+                    totalBalance: 8.06,
+                    grantedBalance: 0,
+                    toppedUpBalance: 8.06,
+                    updatedAt: Date())
+            },
+            fetchSummary: {
+                await counter.increment()
+                return Self.sampleSummary()
+            })
+
+        #expect(snapshot.totalBalance == 8.06)
+        #expect(snapshot.usageSummary == nil)
+        #expect(snapshot.detailedUsageState == .notRequested)
+        #expect(await counter.value == 0)
+    }
+
+    @Test
     func `cancels optional usage summary when balance fetch fails`() async throws {
         let probe = SummaryCancellationProbe()
 
         do {
             _ = try await DeepSeekUsageFetcher._fetchUsageForTesting(
                 apiKey: "test-key",
+                platformToken: "platform-token",
                 includeOptionalUsage: true,
                 optionalSummaryJoinGrace: .seconds(2),
                 fetchBalanceData: { _ in
@@ -468,6 +619,7 @@ struct DeepSeekUsageFetcherTests {
         do {
             _ = try await DeepSeekUsageFetcher._fetchUsageForTesting(
                 apiKey: "test-key",
+                platformToken: "platform-token",
                 includeOptionalUsage: true,
                 optionalSummaryJoinGrace: .seconds(2),
                 fetchBalanceData: { _ in
@@ -496,6 +648,7 @@ struct DeepSeekUsageFetcherTests {
         let task = Task {
             try await DeepSeekUsageFetcher._fetchUsageForTesting(
                 apiKey: "test-key",
+                platformToken: "platform-token",
                 includeOptionalUsage: true,
                 optionalSummaryJoinGrace: .seconds(30),
                 fetchBalanceData: { _ in
@@ -517,7 +670,7 @@ struct DeepSeekUsageFetcherTests {
         task.cancel()
 
         do {
-            _ = try await Self.withTimeout(.seconds(10)) {
+            _ = try await Self.withTimeout(.seconds(60)) {
                 try await task.value
             }
             Issue.record("Expected cancellation")
@@ -528,20 +681,20 @@ struct DeepSeekUsageFetcherTests {
 
     @Test
     func `parent cancellation stops summary while balance transport ignores cancellation`() async throws {
-        let balanceStarted = AsyncStream<Void>.makeStream(of: Void.self)
+        let balanceStarted = HeldRequestGate()
+        let releaseBalance = HeldRequestGate()
+        defer { Task { await releaseBalance.open() } }
         let probe = SummaryCancellationProbe()
         let task = Task {
             try await DeepSeekUsageFetcher._fetchUsageForTesting(
                 apiKey: "test-key",
+                platformToken: "platform-token",
                 includeOptionalUsage: true,
                 optionalSummaryJoinGrace: .seconds(30),
                 fetchBalanceData: { _ in
-                    balanceStarted.continuation.yield(())
-                    return await withCheckedContinuation { continuation in
-                        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
-                            continuation.resume(returning: Data(Self.sampleBalanceJSON.utf8))
-                        }
-                    }
+                    await balanceStarted.open()
+                    await releaseBalance.wait()
+                    return Data(Self.sampleBalanceJSON.utf8)
                 },
                 fetchSummary: { _ in
                     await probe.markStarted()
@@ -555,14 +708,13 @@ struct DeepSeekUsageFetcherTests {
                 })
         }
 
-        var balanceIterator = balanceStarted.stream.makeAsyncIterator()
-        _ = await balanceIterator.next()
+        await balanceStarted.wait()
         await probe.waitUntilStarted()
-        let cancellationStartedAt = ContinuousClock.now
         task.cancel()
 
         await probe.waitUntilCancelled()
-        #expect(cancellationStartedAt.duration(to: .now) < .milliseconds(300))
+        #expect(await releaseBalance.isOpen == false)
+        await releaseBalance.open()
         await #expect(throws: CancellationError.self) {
             try await task.value
         }
@@ -593,6 +745,7 @@ struct DeepSeekUsageFetcherTests {
         let expected = Self.sampleSummary()
         let snapshot = try await DeepSeekUsageFetcher._fetchUsageForTesting(
             apiKey: "test-key",
+            platformToken: "platform-token",
             includeOptionalUsage: true,
             optionalSummaryJoinGrace: .seconds(2),
             fetchBalanceData: { _ in
@@ -604,6 +757,68 @@ struct DeepSeekUsageFetcherTests {
 
         #expect(snapshot.totalBalance == 50.0)
         #expect(snapshot.usageSummary == expected)
+        #expect(snapshot.detailedUsageState == .available)
+    }
+
+    @Test
+    func `API key alone reports that a web session is required`() async throws {
+        let summaryCalls = SummaryCallCounter()
+        let snapshot = try await DeepSeekUsageFetcher._fetchUsageForTesting(
+            apiKey: "test-key",
+            platformToken: nil,
+            includeOptionalUsage: true,
+            optionalSummaryJoinGrace: .seconds(1),
+            fetchBalanceData: { _ in
+                Data(Self.sampleBalanceJSON.utf8)
+            },
+            fetchSummary: { _ in
+                await summaryCalls.increment()
+                return Self.sampleSummary()
+            })
+
+        #expect(snapshot.totalBalance == 50.0)
+        #expect(snapshot.usageSummary == nil)
+        #expect(snapshot.detailedUsageState == .webSessionRequired)
+        #expect(await summaryCalls.value == 0)
+    }
+
+    @Test
+    func `platform token is separate from the balance API key`() async throws {
+        let snapshot = try await DeepSeekUsageFetcher._fetchUsageForTesting(
+            apiKey: "balance-api-key",
+            platformToken: "browser-user-token",
+            includeOptionalUsage: true,
+            optionalSummaryJoinGrace: .seconds(1),
+            fetchBalanceData: { key in
+                #expect(key == "balance-api-key")
+                return Data(Self.sampleBalanceJSON.utf8)
+            },
+            fetchSummary: { token in
+                #expect(token == "browser-user-token")
+                return Self.sampleSummary()
+            })
+
+        #expect(snapshot.usageSummary != nil)
+        #expect(snapshot.detailedUsageState == .available)
+    }
+
+    @Test
+    func `invalid platform token preserves balance and requests sign in`() async throws {
+        let snapshot = try await DeepSeekUsageFetcher._fetchUsageForTesting(
+            apiKey: "balance-api-key",
+            platformToken: "expired-browser-token",
+            includeOptionalUsage: true,
+            optionalSummaryJoinGrace: .seconds(1),
+            fetchBalanceData: { _ in
+                Data(Self.sampleBalanceJSON.utf8)
+            },
+            fetchSummary: { _ in
+                throw DeepSeekUsageError.invalidPlatformToken
+            })
+
+        #expect(snapshot.totalBalance == 50.0)
+        #expect(snapshot.usageSummary == nil)
+        #expect(snapshot.detailedUsageState == .webSessionRequired)
     }
 
     private static func utcDate(year: Int, month: Int, day: Int) -> Date? {

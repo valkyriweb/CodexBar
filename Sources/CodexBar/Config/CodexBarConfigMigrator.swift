@@ -13,7 +13,6 @@ struct CodexBarConfigMigrator {
         let minimaxCookieStore: any MiniMaxCookieStoring
         let minimaxAPITokenStore: any MiniMaxAPITokenStoring
         let kimiTokenStore: any KimiTokenStoring
-        let kimiK2TokenStore: any KimiK2TokenStoring
         let augmentCookieStore: any CookieHeaderStoring
         let ampCookieStore: any CookieHeaderStoring
         let copilotTokenStore: any CopilotTokenStoring
@@ -26,21 +25,26 @@ struct CodexBarConfigMigrator {
         var didUpdate = false
         var sawLegacySecrets = false
         var sawLegacyAccounts = false
+        var legacyLoadFailures: [String] = []
     }
 
     static func loadOrMigrate(
         configStore: CodexBarConfigStore,
         userDefaults: UserDefaults,
-        stores: LegacyStores) -> CodexBarConfig
+        keychainAccessDisabled: Bool,
+        stores: LegacyStores) throws -> CodexBarConfig
     {
         let log = CodexBarLog.logger(LogCategories.configMigration)
-        let existing = try? configStore.load()
+        let existing = try configStore.load()
         var config = (existing ?? CodexBarConfig.makeDefault()).normalized()
         var state = MigrationState()
 
         // applyLegacyCookieSources reads only UserDefaults — cheap, runs unconditionally so
         // newly-added cookie-source keys are picked up on every launch.
         self.applyLegacyCookieSources(userDefaults: userDefaults, config: &config, state: &state)
+        self.bindLegacyMoonshotAPIKeyRegion(config: &config, state: &state)
+        self.applyLegacyUsageVisibility(userDefaults: userDefaults, config: &config, state: &state)
+        self.preserveClaudeResetCreditVisibility(userDefaults: userDefaults, config: &config, state: &state)
 
         let migrationCompleted = userDefaults.bool(forKey: Self.legacyMigrationCompletedKey)
         if !migrationCompleted {
@@ -50,21 +54,34 @@ struct CodexBarConfigMigrator {
             if existing == nil {
                 self.applyLegacyOrderAndToggles(userDefaults: userDefaults, config: &config, state: &state)
             }
-            self.migrateLegacySecrets(userDefaults: userDefaults, stores: stores, config: &config, state: &state)
-            self.migrateLegacyAccounts(stores: stores, config: &config, state: &state)
+            self.migrateLegacySecrets(
+                userDefaults: userDefaults,
+                stores: stores,
+                config: &config,
+                state: &state,
+                log: log)
+            self.migrateLegacyAccounts(stores: stores, config: &config, state: &state, log: log)
         }
 
-        var didPersistUpdates = true
         if state.didUpdate {
             do {
                 try configStore.save(config)
             } catch {
-                didPersistUpdates = false
                 log.error("Failed to persist config: \(error)")
+                return config.normalized()
             }
         }
 
-        guard didPersistUpdates else {
+        // A disabled Keychain read looks empty to legacy stores, not successfully migrated.
+        // Keep permitted file/default imports, but preserve cleanup and completion for a later retry.
+        guard !keychainAccessDisabled else {
+            return config.normalized()
+        }
+
+        guard state.legacyLoadFailures.isEmpty else {
+            log.error(
+                "Legacy migration deferred because one or more sources were unreadable",
+                metadata: ["stores": state.legacyLoadFailures.joined(separator: ",")])
             return config.normalized()
         }
 
@@ -78,6 +95,43 @@ struct CodexBarConfigMigrator {
         }
 
         return config.normalized()
+    }
+
+    private static func preserveClaudeResetCreditVisibility(
+        userDefaults: UserDefaults,
+        config: inout CodexBarConfig,
+        state: inout MigrationState)
+    {
+        // Provider-specific by design: Claude resets used the global optional gate before independent controls.
+        guard let index = config.providers.firstIndex(where: { $0.id == .claude }),
+              config.providers[index].claudeResetCreditsVisibilityMigrated != true
+        else { return }
+        if userDefaults.object(forKey: "showOptionalCreditsAndExtraUsage") as? Bool == false {
+            let existing = config.providers[index].hiddenUsageItemIDs ?? []
+            config.providers[index].hiddenUsageItemIDs = Set(existing + ["section:claude-reset-credits"]).sorted()
+        }
+        config.providers[index].claudeResetCreditsVisibilityMigrated = true
+        state.didUpdate = true
+    }
+
+    private static func applyLegacyUsageVisibility(
+        userDefaults: UserDefaults,
+        config: inout CodexBarConfig,
+        state: inout MigrationState)
+    {
+        // Provider-specific by design: upgrade the two retired visibility toggles before sync reads config.
+        let legacySelections: [(UsageProvider, String, [String])] = [
+            (.codex, "codexSparkUsageVisible", ["metric:codex-spark", "metric:codex-spark-weekly"]),
+            (.claude, "claudeDailyRoutinesUsageVisible", ["metric:claude-routines"]),
+        ]
+        for (provider, key, hiddenIDs) in legacySelections {
+            guard userDefaults.object(forKey: key) as? Bool == false,
+                  let index = config.providers.firstIndex(where: { $0.id == provider.instanceID }),
+                  config.providers[index].hiddenUsageItemIDs == nil
+            else { continue }
+            config.providers[index].hiddenUsageItemIDs = hiddenIDs
+            state.didUpdate = true
+        }
     }
 
     private static func applyLegacyOrderAndToggles(
@@ -100,33 +154,52 @@ struct CodexBarConfigMigrator {
         userDefaults: UserDefaults,
         stores: LegacyStores,
         config: inout CodexBarConfig,
-        state: inout MigrationState)
+        state: inout MigrationState,
+        log: CodexBarLogger)
     {
-        self.migrateTokenProviders(
-            [
-                (.zai, stores.zaiTokenStore.loadToken),
-                (.synthetic, stores.syntheticTokenStore.loadToken),
-                (.copilot, stores.copilotTokenStore.loadToken),
-                (.kimik2, stores.kimiK2TokenStore.loadToken),
-            ],
-            config: &config,
-            state: &state)
+        // Provider-specific by design: this one-shot migration names the retired per-provider secret stores.
+        let sources: [(UsageProvider, String, () throws -> String?, WritableKeyPath<ProviderConfig, String?>)] = [
+            (.zai, "zai-token", stores.zaiTokenStore.loadToken, \.apiKey),
+            (.synthetic, "synthetic-token", stores.syntheticTokenStore.loadToken, \.apiKey),
+            (.copilot, "copilot-token", stores.copilotTokenStore.loadToken, \.apiKey),
+            (.codex, "codex-cookie", stores.codexCookieStore.loadCookieHeader, \.cookieHeader),
+            (.claude, "claude-cookie", stores.claudeCookieStore.loadCookieHeader, \.cookieHeader),
+            (.cursor, "cursor-cookie", stores.cursorCookieStore.loadCookieHeader, \.cookieHeader),
+            (.factory, "factory-cookie", stores.factoryCookieStore.loadCookieHeader, \.cookieHeader),
+            (.augment, "augment-cookie", stores.augmentCookieStore.loadCookieHeader, \.cookieHeader),
+            (.amp, "amp-cookie", stores.ampCookieStore.loadCookieHeader, \.cookieHeader),
+            (.minimax, "minimax-api-token", stores.minimaxAPITokenStore.loadToken, \.apiKey),
+            (.minimax, "minimax-cookie", stores.minimaxCookieStore.loadCookieHeader, \.cookieHeader),
+            (.kimi, "kimi-token", stores.kimiTokenStore.loadToken, \.cookieHeader),
+            (.opencode, "opencode-cookie", stores.opencodeCookieStore.loadCookieHeader, \.cookieHeader),
+        ]
+        for (provider, store, loader, field) in sources {
+            var value = self.loadLegacyString(provider: provider, store: store, state: &state, log: log, loader: loader)
+            // Provider-specific by design: Kimi also accepted a cookie in UserDefaults.
+            if provider == .kimi, value?.isEmpty ?? true {
+                value = userDefaults.string(forKey: "kimiManualCookieHeader")
+            }
+            if value != nil {
+                state.sawLegacySecrets = true
+            }
+            self.updateProvider(provider, config: &config, state: &state) { entry in
+                self.setIfEmpty(&entry[keyPath: field], value)
+            }
+        }
 
-        self.migrateCookieProviders(
-            [
-                (.codex, stores.codexCookieStore.loadCookieHeader),
-                (.claude, stores.claudeCookieStore.loadCookieHeader),
-                (.cursor, stores.cursorCookieStore.loadCookieHeader),
-                (.factory, stores.factoryCookieStore.loadCookieHeader),
-                (.augment, stores.augmentCookieStore.loadCookieHeader),
-                (.amp, stores.ampCookieStore.loadCookieHeader),
-            ],
-            config: &config,
-            state: &state)
-
-        self.migrateMiniMax(userDefaults: userDefaults, stores: stores, config: &config, state: &state)
-        self.migrateKimi(userDefaults: userDefaults, stores: stores, config: &config, state: &state)
-        self.migrateOpenCode(userDefaults: userDefaults, stores: stores, config: &config, state: &state)
+        // Provider-specific by design: these metadata fields accompanied the retired secret stores.
+        let fields: [(UsageProvider, String, WritableKeyPath<ProviderConfig, String?>)] = [
+            (.minimax, "minimaxAPIRegion", \.region),
+            (.opencode, "opencodeWorkspaceID", \.workspaceID),
+        ]
+        for (provider, key, field) in fields {
+            guard let value = userDefaults.string(forKey: key), !value.isEmpty else { continue }
+            self.updateProvider(provider, config: &config, state: &state) { entry in
+                guard entry[keyPath: field] == nil else { return false }
+                entry[keyPath: field] = value
+                return true
+            }
+        }
     }
 
     private static func applyLegacyCookieSources(
@@ -134,6 +207,7 @@ struct CodexBarConfigMigrator {
         config: inout CodexBarConfig,
         state: inout MigrationState)
     {
+        // Provider-specific by design: these are the historical UserDefaults keys shipped before unified config.
         let sources: [(UsageProvider, String)] = [
             (.codex, "codexCookieSource"),
             (.claude, "claudeCookieSource"),
@@ -158,6 +232,7 @@ struct CodexBarConfigMigrator {
         }
 
         if userDefaults.object(forKey: "openAIWebAccessEnabled") as? Bool == false {
+            // Provider-specific by design: the retired OpenAI web toggle controlled Codex dashboard cookies.
             self.updateProvider(.codex, config: &config, state: &state) { entry in
                 guard entry.cookieSource == nil else { return false }
                 entry.cookieSource = .off
@@ -166,100 +241,37 @@ struct CodexBarConfigMigrator {
         }
     }
 
-    private static func migrateTokenProviders(
-        _ providers: [(UsageProvider, () throws -> String?)],
+    private static func bindLegacyMoonshotAPIKeyRegion(
         config: inout CodexBarConfig,
         state: inout MigrationState)
     {
-        for (provider, loader) in providers {
-            let token = try? loader()
-            if token != nil { state.sawLegacySecrets = true }
-            self.updateProvider(provider, config: &config, state: &state) { entry in
-                self.setIfEmpty(&entry.apiKey, token)
-            }
-        }
-    }
-
-    private static func migrateCookieProviders(
-        _ providers: [(UsageProvider, () throws -> String?)],
-        config: inout CodexBarConfig,
-        state: inout MigrationState)
-    {
-        for (provider, loader) in providers {
-            let header = try? loader()
-            if header != nil { state.sawLegacySecrets = true }
-            self.updateProvider(provider, config: &config, state: &state) { entry in
-                self.setIfEmpty(&entry.cookieHeader, header)
-            }
-        }
-    }
-
-    private static func migrateMiniMax(
-        userDefaults: UserDefaults,
-        stores: LegacyStores,
-        config: inout CodexBarConfig,
-        state: inout MigrationState)
-    {
-        let token = try? stores.minimaxAPITokenStore.loadToken()
-        let header = try? stores.minimaxCookieStore.loadCookieHeader()
-        if token != nil || header != nil {
-            state.sawLegacySecrets = true
-        }
-        let regionRaw = userDefaults.string(forKey: "minimaxAPIRegion")
-        self.updateProvider(.minimax, config: &config, state: &state) { entry in
-            var changed = false
-            changed = self.setIfEmpty(&entry.apiKey, token) || changed
-            if let regionRaw, !regionRaw.isEmpty, entry.region == nil {
-                entry.region = regionRaw
-                changed = true
-            }
-            changed = self.setIfEmpty(&entry.cookieHeader, header) || changed
-            return changed
-        }
-    }
-
-    private static func migrateKimi(
-        userDefaults: UserDefaults,
-        stores: LegacyStores,
-        config: inout CodexBarConfig,
-        state: inout MigrationState)
-    {
-        var token = try? stores.kimiTokenStore.loadToken()
-        if token?.isEmpty ?? true {
-            token = userDefaults.string(forKey: "kimiManualCookieHeader")
-        }
-        if token != nil { state.sawLegacySecrets = true }
-        self.updateProvider(.kimi, config: &config, state: &state) { entry in
-            self.setIfEmpty(&entry.cookieHeader, token)
-        }
-    }
-
-    private static func migrateOpenCode(
-        userDefaults: UserDefaults,
-        stores: LegacyStores,
-        config: inout CodexBarConfig,
-        state: inout MigrationState)
-    {
-        let header = try? stores.opencodeCookieStore.loadCookieHeader()
-        if header != nil { state.sawLegacySecrets = true }
-        let workspaceID = userDefaults.string(forKey: "opencodeWorkspaceID")
-        self.updateProvider(.opencode, config: &config, state: &state) { entry in
-            var changed = false
-            changed = self.setIfEmpty(&entry.cookieHeader, header) || changed
-            if let workspaceID, !workspaceID.isEmpty, entry.workspaceID == nil {
-                entry.workspaceID = workspaceID
-                changed = true
-            }
-            return changed
+        // Provider-specific by design: old Moonshot API keys stored region separately from the unified config.
+        self.updateProvider(.moonshot, config: &config, state: &state) { entry in
+            guard entry.sanitizedAPIKey != nil, entry.sanitizedAPIKeyRegion == nil else { return false }
+            entry.apiKeyRegion = entry.sanitizedRegion ?? MoonshotRegion.international.rawValue
+            return true
         }
     }
 
     private static func migrateLegacyAccounts(
         stores: LegacyStores,
         config: inout CodexBarConfig,
-        state: inout MigrationState)
+        state: inout MigrationState,
+        log: CodexBarLogger)
     {
-        guard let accounts = try? stores.tokenAccountStore.loadAccounts(), !accounts.isEmpty else { return }
+        let accounts: [UsageProvider: ProviderTokenAccountData]
+        do {
+            accounts = try stores.tokenAccountStore.loadAccounts()
+        } catch {
+            self.recordLegacyLoadFailure(
+                provider: nil,
+                store: "token-accounts",
+                error: error,
+                state: &state,
+                log: log)
+            return
+        }
+        guard !accounts.isEmpty else { return }
         state.sawLegacyAccounts = true
         for (provider, data) in accounts where !data.accounts.isEmpty {
             self.updateProvider(provider, config: &config, state: &state) { entry in
@@ -270,13 +282,50 @@ struct CodexBarConfigMigrator {
         }
     }
 
+    private static func loadLegacyString(
+        provider: UsageProvider,
+        store: String,
+        state: inout MigrationState,
+        log: CodexBarLogger,
+        loader: () throws -> String?) -> String?
+    {
+        do {
+            return try loader()
+        } catch {
+            self.recordLegacyLoadFailure(
+                provider: provider,
+                store: store,
+                error: error,
+                state: &state,
+                log: log)
+            return nil
+        }
+    }
+
+    private static func recordLegacyLoadFailure(
+        provider: UsageProvider?,
+        store: String,
+        error: Error,
+        state: inout MigrationState,
+        log: CodexBarLogger)
+    {
+        state.legacyLoadFailures.append(store)
+        log.error(
+            "Failed to load legacy migration source",
+            metadata: [
+                "provider": provider?.rawValue ?? "multiple",
+                "store": store,
+                "error": error.localizedDescription,
+            ])
+    }
+
     private static func updateProvider(
         _ provider: UsageProvider,
         config: inout CodexBarConfig,
         state: inout MigrationState,
         mutate: (inout ProviderConfig) -> Bool)
     {
-        guard let index = config.providers.firstIndex(where: { $0.id == provider }) else { return }
+        guard let index = config.providers.firstIndex(where: { $0.id == provider.instanceID }) else { return }
         var entry = config.providers[index]
         let changed = mutate(&entry)
         if changed {
@@ -308,7 +357,6 @@ struct CodexBarConfigMigrator {
             try stores.copilotTokenStore.storeToken(nil)
             try stores.minimaxAPITokenStore.storeToken(nil)
             try stores.kimiTokenStore.storeToken(nil)
-            try stores.kimiK2TokenStore.storeToken(nil)
             try stores.codexCookieStore.storeCookieHeader(nil)
             try stores.claudeCookieStore.storeCookieHeader(nil)
             try stores.cursorCookieStore.storeCookieHeader(nil)
@@ -334,21 +382,21 @@ struct CodexBarConfigMigrator {
 
     private static func applyProviderOrder(_ raw: [String], config: CodexBarConfig) -> CodexBarConfig {
         let configsByID = Dictionary(uniqueKeysWithValues: config.providers.map { ($0.id, $0) })
-        var seen: Set<UsageProvider> = []
+        var seen: Set<ProviderInstanceID> = []
         var ordered: [ProviderConfig] = []
         ordered.reserveCapacity(config.providers.count)
 
         for rawValue in raw {
-            guard let provider = UsageProvider(rawValue: rawValue),
-                  let entry = configsByID[provider],
-                  !seen.contains(provider)
+            guard let instanceID = ProviderInstanceID(rawValue: rawValue),
+                  let entry = configsByID[instanceID],
+                  !seen.contains(instanceID)
             else { continue }
-            seen.insert(provider)
+            seen.insert(instanceID)
             ordered.append(entry)
         }
 
-        for provider in UsageProvider.allCases where !seen.contains(provider) {
-            ordered.append(configsByID[provider] ?? ProviderConfig(id: provider))
+        for provider in UsageProvider.allCases where !seen.contains(provider.instanceID) {
+            ordered.append(configsByID[provider.instanceID] ?? ProviderConfig(id: provider.instanceID))
         }
 
         var updated = config
@@ -362,7 +410,7 @@ struct CodexBarConfigMigrator {
     {
         var updated = config
         for index in updated.providers.indices {
-            let provider = updated.providers[index].id
+            guard let provider = updated.providers[index].id.firstPartyProvider else { continue }
             let meta = ProviderDescriptorRegistry.descriptor(for: provider).metadata
             if let value = toggles[meta.cliName] {
                 updated.providers[index].enabled = value

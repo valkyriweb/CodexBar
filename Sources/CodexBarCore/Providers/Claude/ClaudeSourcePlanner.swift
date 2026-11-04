@@ -27,10 +27,12 @@ public struct ClaudeSourcePlanningInput: Equatable, Sendable {
 
 public enum ClaudeSourcePlanReason: String, Equatable, Sendable {
     case explicitSourceSelection = "explicit-source-selection"
+    case explicitOAuthOwnerCLIFallback = "explicit-oauth-owner-cli-fallback"
     case appAutoPreferredOAuth = "app-auto-preferred-oauth"
     case appAutoFallbackCLI = "app-auto-fallback-cli"
     case appAutoFallbackWeb = "app-auto-fallback-web"
     case cliAutoPreferredWeb = "cli-auto-preferred-web"
+    case cliAutoFallbackOAuth = "cli-auto-fallback-oauth"
     case cliAutoFallbackCLI = "cli-auto-fallback-cli"
 }
 
@@ -70,6 +72,8 @@ public struct ClaudeFetchPlan: Equatable, Sendable {
     public var preferredStep: ClaudeFetchPlanStep? {
         switch self.input.selectedDataSource {
         case .auto:
+            self.availableSteps.first
+        case .oauth where self.input.runtime == .app:
             self.availableSteps.first
         case .api, .oauth, .web, .cli:
             self.orderedSteps.first
@@ -179,15 +183,25 @@ public enum ClaudeSourcePlanner {
                     self.step(.web, reason: .appAutoFallbackWeb, input: input),
                 ]
             case .cli:
-                [
-                    self.step(.web, reason: .cliAutoPreferredWeb, input: input),
-                    self.step(.cli, reason: .cliAutoFallbackCLI, input: input),
-                ]
+                // OAuth is only planned where CLI Auto attempts it (Linux); macOS keeps web → cli.
+                [self.step(.web, reason: .cliAutoPreferredWeb, input: input)]
+                    + (input.hasOAuthCredentials
+                        ? [self.step(.oauth, reason: .cliAutoFallbackOAuth, input: input)]
+                        : [])
+                    + [self.step(.cli, reason: .cliAutoFallbackCLI, input: input)]
             }
         case .api:
             [self.step(.api, reason: .explicitSourceSelection, input: input)]
         case .oauth:
-            [self.step(.oauth, reason: .explicitSourceSelection, input: input)]
+            switch input.runtime {
+            case .app:
+                [
+                    self.step(.oauth, reason: .explicitSourceSelection, input: input),
+                    self.step(.cli, reason: .explicitOAuthOwnerCLIFallback, input: input),
+                ]
+            case .cli:
+                [self.step(.oauth, reason: .explicitSourceSelection, input: input)]
+            }
         case .web:
             [self.step(.web, reason: .explicitSourceSelection, input: input)]
         case .cli:

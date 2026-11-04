@@ -6,7 +6,7 @@ import Testing
 @MainActor
 extension CodexAccountScopedRefreshTests {
     @Test
-    func `backfills non active email only codex row from own history`() async throws {
+    func `email only plan history never backfills quota publication`() async throws {
         let settings = self.makeSettingsStore(
             suite: "CodexAccountVisibleHistoryBackfillTests-non-active-email-history")
         settings.refreshFrequency = .manual
@@ -14,9 +14,9 @@ extension CodexAccountScopedRefreshTests {
 
         let activeID = try #require(UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-333333333333"))
         let siblingID = try #require(UUID(uuidString: "BBBBBBBB-CCCC-DDDD-EEEE-444444444444"))
-        let activeHome = FileManager.default.temporaryDirectory
+        let activeHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-active-email-\(UUID().uuidString)", isDirectory: true)
-        let siblingHome = FileManager.default.temporaryDirectory
+        let siblingHome = CodexCredentialFixtures.root
             .appendingPathComponent("codex-visible-sibling-email-\(UUID().uuidString)", isDirectory: true)
         try Self.writeCodexAuthFile(
             homeURL: activeHome,
@@ -107,14 +107,13 @@ extension CodexAccountScopedRefreshTests {
             $0.account.email == "sibling-email-history@example.com"
         }?.snapshot)
         #expect(siblingSnapshot.primary?.usedPercent == 6)
-        #expect(siblingSnapshot.primary?.windowMinutes == 300)
-        #expect(siblingSnapshot.primary?.resetsAt == sessionReset)
-        #expect(siblingSnapshot.secondary?.usedPercent == 36)
-        #expect(siblingSnapshot.secondary?.resetsAt == weeklyReset)
+        #expect(siblingSnapshot.primary?.windowMinutes == 0)
+        #expect(siblingSnapshot.primary?.resetsAt == nil)
+        #expect(siblingSnapshot.secondary == nil)
         let persistedSibling = try #require(snapshotStore.storedSnapshots.first {
             $0.account.email == "sibling-email-history@example.com"
         }?.snapshot)
-        #expect(persistedSibling.primary?.resetsAt == sessionReset)
-        #expect(persistedSibling.secondary?.resetsAt == weeklyReset)
+        #expect(persistedSibling.primary?.resetsAt == nil)
+        #expect(persistedSibling.secondary == nil)
     }
 }

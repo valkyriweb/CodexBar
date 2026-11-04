@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 enum ClaudeWebExtraRateWindowParser {
@@ -21,49 +22,45 @@ enum ClaudeWebExtraRateWindowParser {
         var sourceKeys: [String: String] = [:]
         windows.reserveCapacity(Self.definitions.count)
 
-        for definition in Self.definitions {
-            if let foundWindow = Self.firstUsageWindow(in: json, keys: definition.keys) {
-                let rawWindow = foundWindow.window
-                guard let utilization = Self.percentValue(from: rawWindow["utilization"]) else { continue }
-                let resetsAt = (rawWindow["resets_at"] as? String).flatMap(Self.parseISO8601Date)
-                windows.append(Self.namedWindow(
-                    id: definition.id,
-                    title: definition.title,
-                    usedPercent: utilization,
-                    resetsAt: resetsAt))
-                sourceKeys[definition.id] = foundWindow.sourceKey
-                continue
-            }
-
-            // Some accounts expose the key with null payloads (for example `seven_day_cowork: null`).
-            // Preserve the bar in that case with a 0% window so the product section remains visible.
-            if let key = Self.firstUsageKey(in: json, keys: definition.keys) {
-                windows.append(Self.namedWindow(
-                    id: definition.id,
-                    title: definition.title,
-                    usedPercent: 0,
-                    resetsAt: nil))
-                sourceKeys[definition.id] = key
-            }
-        }
+        // Model-scoped weekly limits come first: they track the model budget users spend
+        // day to day, while Daily Routines stays at 0% for accounts that never use
+        // Routines/Cowork and would otherwise push the meaningful row down the card.
         windows.append(contentsOf: Self.scopedWeeklyLimitWindows(from: json))
+
+        for definition in Self.definitions {
+            guard let foundWindow = Self.firstUsageWindow(in: json, keys: definition.keys) else { continue }
+            let rawWindow = foundWindow.window
+            guard let utilization = Self.percentValue(from: rawWindow["utilization"]) else { continue }
+            let resetsAt = ISO8601DateParser.parse(rawWindow["resets_at"] as? String)
+            windows.append(Self.namedWindow(
+                id: definition.id,
+                title: definition.title,
+                usedPercent: utilization,
+                resetsAt: resetsAt))
+            sourceKeys[definition.id] = foundWindow.sourceKey
+        }
         return (windows, sourceKeys)
     }
 
     private static func scopedWeeklyLimitWindows(from json: [String: Any]) -> [NamedRateWindow] {
-        guard let limits = json["limits"] as? [[String: Any]] else { return [] }
-        let mappedLimits = limits.map { entry in
+        ClaudeScopedWeeklyLimitMapper.extraRateWindows(from: self.scopedWeeklyLimits(from: json))
+    }
+
+    /// Entry-by-entry parse of the `limits` array, shared with the OAuth path: a field of an
+    /// unexpected type reads as missing instead of discarding the entry or its siblings.
+    static func scopedWeeklyLimits(from json: [String: Any]) -> [ClaudeScopedWeeklyLimitMapper.Limit] {
+        guard let limits = json["limits"] as? [Any] else { return [] }
+        return limits.compactMap { $0 as? [String: Any] }.map { entry in
             let scope = entry["scope"] as? [String: Any]
             let model = scope?["model"] as? [String: Any]
             return ClaudeScopedWeeklyLimitMapper.Limit(
                 kind: entry["kind"] as? String,
                 group: entry["group"] as? String,
                 percent: Self.percentValue(from: entry["percent"]),
-                resetsAt: (entry["resets_at"] as? String).flatMap(Self.parseISO8601Date),
+                resetsAt: ISO8601DateParser.parse(entry["resets_at"] as? String),
                 modelID: model?["id"] as? String,
                 modelName: model?["display_name"] as? String)
         }
-        return ClaudeScopedWeeklyLimitMapper.extraRateWindows(from: mappedLimits)
     }
 
     private static func namedWindow(
@@ -94,30 +91,10 @@ enum ClaudeWebExtraRateWindowParser {
         return nil
     }
 
-    private static func firstUsageKey(in json: [String: Any], keys: [String]) -> String? {
-        for key in keys where json.keys.contains(key) {
-            return key
-        }
-        return nil
-    }
-
     private static func percentValue(from value: Any?) -> Double? {
-        if let intValue = value as? Int {
-            return Double(intValue)
-        }
-        if let doubleValue = value as? Double {
-            return doubleValue
-        }
-        return nil
-    }
-
-    private static func parseISO8601Date(_ string: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: string) {
-            return date
-        }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: string)
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        return number.doubleValue
     }
 }

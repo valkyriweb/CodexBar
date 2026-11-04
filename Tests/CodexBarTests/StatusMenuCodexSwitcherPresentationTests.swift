@@ -64,6 +64,14 @@ struct StatusMenuCodexSwitcherPresentationTests {
                 loginMethod: "Plus"))
     }
 
+    private func removeAccountIdentity(fromSnapshotStoreAt fileURL: URL) throws {
+        var payload = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: fileURL)) as? [String: Any])
+        var records = try #require(payload["records"] as? [[String: Any]])
+        records[0].removeValue(forKey: "accountIdentity")
+        payload["records"] = records
+        try JSONSerialization.data(withJSONObject: payload).write(to: fileURL)
+    }
+
     @Test
     func `codex account ordering keeps workspace groups contiguous`() {
         let teamActive = CodexVisibleAccount(
@@ -255,6 +263,7 @@ struct StatusMenuCodexSwitcherPresentationTests {
         let account = CodexVisibleAccount(
             id: "active@example.com",
             email: "active@example.com",
+            workspaceAccountID: "acct-active",
             storedAccountID: nil,
             selectionSource: .liveSystem,
             isActive: true,
@@ -275,6 +284,49 @@ struct StatusMenuCodexSwitcherPresentationTests {
         #expect(hydrated.map(\.id) == [account.id])
         #expect(hydrated.first?.snapshot?.primary?.usedPercent == 17)
         #expect(hydrated.first?.account.email == account.email)
+    }
+
+    @Test
+    func `codex account snapshot store roundtrips monthly credit limits`() {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let credits = CreditsSnapshot(
+            remaining: 0,
+            events: [],
+            updatedAt: now,
+            codexCreditLimit: CodexCreditLimitSnapshot(
+                used: 27,
+                limit: 1000,
+                remainingPercent: 73,
+                resetsAt: nil,
+                updatedAt: now))
+
+        let account = CodexVisibleAccount(
+            id: "biz@example.com",
+            email: "biz@example.com",
+            workspaceAccountID: "acct-biz",
+            storedAccountID: nil,
+            selectionSource: .liveSystem,
+            isActive: true,
+            isLive: true,
+            canReauthenticate: true,
+            canRemove: false)
+        let store = FileCodexAccountUsageSnapshotStore(fileURL: fileURL)
+        store.store([
+            CodexAccountUsageSnapshot(
+                account: account,
+                snapshot: self.snapshot(email: account.email, percent: 0),
+                error: nil,
+                sourceLabel: "oauth",
+                credits: credits),
+        ])
+
+        let hydrated = store.load(for: [account])
+
+        #expect(hydrated.first?.credits?.codexCreditLimit?.used == 27)
+        #expect(hydrated.first?.credits?.codexCreditLimit?.limit == 1000)
+        #expect(hydrated.first?.credits?.codexCreditLimit?.remainingPercent == 73)
     }
 
     @Test
@@ -321,7 +373,7 @@ struct StatusMenuCodexSwitcherPresentationTests {
     }
 
     @Test
-    func `codex account snapshot store rejects same stored account after auth fingerprint changes`() {
+    func `codex account snapshot store keeps same composite owner after auth fingerprint changes`() {
         let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
@@ -329,6 +381,7 @@ struct StatusMenuCodexSwitcherPresentationTests {
         let oldAccount = CodexVisibleAccount(
             id: "reauth@example.com",
             email: "reauth@example.com",
+            workspaceAccountID: "acct-reauth",
             authFingerprint: "old-auth-fingerprint",
             storedAccountID: accountID,
             selectionSource: .managedAccount(id: accountID),
@@ -339,6 +392,7 @@ struct StatusMenuCodexSwitcherPresentationTests {
         let newAccount = CodexVisibleAccount(
             id: "reauth@example.com",
             email: "reauth@example.com",
+            workspaceAccountID: "acct-reauth",
             authFingerprint: "new-auth-fingerprint",
             storedAccountID: accountID,
             selectionSource: .managedAccount(id: accountID),
@@ -357,7 +411,8 @@ struct StatusMenuCodexSwitcherPresentationTests {
 
         let hydrated = store.load(for: [newAccount])
 
-        #expect(hydrated.isEmpty)
+        #expect(hydrated.map(\.id) == [newAccount.id])
+        #expect(hydrated.first?.snapshot?.primary?.usedPercent == 71)
     }
 
     @Test
@@ -396,5 +451,79 @@ struct StatusMenuCodexSwitcherPresentationTests {
         let hydrated = store.load(for: [workspaceAccount])
 
         #expect(hydrated.isEmpty)
+    }
+
+    @Test
+    func `codex account snapshot store rejects normalized legacy email ids without composite owner`() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let payload = """
+        {
+          "records" : [
+            {
+              "error" : "cached",
+              "id" : "Legacy@Example.com",
+              "snapshot" : null,
+              "sourceLabel" : "legacy"
+            }
+          ],
+          "version" : 1
+        }
+        """
+        try Data(payload.utf8).write(to: fileURL)
+
+        let account = CodexVisibleAccount(
+            id: "Legacy@Example.com",
+            email: "legacy@example.com",
+            storedAccountID: nil,
+            selectionSource: .liveSystem,
+            isActive: true,
+            isLive: true,
+            canReauthenticate: true,
+            canRemove: false)
+        let store = FileCodexAccountUsageSnapshotStore(fileURL: fileURL)
+
+        #expect(store.load(for: [account]).isEmpty)
+    }
+
+    @Test
+    func `codex account snapshot store rejects legacy stable ids crossing workspace members`() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        let managedAccountID = UUID()
+        let visibleID = "managed:\(managedAccountID.uuidString.lowercased())"
+        let priorAccount = CodexVisibleAccount(
+            id: visibleID,
+            email: "first-member@example.com",
+            workspaceAccountID: "shared-workspace",
+            storedAccountID: managedAccountID,
+            selectionSource: .managedAccount(id: managedAccountID),
+            isActive: false,
+            isLive: false,
+            canReauthenticate: true,
+            canRemove: true)
+        let otherMember = CodexVisibleAccount(
+            id: priorAccount.id,
+            email: "second-member@example.com",
+            workspaceAccountID: priorAccount.workspaceAccountID,
+            storedAccountID: managedAccountID,
+            selectionSource: .managedAccount(id: managedAccountID),
+            isActive: true,
+            isLive: false,
+            canReauthenticate: true,
+            canRemove: true)
+        let store = FileCodexAccountUsageSnapshotStore(fileURL: fileURL)
+        store.store([
+            CodexAccountUsageSnapshot(
+                account: priorAccount,
+                snapshot: self.snapshot(email: priorAccount.email, percent: 71),
+                error: nil,
+                sourceLabel: "legacy"),
+        ])
+
+        try self.removeAccountIdentity(fromSnapshotStoreAt: fileURL)
+
+        #expect(store.load(for: [otherMember]).isEmpty)
     }
 }

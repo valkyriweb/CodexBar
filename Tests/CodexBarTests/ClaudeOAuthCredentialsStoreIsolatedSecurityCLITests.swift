@@ -70,24 +70,58 @@ struct ClaudeOAuthCredentialsStoreIsolatedSecurityCLITests {
             ClaudeOAuthCredentialsStore.isolatedSecurityCLIKeychainEnvironmentKey: "/tmp/verify.keychain-db",
         ]
 
-        let isMcpOnly = ClaudeOAuthCredentialsStore.withSecurityCLIReadOverrideForTesting(.data(mcpOnlyPayload)) {
-            ClaudeOAuthCredentialsStore.isMcpOAuthOnlyClaudeKeychainPayloadPresent(
-                interaction: .background,
-                readStrategy: .securityCLIExperimental,
-                keychainAccessDisabled: true,
-                environment: environment)
-        }
-        #expect(isMcpOnly)
+        ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.always) {
+            let isMcpOnly = ClaudeOAuthCredentialsStore
+                .withSecurityCLIReadOverrideForTesting(.data(mcpOnlyPayload)) {
+                    ClaudeOAuthCredentialsStore.isMcpOAuthOnlyClaudeKeychainPayloadPresent(
+                        interaction: .background,
+                        readStrategy: .securityCLIExperimental,
+                        keychainAccessDisabled: true,
+                        environment: environment)
+                }
+            #expect(isMcpOnly)
 
-        let blockedWithoutIsolatedKeychain = ClaudeOAuthCredentialsStore
-            .withSecurityCLIReadOverrideForTesting(.data(mcpOnlyPayload)) {
+            let blockedWithoutIsolatedKeychain = ClaudeOAuthCredentialsStore
+                .withSecurityCLIReadOverrideForTesting(.data(mcpOnlyPayload)) {
+                    ClaudeOAuthCredentialsStore.isMcpOAuthOnlyClaudeKeychainPayloadPresent(
+                        interaction: .background,
+                        readStrategy: .securityCLIExperimental,
+                        keychainAccessDisabled: true,
+                        environment: [KeychainAccessGate.disableAccessEnvironmentKey: "1"])
+                }
+            #expect(blockedWithoutIsolatedKeychain == false)
+        }
+    }
+
+    @Test
+    func `never prompt mode still detects MCP-only payload via experimental security CLI reader`() {
+        let mcpOnlyPayload = Data(#"{"mcpOAuth":{"plugin:test":{"accessToken":"synthetic"}}}"#.utf8)
+        let environment = [
+            KeychainAccessGate.disableAccessEnvironmentKey: "1",
+            ClaudeOAuthCredentialsStore.isolatedSecurityCLIKeychainEnvironmentKey: "/tmp/verify.keychain-db",
+        ]
+
+        let isMcpOnly = ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.never) {
+            ClaudeOAuthCredentialsStore.withSecurityCLIReadOverrideForTesting(.data(mcpOnlyPayload)) {
                 ClaudeOAuthCredentialsStore.isMcpOAuthOnlyClaudeKeychainPayloadPresent(
                     interaction: .background,
                     readStrategy: .securityCLIExperimental,
                     keychainAccessDisabled: true,
-                    environment: [KeychainAccessGate.disableAccessEnvironmentKey: "1"])
+                    environment: environment)
             }
-        #expect(blockedWithoutIsolatedKeychain == false)
+        }
+        #expect(!isMcpOnly)
+
+        let blockedViaSecurityFramework = ClaudeOAuthKeychainPromptPreference.withTaskOverrideForTesting(.never) {
+            ClaudeOAuthCredentialsStore.withSecurityCLIReadOverrideForTesting(.data(mcpOnlyPayload)) {
+                ClaudeOAuthCredentialsStore.isMcpOAuthOnlyClaudeKeychainPayloadPresent(
+                    interaction: .background,
+                    readStrategy: .securityFramework,
+                    keychainAccessDisabled: false,
+                    environment: [:])
+            }
+        }
+        #expect(!blockedViaSecurityFramework)
     }
 }
 #endif

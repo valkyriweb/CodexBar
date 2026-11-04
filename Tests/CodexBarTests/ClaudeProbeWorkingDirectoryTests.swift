@@ -4,6 +4,28 @@ import Testing
 
 struct ClaudeProbeWorkingDirectoryTests {
     @Test
+    func `cleanup preserves transcripts outside the owned probe directory`() throws {
+        let root = try Self.makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("user-project")
+        let owned = root.appendingPathComponent("CodexBar/ClaudeProbe")
+        let profile = root.appendingPathComponent("profile")
+        let archive = profile.appendingPathComponent("projects")
+            .appendingPathComponent(ClaudeProbeSessionArtifactCleaner.claudeProjectDirectoryName(for: project))
+        try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
+        let transcript = archive.appendingPathComponent("user-session.jsonl")
+        try Data("{}\n".utf8).write(to: transcript)
+        let removed = ClaudeStatusProbe.$dedicatedProbeDirectoryOverrideForTesting.withValue(owned) {
+            ClaudeProbeSessionArtifactCleaner.cleanupProbeSessionArtifacts(
+                probeDirectory: project,
+                environment: ["CLAUDE_CONFIG_DIR": profile.path, "HOME": root.path])
+        }
+        let transcriptSurvives = FileManager.default.fileExists(atPath: transcript.path)
+        #expect(removed.isEmpty)
+        #expect(transcriptSurvives)
+    }
+
+    @Test
     func `probe working directory disables deep link registration`() throws {
         let directory = try Self.makeTemporaryDirectory()
 
@@ -104,7 +126,7 @@ struct ClaudeProbeWorkingDirectoryTests {
         try Data("keep".utf8).write(to: probeNote)
         try Data("{}\n".utf8).write(to: unrelatedSession)
 
-        let removed = ClaudeProbeSessionArtifactCleaner.cleanupProbeSessionArtifacts(
+        let removed = Self.cleanupOwnedProbeArtifacts(
             probeDirectory: probeDirectory,
             environment: ["CLAUDE_CONFIG_DIR": claudeRoot.path, "HOME": claudeRoot.path])
 
@@ -131,12 +153,56 @@ struct ClaudeProbeWorkingDirectoryTests {
         let probeSession = probeProject.appendingPathComponent("probe-session.jsonl")
         try Data("{}\n".utf8).write(to: probeSession)
 
-        let removed = ClaudeProbeSessionArtifactCleaner.cleanupProbeSessionArtifacts(
+        let removed = Self.cleanupOwnedProbeArtifacts(
             probeDirectory: probeDirectory,
             environment: ["CLAUDE_CONFIG_DIR": claudeRoot.path, "HOME": claudeRoot.path])
 
         #expect(removed.map(\.lastPathComponent) == ["probe-session.jsonl"])
         #expect(!FileManager.default.fileExists(atPath: probeSession.path))
+    }
+
+    @Test
+    func `cleanup resolves one literal relative profile root like Claude`() throws {
+        let probeDirectory = try Self.makeTemporaryDirectory()
+        let homeDirectory = try Self.makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: probeDirectory)
+            try? FileManager.default.removeItem(at: homeDirectory)
+        }
+
+        let relativeProfile = "profiles/team,a"
+        let selectedRoot = probeDirectory.appendingPathComponent(relativeProfile, isDirectory: true)
+        let defaultRoot = homeDirectory.appendingPathComponent(".claude", isDirectory: true)
+        let projectDirectoryName = ClaudeProbeSessionArtifactCleaner.claudeProjectDirectoryName(
+            for: probeDirectory)
+        let selectedProject = selectedRoot
+            .appendingPathComponent("projects", isDirectory: true)
+            .appendingPathComponent(projectDirectoryName, isDirectory: true)
+        let defaultProject = defaultRoot
+            .appendingPathComponent("projects", isDirectory: true)
+            .appendingPathComponent(projectDirectoryName, isDirectory: true)
+        try FileManager.default.createDirectory(at: selectedProject, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: defaultProject, withIntermediateDirectories: true)
+
+        let selectedTranscript = selectedProject.appendingPathComponent("selected.jsonl")
+        let defaultTranscript = defaultProject.appendingPathComponent("default.jsonl")
+        try Data("{}\n".utf8).write(to: selectedTranscript)
+        try Data("{}\n".utf8).write(to: defaultTranscript)
+
+        let removed = Self.cleanupOwnedProbeArtifacts(
+            probeDirectory: probeDirectory,
+            environment: ["CLAUDE_CONFIG_DIR": relativeProfile, "HOME": homeDirectory.path])
+
+        #expect(removed.map(\.lastPathComponent) == ["selected.jsonl"])
+        #expect(!FileManager.default.fileExists(atPath: selectedTranscript.path))
+        #expect(FileManager.default.fileExists(atPath: defaultTranscript.path))
+    }
+
+    private static func cleanupOwnedProbeArtifacts(probeDirectory: URL, environment: [String: String]) -> [URL] {
+        ClaudeStatusProbe.$dedicatedProbeDirectoryOverrideForTesting.withValue(probeDirectory) {
+            ClaudeProbeSessionArtifactCleaner.cleanupProbeSessionArtifacts(
+                probeDirectory: probeDirectory, environment: environment)
+        }
     }
 
     private static func makeTemporaryDirectory() throws -> URL {

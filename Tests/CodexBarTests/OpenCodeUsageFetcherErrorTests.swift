@@ -4,6 +4,56 @@ import Testing
 
 @Suite(.serialized)
 struct OpenCodeUsageFetcherErrorTests {
+    @Test(arguments: [false, true])
+    func `legacy billing cancellation is not replaced with the subscription error`(cancelledURL: Bool) async {
+        let transport = ProviderHTTPTransportHandler { request in
+            if request.value(forHTTPHeaderField: "X-Server-Id") ==
+                "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d"
+            {
+                if cancelledURL { throw URLError(.cancelled) }
+                throw CancellationError()
+            }
+            let url = try #require(request.url)
+            let (response, data) = Self.makeResponse(
+                url: url, body: "null", statusCode: 200, contentType: "application/json")
+            return (data, response)
+        }
+        await #expect(throws: CancellationError.self) {
+            try await OpenCodeUsageFetcher.fetchUsage(
+                cookieHeader: "auth=synthetic", timeout: 2, workspaceIDOverride: "wrk_TEST123", session: transport)
+        }
+    }
+
+    @Test
+    func `migrated workspace reads Console instead of the signed out legacy endpoint`() async throws {
+        defer { OpenCodeStubURLProtocol.handler = nil }
+        let now = Date(timeIntervalSince1970: 1_790_640_000)
+        OpenCodeStubURLProtocol.handler = { request in
+            let url = try #require(request.url)
+            let body: String
+            switch url.path {
+            case "/console/api/orgs":
+                body = #"[{"id":"wrk_MIGRATED","name":"Synthetic"}]"#
+            case "/console/api/go/status":
+                #expect(request.value(forHTTPHeaderField: "x-org-id") == "wrk_MIGRATED")
+                body = """
+                {"access":{"meters":{
+                  "fiveHour":{"usedMicroCents":"89062297","limitMicroCents":"1200000000",
+                    "resetsAt":"2026-09-30T01:31:21Z"},
+                  "week":{"usedMicroCents":"703325271","limitMicroCents":"3000000000",
+                    "resetsAt":"2026-10-05T00:00:00Z"}}}}
+                """
+            default:
+                body = #"new Error('actor of type "public" is not associated with an account')"#
+            }
+            return Self.makeResponse(url: url, body: body, statusCode: 200, contentType: "application/json")
+        }
+        let snapshot = try await OpenCodeUsageFetcher.fetchUsage(
+            cookieHeader: "__Host-console_session=synthetic", timeout: 2, now: now, session: self.makeSession())
+        #expect(abs(snapshot.rollingUsagePercent - 7.421858083333333) < 0.000001)
+        #expect(abs(snapshot.weeklyUsagePercent - 23.4441757) < 0.000001)
+    }
+
     private func makeSession() -> URLSession {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [OpenCodeStubURLProtocol.self]
@@ -112,11 +162,184 @@ struct OpenCodeUsageFetcherErrorTests {
             }
         }
 
-        #expect(methods == ["GET"])
+        // Subscription GET, then the billing lookup; the POST that answers HTTP 500 is never sent.
+        #expect(methods == ["GET", "GET"])
         #expect(queries[0].contains("id="))
         #expect(queries[0].contains("wrk_TEST123"))
         #expect(urls[0].path == "/_server")
         #expect(contentTypes[0].isEmpty)
+    }
+
+    @Test
+    func `pay as you go workspace reports monthly spend instead of failing`() async throws {
+        defer {
+            OpenCodeStubURLProtocol.handler = nil
+        }
+
+        var methods: [String] = []
+        OpenCodeStubURLProtocol.handler = { request in
+            guard let url = request.url else { throw URLError(.badURL) }
+            methods.append(request.httpMethod ?? "GET")
+
+            if request.value(forHTTPHeaderField: "X-Server-Id") == Self.billingServerID {
+                return Self.makeResponse(
+                    url: url,
+                    body: Self.billingPayload,
+                    statusCode: 200,
+                    contentType: "text/javascript")
+            }
+            // The subscription server function resolves to null for workspaces without a subscription.
+            return Self.makeResponse(
+                url: url,
+                body: Self.nullServerFunctionPayload,
+                statusCode: 200,
+                contentType: "text/javascript")
+        }
+
+        let snapshot = try await OpenCodeUsageFetcher.fetchUsage(
+            cookieHeader: "auth=test",
+            timeout: 2,
+            workspaceIDOverride: "wrk_TEST123",
+            session: self.makeSession())
+
+        let payAsYouGo = try #require(snapshot.payAsYouGo)
+        #expect(payAsYouGo.monthlyUsageUSD == 15)
+        #expect(payAsYouGo.monthlyLimitUSD == 20)
+        #expect(payAsYouGo.balanceUSD == 12.5)
+        #expect(payAsYouGo.usedPercent == 75)
+        #expect(methods == ["GET", "GET"])
+    }
+
+    @Test
+    func `subscription post failure falls back to billing usage`() async throws {
+        defer {
+            OpenCodeStubURLProtocol.handler = nil
+        }
+
+        var methods: [String] = []
+        OpenCodeStubURLProtocol.handler = { request in
+            guard let url = request.url else { throw URLError(.badURL) }
+            methods.append(request.httpMethod ?? "GET")
+
+            if request.value(forHTTPHeaderField: "X-Server-Id") == Self.billingServerID {
+                return Self.makeResponse(
+                    url: url,
+                    body: Self.billingPayload,
+                    statusCode: 200,
+                    contentType: "text/javascript")
+            }
+            if request.httpMethod?.uppercased() == "GET" {
+                return Self.makeResponse(
+                    url: url,
+                    body: #"{"ok":true}"#,
+                    statusCode: 200,
+                    contentType: "application/json")
+            }
+            return Self.makeResponse(
+                url: url,
+                body: #"{"status":500,"unhandled":true,"message":"HTTPError"}"#,
+                statusCode: 500,
+                contentType: "application/json")
+        }
+
+        let snapshot = try await OpenCodeUsageFetcher.fetchUsage(
+            cookieHeader: "auth=test",
+            timeout: 2,
+            workspaceIDOverride: "wrk_TEST123",
+            session: self.makeSession())
+
+        #expect(snapshot.payAsYouGo?.usedPercent == 75)
+        #expect(methods == ["GET", "POST", "GET"])
+    }
+
+    @Test
+    func `subscription failure is preserved when billing still has a subscription`() async throws {
+        defer {
+            OpenCodeStubURLProtocol.handler = nil
+        }
+
+        var methods: [String] = []
+        OpenCodeStubURLProtocol.handler = { request in
+            guard let url = request.url else { throw URLError(.badURL) }
+            methods.append(request.httpMethod ?? "GET")
+
+            if request.value(forHTTPHeaderField: "X-Server-Id") == Self.billingServerID {
+                return Self.makeResponse(
+                    url: url,
+                    body: Self.subscriptionBillingPayload,
+                    statusCode: 200,
+                    contentType: "application/json")
+            }
+            if request.httpMethod?.uppercased() == "GET" {
+                return Self.makeResponse(
+                    url: url,
+                    body: #"{"ok":true}"#,
+                    statusCode: 200,
+                    contentType: "application/json")
+            }
+            return Self.makeResponse(
+                url: url,
+                body: #"{"status":500,"unhandled":true,"message":"HTTPError"}"#,
+                statusCode: 500,
+                contentType: "application/json")
+        }
+
+        do {
+            _ = try await OpenCodeUsageFetcher.fetchUsage(
+                cookieHeader: "auth=test",
+                timeout: 2,
+                workspaceIDOverride: "wrk_TEST123",
+                session: self.makeSession())
+            Issue.record("Expected the subscription API error to be preserved.")
+        } catch let error as OpenCodeUsageError {
+            switch error {
+            case let .apiError(message):
+                #expect(message.contains("HTTP 500"))
+            default:
+                Issue.record("Expected apiError, got: \(error)")
+            }
+        }
+
+        #expect(methods == ["GET", "POST", "GET"])
+    }
+
+    @Test
+    func `billing fallback surfaces expired session as invalid credentials`() async throws {
+        defer {
+            OpenCodeStubURLProtocol.handler = nil
+        }
+
+        OpenCodeStubURLProtocol.handler = { request in
+            guard let url = request.url else { throw URLError(.badURL) }
+            if request.value(forHTTPHeaderField: "X-Server-Id") == Self.billingServerID {
+                return Self.makeResponse(
+                    url: url,
+                    body: "<html><body>Please sign in to continue</body></html>",
+                    statusCode: 200,
+                    contentType: "text/html")
+            }
+            return Self.makeResponse(
+                url: url,
+                body: Self.nullServerFunctionPayload,
+                statusCode: 200,
+                contentType: "text/javascript")
+        }
+
+        do {
+            _ = try await OpenCodeUsageFetcher.fetchUsage(
+                cookieHeader: "auth=test",
+                timeout: 2,
+                workspaceIDOverride: "wrk_TEST123",
+                session: self.makeSession())
+            Issue.record("Expected OpenCodeUsageError.invalidCredentials")
+        } catch let error as OpenCodeUsageError {
+            switch error {
+            case .invalidCredentials:
+                break
+            default:
+                Issue.record("Expected invalidCredentials, got: \(error)")
+            }
+        }
     }
 
     @Test
@@ -263,6 +486,33 @@ struct OpenCodeUsageFetcherErrorTests {
         #expect(observedCookie == "auth=test")
     }
 
+    private static let billingServerID = "c83b78a614689c38ebee981f9b39a8b377716db85c1fd7dbab604adc02d3313d"
+
+    /// Shape opencode.ai returns when a server function resolves to null.
+    private static let nullServerFunctionPayload =
+        #";0x00000051;((self.$R=self.$R||{})["server-fn:test"]=[],null)"#
+
+    /// Redacted customer/billing payload for a pay-as-you-go workspace: $15.00 spent of a $20
+    /// monthly limit, $12.50 prepaid balance left. Amounts arrive scaled by 1e8.
+    private static let billingPayload = [
+        #";0x000002b9;((self.$R=self.$R||{})["server-fn:test"]=[],($R=>$R[0]={customerID:"cus_TEST","#,
+        #"paymentMethodID:"pm_TEST",paymentMethodType:"link",paymentMethodLast4:null,balance:1250000000,"#,
+        #"reload:!0,reloadAmount:10,reloadAmountMin:10,reloadTrigger:5,reloadTriggerMin:5,monthlyLimit:20,"#,
+        #"monthlyUsage:1500000000,timeMonthlyUsageUpdated:$R[1]=new Date("2026-07-29T14:45:11.000Z"),"#,
+        #"reloadError:null,timeReloadError:null,subscription:null,subscriptionID:null,subscriptionPlan:null,"#,
+        #"lite:$R[2]={},liteSubscriptionID:"sub_TEST"})($R["server-fn:test"]))"#,
+    ].joined()
+
+    private static let subscriptionBillingPayload = """
+    {
+      "customerID": "cus_TEST",
+      "monthlyUsage": 1500000000,
+      "monthlyLimit": 20,
+      "balance": 1250000000,
+      "subscription": {"id": "sub_TEST"}
+    }
+    """
+
     private static func makeResponse(
         url: URL,
         body: String,
@@ -279,7 +529,11 @@ struct OpenCodeUsageFetcherErrorTests {
 }
 
 final class OpenCodeStubURLProtocol: URLProtocol {
-    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    private static let _handlerBox = LockIsolated<((URLRequest) throws -> (HTTPURLResponse, Data))?>(nil)
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))? {
+        get { Self._handlerBox.value }
+        set { Self._handlerBox.setValue(newValue) }
+    }
 
     override static func canInit(with request: URLRequest) -> Bool {
         request.url?.host == "opencode.ai"

@@ -52,7 +52,7 @@ public struct VertexAIUsageResponse: Sendable {
 }
 
 public enum VertexAIUsageFetcher {
-    private static let log = CodexBarLog.logger(LogCategories.vertexAIFetcher)
+    private static let log = CodexBarLog.logger(LogCategories.provider(.vertexai, scope: "fetcher"))
 
     // Cloud Monitoring API endpoint for time series
     private static let monitoringEndpoint = "https://monitoring.googleapis.com/v3/projects"
@@ -60,21 +60,13 @@ public enum VertexAIUsageFetcher {
 
     public static func fetchUsage(
         accessToken: String,
-        projectId: String?) async throws -> VertexAIUsageResponse
+        projectId: String?,
+        transport: any ProviderHTTPTransport = ProviderHTTPClient.shared) async throws -> VertexAIUsageResponse
     {
         guard let projectId, !projectId.isEmpty else {
             throw VertexAIFetchError.noProject
         }
 
-        return try await Self.fetchQuotaUsage(
-            accessToken: accessToken,
-            projectId: projectId)
-    }
-
-    private static func fetchQuotaUsage(
-        accessToken: String,
-        projectId: String) async throws -> VertexAIUsageResponse
-    {
         let usageFilter = """
         metric.type="serviceruntime.googleapis.com/quota/allocation/usage" \
         AND resource.type="consumer_quota" \
@@ -89,12 +81,32 @@ public enum VertexAIUsageFetcher {
         let usageSeries = try await Self.fetchTimeSeries(
             accessToken: accessToken,
             projectId: projectId,
-            filter: usageFilter)
+            filter: usageFilter,
+            transport: transport)
         let limitSeries = try await Self.fetchTimeSeries(
             accessToken: accessToken,
             projectId: projectId,
-            filter: limitFilter)
+            filter: limitFilter,
+            transport: transport)
 
+        return try Self.makeQuotaUsageResponse(
+            usageSeries: usageSeries,
+            limitSeries: limitSeries)
+    }
+
+    static func parseQuotaUsage(usageData: Data, limitData: Data) throws -> VertexAIUsageResponse {
+        let decoder = JSONDecoder()
+        let usageResponse = try decoder.decode(MonitoringTimeSeriesResponse.self, from: usageData)
+        let limitResponse = try decoder.decode(MonitoringTimeSeriesResponse.self, from: limitData)
+        return try Self.makeQuotaUsageResponse(
+            usageSeries: usageResponse.timeSeries ?? [],
+            limitSeries: limitResponse.timeSeries ?? [])
+    }
+
+    private static func makeQuotaUsageResponse(
+        usageSeries: [MonitoringTimeSeries],
+        limitSeries: [MonitoringTimeSeries]) throws -> VertexAIUsageResponse
+    {
         let usageByKey = Self.aggregate(series: usageSeries)
         let limitByKey = Self.aggregate(series: limitSeries)
 
@@ -104,10 +116,15 @@ public enum VertexAIUsageFetcher {
 
         var maxPercent: Double?
         var matchedCount = 0
-        var matchedKeys: Set<QuotaKey> = []
-        for (key, limit) in limitByKey {
-            guard limit > 0, let usage = usageByKey[key] else { continue }
-            matchedKeys.insert(key)
+        var matchedUsageKeys: Set<QuotaKey> = []
+        var matchedLimitKeys: Set<QuotaKey> = []
+        for (usageKey, usage) in usageByKey {
+            guard let (limitKey, limit) = Self.matchingLimit(
+                for: usageKey,
+                in: limitByKey)
+            else { continue }
+            matchedUsageKeys.insert(usageKey)
+            matchedLimitKeys.insert(limitKey)
             matchedCount += 1
             let percent = (usage / limit) * 100.0
             maxPercent = max(maxPercent ?? percent, percent)
@@ -117,8 +134,8 @@ public enum VertexAIUsageFetcher {
             throw VertexAIFetchError.noData
         }
 
-        let unmatchedUsage = Set(usageByKey.keys).subtracting(matchedKeys).count
-        let unmatchedLimit = Set(limitByKey.keys).subtracting(matchedKeys).count
+        let unmatchedUsage = Set(usageByKey.keys).subtracting(matchedUsageKeys).count
+        let unmatchedLimit = Set(limitByKey.keys).subtracting(matchedLimitKeys).count
         Self.log.debug("Quota series preview", metadata: [
             "usageKeys": Self.previewKeys(usageByKey),
             "limitKeys": Self.previewKeys(limitByKey),
@@ -138,6 +155,24 @@ public enum VertexAIUsageFetcher {
             resetsAt: nil,
             resetDescription: nil,
             rawData: nil)
+    }
+
+    private static func matchingLimit(
+        for usageKey: QuotaKey,
+        in limitByKey: [QuotaKey: Double]) -> (key: QuotaKey, value: Double)?
+    {
+        if let exactLimit = limitByKey[usageKey], exactLimit > 0 {
+            return (usageKey, exactLimit)
+        }
+
+        guard usageKey.limitName.isEmpty else { return nil }
+        let candidates = limitByKey.filter { limitKey, limit in
+            limit > 0
+                && limitKey.quotaMetric == usageKey.quotaMetric
+                && limitKey.location == usageKey.location
+        }
+        guard candidates.count == 1, let candidate = candidates.first else { return nil }
+        return candidate
     }
 
     private struct MonitoringTimeSeriesResponse: Decodable {
@@ -179,12 +214,14 @@ public enum VertexAIUsageFetcher {
     private static func fetchTimeSeries(
         accessToken: String,
         projectId: String,
-        filter: String) async throws -> [MonitoringTimeSeries]
+        filter: String,
+        transport: any ProviderHTTPTransport) async throws -> [MonitoringTimeSeries]
     {
         let now = Date()
         let start = now.addingTimeInterval(-Self.usageWindowSeconds)
         let formatter = ISO8601DateFormatter()
         var pageToken: String?
+        var seenPageTokens: Set<String> = []
         var allSeries: [MonitoringTimeSeries] = []
 
         repeat {
@@ -218,7 +255,7 @@ public enum VertexAIUsageFetcher {
             let response: ProviderHTTPResponse
 
             do {
-                response = try await ProviderHTTPClient.shared.response(for: request)
+                response = try await transport.response(for: request)
             } catch {
                 throw VertexAIFetchError.networkError(error)
             }
@@ -239,8 +276,14 @@ public enum VertexAIUsageFetcher {
             if let series = decoded.timeSeries {
                 allSeries.append(contentsOf: series)
             }
-            pageToken = decoded.nextPageToken?.isEmpty == false ? decoded.nextPageToken : nil
-        } while pageToken != nil
+            // Retain this distinct page before stopping a repeated cursor.
+            guard let nextToken = decoded.nextPageToken, !nextToken.isEmpty,
+                  seenPageTokens.insert(nextToken).inserted else { break }
+            guard seenPageTokens.count < 100 else {
+                throw VertexAIFetchError.invalidResponse("Monitoring page limit exceeded")
+            }
+            pageToken = nextToken
+        } while true
 
         return allSeries
     }
@@ -250,7 +293,7 @@ public enum VertexAIUsageFetcher {
 
         for entry in series {
             guard let key = Self.quotaKey(from: entry),
-                  let value = Self.maxPointValue(from: entry.points)
+                  let value = entry.points.compactMap(self.pointValue).max()
             else {
                 continue
             }
@@ -271,13 +314,13 @@ public enum VertexAIUsageFetcher {
         return QuotaKey(quotaMetric: quotaMetric, limitName: limitName, location: location)
     }
 
-    private static func maxPointValue(from points: [MonitoringPoint]) -> Double? {
-        points.compactMap(self.pointValue).max()
-    }
-
     private static func pointValue(from point: MonitoringPoint) -> Double? {
-        if let doubleValue = point.value.doubleValue { return doubleValue }
-        if let int64Value = point.value.int64Value { return Double(int64Value) }
+        if let doubleValue = point.value.doubleValue {
+            return doubleValue
+        }
+        if let int64Value = point.value.int64Value {
+            return Double(int64Value)
+        }
         return nil
     }
 
